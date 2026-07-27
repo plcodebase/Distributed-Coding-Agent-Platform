@@ -1549,29 +1549,3 @@ The project is complete when all of the following are true:
 * No accepted tasks are silently lost during tested failures.
 * Benchmark and architecture reports are committed.
 
----
-
-# 16. Résumé Evidence to Collect
-
-Do not finalize résumé claims until these measurements exist:
-
-* Maximum tested concurrent runs
-* Number of worker replicas
-* Runs completed per minute
-* p95 queue wait
-* p95 first-token latency
-* p95 total run latency
-* Worker-failure recovery time
-* Number of lost accepted tasks
-* Number of duplicated committed patches
-* Provider fallback recovery time
-* Token or cost reduction from routing
-* Coding-task success rate
-* Sandbox startup time
-* Resource usage per active sandbox
-
-Preferred final résumé framing:
-
-> Built a distributed coding-agent platform with isolated execution, durable task scheduling, checkpoint recovery, and a multi-provider LLM gateway.
-
-The supporting bullets should use only measured results produced by this implementation.
