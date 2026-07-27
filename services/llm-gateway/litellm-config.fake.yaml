@@ -1,0 +1,45 @@
+model_list:
+  - model_name: coding-default
+    litellm_params:
+      model: openai/fake-primary
+      api_base: http://fake-llm-primary:8080/v1
+      api_key: fake-primary-key
+  - model_name: coding-fast
+    litellm_params:
+      model: openai/fake-primary
+      api_base: http://fake-llm-primary:8080/v1
+      api_key: fake-primary-key
+  - model_name: coding-strong
+    litellm_params:
+      model: openai/fake-secondary
+      api_base: http://fake-llm-secondary:8080/v1
+      api_key: fake-secondary-key
+  - model_name: summarization
+    litellm_params:
+      model: openai/fake-primary
+      api_base: http://fake-llm-primary:8080/v1
+      api_key: fake-primary-key
+  - model_name: code-review
+    litellm_params:
+      model: openai/fake-secondary
+      api_base: http://fake-llm-secondary:8080/v1
+      api_key: fake-secondary-key
+
+router_settings:
+  num_retries: 2
+  retry_after: 1
+  fallbacks:
+    - coding-default: [coding-strong]
+    - coding-fast: [coding-default]
+    - code-review: [coding-strong]
+  allowed_fails: 5
+  cooldown_time: 60
+
+litellm_settings:
+  request_timeout: 120
+  drop_params: false
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  disable_spend_logs: false

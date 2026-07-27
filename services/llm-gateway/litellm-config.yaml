@@ -1,0 +1,40 @@
+model_list:
+  - model_name: coding-default
+    litellm_params:
+      model: os.environ/OPENAI_MODEL
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: coding-fast
+    litellm_params:
+      model: os.environ/OPENAI_MODEL
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: coding-strong
+    litellm_params:
+      model: os.environ/ANTHROPIC_MODEL
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: summarization
+    litellm_params:
+      model: os.environ/OPENAI_MODEL
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: code-review
+    litellm_params:
+      model: os.environ/ANTHROPIC_MODEL
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  num_retries: 2
+  retry_after: 1
+  fallbacks:
+    - coding-default: [coding-strong]
+    - coding-fast: [coding-default]
+    - code-review: [coding-strong]
+  allowed_fails: 5
+  cooldown_time: 60
+
+litellm_settings:
+  request_timeout: 120
+  drop_params: false
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  disable_spend_logs: false

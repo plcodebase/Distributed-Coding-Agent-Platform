@@ -1,0 +1,56 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: astral-sh/setup-uv@v6.6.1
+        with:
+          version: "0.11.32"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages --frozen
+      - run: make lint
+      - run: make typecheck
+      - run: make coverage
+      - name: Validate migrations when present
+        run: |
+          if [ -d migrations ]; then
+            uv run alembic check
+          else
+            echo "No migrations in sequence 1."
+          fi
+
+  configuration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: astral-sh/setup-uv@v6.6.1
+        with:
+          version: "0.11.32"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages --frozen
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes podman
+      - name: Validate Podman Compose configuration
+        run: .venv/bin/podman-compose --env-file .env.example config --quiet
+      - run: podman build --tag agent-platform-fake-llm:test --file services/fake-llm/Containerfile services/fake-llm
+      - name: Start Podman dependency stack
+        run: make compose-up ENV_FILE=.env.example
+      - name: Verify dependency health and fake model routes
+        run: make compose-smoke ENV_FILE=.env.example
+      - name: Stop Podman dependency stack
+        if: always()
+        run: make compose-down ENV_FILE=.env.example

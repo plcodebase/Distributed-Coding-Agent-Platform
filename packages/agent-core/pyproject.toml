@@ -1,0 +1,20 @@
+[project]
+name = "agent-core"
+version = "0.1.0"
+description = "Shared configuration foundation for the agent platform"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "platform-telemetry",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.9,<3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_core"]
+
+[tool.uv.sources]
+platform-telemetry = { workspace = true }
