@@ -1,7 +1,7 @@
 UV ?= uv
 PODMAN ?= podman
-PODMAN_COMPOSE_PROVIDER ?= $(CURDIR)/.venv/bin/podman-compose
-COMPOSE = PODMAN_COMPOSE_PROVIDER=$(PODMAN_COMPOSE_PROVIDER) $(PODMAN) compose
+PODMAN_COMPOSE ?= $(CURDIR)/.venv/bin/podman-compose
+COMPOSE = $(PODMAN_COMPOSE) --podman-path $(PODMAN)
 COMPOSE_SERVICES = postgres redis minio fake-llm-primary fake-llm-secondary litellm prometheus grafana
 ENV_FILE ?= .env
 COMPOSE_WAIT_TIMEOUT ?= 180
@@ -44,10 +44,11 @@ check: lint typecheck coverage
 test: check
 
 compose-config:
-	$(PODMAN_COMPOSE_PROVIDER) --env-file $(ENV_FILE) config --quiet
+	$(COMPOSE) --env-file $(ENV_FILE) config --quiet
 
 compose-up:
-	$(COMPOSE) --env-file $(ENV_FILE) up --wait --wait-timeout $(COMPOSE_WAIT_TIMEOUT) $(COMPOSE_SERVICES)
+	$(COMPOSE) --env-file $(ENV_FILE) run --rm --no-deps -T prometheus-credentials
+	$(COMPOSE) --env-file $(ENV_FILE) up --detach --wait --wait-timeout $(COMPOSE_WAIT_TIMEOUT) $(COMPOSE_SERVICES)
 	$(COMPOSE) --env-file $(ENV_FILE) run --rm --no-deps -T minio-init
 
 compose-smoke:

@@ -31,6 +31,7 @@ router_settings:
   cooldown_time: 60
 
 litellm_settings:
+  callbacks: ["prometheus"]
   request_timeout: 120
   drop_params: false
   set_verbose: false

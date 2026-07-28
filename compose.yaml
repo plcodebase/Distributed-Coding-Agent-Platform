@@ -152,6 +152,20 @@ services:
       retries: 30
     restart: unless-stopped
 
+  prometheus-credentials:
+    image: alpine:3.23.3
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
+    volumes:
+      - prometheus-secrets:/secrets
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >
+        umask 077;
+        printf '%s' "$$LITELLM_MASTER_KEY" > /secrets/litellm-master-key;
+        chmod 0444 /secrets/litellm-master-key
+    restart: "no"
+
   prometheus:
     image: prom/prometheus:v3.11.3-distroless
     command:
@@ -162,6 +176,7 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./deployments/podman-compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-secrets:/run/secrets:ro
       - prometheus-data:/prometheus
     healthcheck:
       test:
@@ -186,6 +201,9 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
@@ -209,4 +227,5 @@ volumes:
   postgres-data:
   minio-data:
   prometheus-data:
+  prometheus-secrets:
   grafana-data:

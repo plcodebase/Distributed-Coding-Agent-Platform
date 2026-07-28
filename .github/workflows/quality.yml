@@ -45,7 +45,7 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install --yes podman
       - name: Validate Podman Compose configuration
-        run: .venv/bin/podman-compose --env-file .env.example config --quiet
+        run: make compose-config ENV_FILE=.env.example
       - run: podman build --tag agent-platform-fake-llm:test --file services/fake-llm/Containerfile services/fake-llm
       - name: Start Podman dependency stack
         run: make compose-up ENV_FILE=.env.example

@@ -25,12 +25,12 @@ make compose-up
 make compose-smoke
 ```
 
-`make compose-up` starts shared infrastructure only and pins `podman-compose` as
-Podman's Compose provider. `make compose-smoke` verifies every exposed dependency and
-routes requests through LiteLLM to both deterministic fake providers. Agent
-applications and workers are added in later implementation sequences. The fake
-LiteLLM routes are the default local configuration and do not need provider
-credentials.
+`make compose-up` starts shared infrastructure only and invokes the locked
+`podman-compose` package with the native Podman CLI explicitly. `make compose-smoke`
+verifies every exposed dependency and routes requests through LiteLLM to both
+deterministic fake providers. Agent applications and workers are added in later
+implementation sequences. The fake LiteLLM routes are the default local configuration
+and do not need provider credentials.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
 sandbox environments.

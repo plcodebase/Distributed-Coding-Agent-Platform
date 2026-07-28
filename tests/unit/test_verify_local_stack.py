@@ -165,7 +165,7 @@ def test_tcp_and_redis_protocol_checks(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_text_and_grafana_checks_validate_response_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(stack, "_local_http_request", lambda _url: b"ready")
+    monkeypatch.setattr(stack, "_local_http_request", lambda _url: b"Server is Ready")
     stack._check_text_endpoint("http://localhost/ready", "ready")
 
     with pytest.raises(ValueError, match="did not contain"):

@@ -116,7 +116,7 @@ def _check_redis() -> None:
 
 def _check_text_endpoint(url: str, expected_text: str) -> None:
     response = _local_http_request(url).decode(errors="replace")
-    if expected_text not in response:
+    if expected_text.casefold() not in response.casefold():
         raise ValueError(f"response did not contain {expected_text!r}")
 
 

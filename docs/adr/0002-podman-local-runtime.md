@@ -11,7 +11,8 @@ owner explicitly requires Podman and prohibits use of Docker tooling.
 ## Decision
 
 - Use rootless Podman for local images, networks, volumes, and containers.
-- Use `podman compose` with the locked `podman-compose` provider.
+- Invoke the locked `podman-compose` package with the native Podman CLI path. This
+  avoids provider auto-selection and Podman wrapper connection remapping.
 - Name build recipes `Containerfile`.
 - Keep the provider-neutral `Sandbox` boundary so Kubernetes and future runtimes do not
   enter `agent-core`.

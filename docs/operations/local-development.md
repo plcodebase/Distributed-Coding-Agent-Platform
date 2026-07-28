@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - `uv` with Python 3.12 support
-- Podman 5 or newer with a running Podman machine on macOS
+- Podman 6 or newer with a running Podman machine on macOS
 - `podman-compose` (installed by `make bootstrap`)
 - GNU Make
 
