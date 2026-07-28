@@ -12,11 +12,11 @@ class SessionStatus(StrEnum):
 
 
 class ApprovalMode(StrEnum):
-    """When a session requires human approval for a proposed action."""
+    """Human-confirmation policy; safety validation remains mandatory in every mode."""
 
-    ALWAYS = "always"
-    ON_REQUEST = "on_request"
-    NEVER = "never"
+    REQUIRE_ALL = "require_all"
+    REQUIRE_SENSITIVE = "require_sensitive"
+    AUTO_APPROVE = "auto_approve"
 
 
 class RunStatus(StrEnum):

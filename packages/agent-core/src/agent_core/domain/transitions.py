@@ -24,11 +24,9 @@ RUN_STATUS_TRANSITIONS: Mapping[RunStatus, frozenset[RunStatus]] = {
         }
     ),
     RunStatus.WAITING_APPROVAL: frozenset(
-        {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST}
+        {RunStatus.QUEUED, RunStatus.FAILED, RunStatus.CANCELLED}
     ),
-    RunStatus.RETRY_PENDING: frozenset(
-        {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.LOST}
-    ),
+    RunStatus.RETRY_PENDING: frozenset({RunStatus.QUEUED, RunStatus.FAILED, RunStatus.CANCELLED}),
     RunStatus.LOST: frozenset({RunStatus.QUEUED, RunStatus.CANCELLED}),
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
@@ -110,10 +108,13 @@ def transition_run(
         data["lease_expires_at"] = normalized_expiry
     elif new_status is RunStatus.RUNNING:
         data["started_at"] = run.started_at or timestamp
+    elif new_status in {RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING}:
+        data["assigned_worker_id"] = None
+        data["lease_expires_at"] = None
     elif new_status is RunStatus.QUEUED:
         data["assigned_worker_id"] = None
         data["lease_expires_at"] = None
-        if run.status is RunStatus.LOST:
+        if run.status in {RunStatus.RETRY_PENDING, RunStatus.LOST}:
             data["attempt"] = run.attempt + 1
     elif new_status is RunStatus.LOST:
         data["lease_expires_at"] = None

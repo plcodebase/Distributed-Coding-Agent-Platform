@@ -4,6 +4,8 @@ from agent_core.domain import (
     ApprovalMode,
     Checkpoint,
     DomainOperationError,
+    ErrorDetail,
+    FrozenJsonObject,
     InvalidRunTransitionError,
     ModelCall,
     ModelCallStatus,
@@ -15,16 +17,25 @@ from agent_core.domain import (
     ToolCallStatus,
     transition_run,
 )
-from agent_core.events import AgentEvent, AnyAgentEvent, EventType, parse_agent_event
+from agent_core.events import (
+    MAX_EVENT_PAYLOAD_BYTES,
+    AgentEvent,
+    AnyAgentEvent,
+    EventType,
+    parse_agent_event,
+)
 from agent_core.settings import PlatformSettings
 
 __all__ = [
+    "MAX_EVENT_PAYLOAD_BYTES",
     "AgentEvent",
     "AnyAgentEvent",
     "ApprovalMode",
     "Checkpoint",
     "DomainOperationError",
+    "ErrorDetail",
     "EventType",
+    "FrozenJsonObject",
     "InvalidRunTransitionError",
     "ModelCall",
     "ModelCallStatus",

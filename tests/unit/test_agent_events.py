@@ -4,15 +4,22 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from agent_core.domain import JsonObject, ToolCallStatus, canonical_argument_hash
+from agent_core.domain import (
+    ErrorDetail,
+    FrozenJsonObject,
+    JsonObject,
+    ToolCallStatus,
+    canonical_argument_hash,
+)
 from agent_core.events import (
+    MAX_EVENT_PAYLOAD_BYTES,
     AgentEvent,
     CheckpointCreatedEvent,
     ContextBuildStartedEvent,
-    ErrorDetail,
     EventType,
     ModelRequestStartedEvent,
     ModelTextDeltaEvent,
+    ModelTextDeltaPayload,
     ModelToolCallReceivedEvent,
     RunCompletedEvent,
     RunFailedEvent,
@@ -286,7 +293,135 @@ def test_event_and_nested_error_are_immutable() -> None:
     )
 
     assert isinstance(event.payload.error, ErrorDetail)
+    assert isinstance(event.payload.error.details, FrozenJsonObject)
     with pytest.raises(ValidationError, match="frozen"):
         assign_attribute(event, "sequence", 10)
     with pytest.raises(ValidationError, match="frozen"):
         assign_attribute(event.payload.error, "retryable", True)
+
+
+def test_event_model_copy_revalidates_envelope_and_payload() -> None:
+    event = RunStartedEvent(
+        run_id=RUN_ID,
+        sequence=1,
+        payload={"attempt": 1, "worker_id": "worker-1"},
+        created_at=NOW,
+    )
+
+    with pytest.raises(ValidationError, match="Input should be"):
+        event.model_copy(update={"event_type": EventType.RUN_FAILED})
+    with pytest.raises(ValidationError, match="greater than or equal"):
+        event.model_copy(update={"sequence": 0})
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        event.model_copy(
+            update={
+                "payload": {
+                    "attempt": 1,
+                    "worker_id": "worker-1",
+                    "provider_specific": True,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")])
+def test_events_reject_non_finite_numbers_in_all_json_paths(number: float) -> None:
+    base = {
+        "run_id": RUN_ID,
+        "sequence": 1,
+        "created_at": NOW,
+    }
+
+    with pytest.raises(ValidationError, match="finite"):
+        parse_agent_event(
+            {
+                **base,
+                "event_type": EventType.MODEL_TOOL_CALL_RECEIVED,
+                "payload": {
+                    "model_call_id": "model-call-finite",
+                    "tool_call_id": "tool-call-finite",
+                    "tool_name": "read_file",
+                    "arguments": {"number": number},
+                    "argument_hash": "0" * 64,
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="finite"):
+        parse_agent_event(
+            {
+                **base,
+                "event_type": EventType.TOOL_COMPLETED,
+                "payload": {
+                    "tool_call_id": "tool-call-finite",
+                    "status": ToolCallStatus.COMPLETED,
+                    "result": {"number": number},
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="finite"):
+        parse_agent_event(
+            {
+                **base,
+                "event_type": EventType.RUN_FAILED,
+                "payload": {
+                    "error": {
+                        "code": "invalid_number",
+                        "message": "details must contain finite JSON",
+                        "details": {"number": number},
+                    }
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="finite"):
+        parse_agent_event(
+            {
+                **base,
+                "event_type": EventType.RUN_RETRY_SCHEDULED,
+                "payload": {
+                    "attempt": 2,
+                    "delay_seconds": number,
+                    "error": {
+                        "code": "gateway_failure",
+                        "message": "gateway request failed",
+                    },
+                },
+            }
+        )
+
+
+def test_event_payload_size_limit_uses_serialized_utf8_bytes() -> None:
+    model_call_id = "model-call-size"
+    one_character_payload = ModelTextDeltaPayload(
+        model_call_id=model_call_id,
+        delta="x",
+    )
+    payload_overhead = len(one_character_payload.model_dump_json().encode("utf-8")) - 1
+    exact_delta = "x" * (MAX_EVENT_PAYLOAD_BYTES - payload_overhead)
+
+    exact_event = ModelTextDeltaEvent(
+        run_id=RUN_ID,
+        sequence=1,
+        payload={"model_call_id": model_call_id, "delta": exact_delta},
+        created_at=NOW,
+    )
+    assert len(exact_event.payload.model_dump_json().encode("utf-8")) == MAX_EVENT_PAYLOAD_BYTES
+
+    with pytest.raises(ValidationError, match="serialized event payload exceeds"):
+        exact_event.model_copy(
+            update={
+                "payload": {
+                    "model_call_id": model_call_id,
+                    "delta": f"{exact_delta}x",
+                }
+            }
+        )
+
+    multibyte_delta = "界" * ((MAX_EVENT_PAYLOAD_BYTES - payload_overhead) // 3 + 1)
+    assert len(multibyte_delta) < MAX_EVENT_PAYLOAD_BYTES
+    with pytest.raises(ValidationError, match="serialized event payload exceeds"):
+        ModelTextDeltaEvent(
+            run_id=RUN_ID,
+            sequence=2,
+            payload={"model_call_id": model_call_id, "delta": multibyte_delta},
+            created_at=NOW,
+        )

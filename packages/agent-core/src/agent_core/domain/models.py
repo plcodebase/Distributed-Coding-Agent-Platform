@@ -6,11 +6,12 @@ import decimal  # noqa: TC003 - Pydantic resolves this field type at runtime
 import hashlib
 import json
 import uuid  # noqa: TC003 - Pydantic resolves this field type at runtime
-from typing import Annotated, Self
+from typing import TYPE_CHECKING, Annotated, Any, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
-from agent_core.domain.base import AwareTimestamp, DomainModel, JsonObject, thaw_json_object
+from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject, JsonObject
+from agent_core.domain.errors import DomainOperationError
 from agent_core.domain.status import (
     ApprovalMode,
     ModelCallStatus,
@@ -18,6 +19,9 @@ from agent_core.domain.status import (
     SessionStatus,
     ToolCallStatus,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 type NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 type IdentifierString = Annotated[
@@ -45,8 +49,9 @@ _STARTED_RUN_STATUSES = frozenset(
         RunStatus.FAILED,
     }
 )
-_ASSIGNED_RUN_STATUSES = frozenset(
-    {RunStatus.LEASED, RunStatus.RUNNING, RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING}
+_ASSIGNED_RUN_STATUSES = frozenset({RunStatus.LEASED, RunStatus.RUNNING})
+_UNASSIGNED_RUN_STATUSES = frozenset(
+    {RunStatus.QUEUED, RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING}
 )
 _TERMINAL_TOOL_STATUSES = frozenset(
     {ToolCallStatus.COMPLETED, ToolCallStatus.FAILED, ToolCallStatus.CANCELLED}
@@ -54,11 +59,14 @@ _TERMINAL_TOOL_STATUSES = frozenset(
 _TERMINAL_MODEL_STATUSES = frozenset({ModelCallStatus.COMPLETED, ModelCallStatus.FAILED})
 
 
-def canonical_argument_hash(arguments: JsonObject) -> str:
+def canonical_argument_hash(arguments: JsonObject | FrozenJsonObject) -> str:
     """Hash canonical JSON tool arguments for idempotency comparisons."""
 
+    json_arguments = (
+        arguments.to_json_object() if isinstance(arguments, FrozenJsonObject) else arguments
+    )
     encoded = json.dumps(
-        thaw_json_object(arguments),
+        json_arguments,
         allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -103,6 +111,35 @@ class Run(DomainModel):
     started_at: AwareTimestamp | None = None
     completed_at: AwareTimestamp | None = None
 
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Revalidate copies and require the transition API for status changes."""
+
+        if update is not None and "status" in update:
+            requested_value = update["status"]
+            try:
+                requested_status = RunStatus(requested_value)
+            except (TypeError, ValueError):
+                requested_status = None
+            if requested_status is not self.status:
+                requested_display = (
+                    requested_status.value if requested_status is not None else str(requested_value)
+                )
+                raise DomainOperationError(
+                    code="run_status_update_requires_transition",
+                    message="run status changes must use transition_run",
+                    details={
+                        "run_id": str(self.id),
+                        "current_status": self.status.value,
+                        "requested_status": requested_display,
+                    },
+                )
+        return super().model_copy(update=update, deep=deep)
+
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
         if self.started_at is not None and self.started_at < self.created_at:
@@ -117,10 +154,10 @@ class Run(DomainModel):
             raise ValueError(f"{self.status.value} run must have assigned_worker_id")
         if self.status in _ASSIGNED_RUN_STATUSES and self.lease_expires_at is None:
             raise ValueError(f"{self.status.value} run must have lease_expires_at")
-        if self.status is RunStatus.QUEUED and (
+        if self.status in _UNASSIGNED_RUN_STATUSES and (
             self.assigned_worker_id is not None or self.lease_expires_at is not None
         ):
-            raise ValueError("queued run may not retain a worker lease")
+            raise ValueError(f"{self.status.value} run may not retain a worker lease")
 
         if self.status in _TERMINAL_RUN_STATUSES:
             if self.completed_at is None:
@@ -137,11 +174,11 @@ class ToolCall(DomainModel):
     run_id: uuid.UUID
     turn_number: int = Field(ge=1)
     tool_name: ToolName
-    arguments: JsonObject
+    arguments: FrozenJsonObject
     argument_hash: Sha256Hex
     status: ToolCallStatus
     workspace_version: IdentifierString | None = None
-    result: JsonObject | None = None
+    result: FrozenJsonObject | None = None
     started_at: AwareTimestamp | None = None
     completed_at: AwareTimestamp | None = None
 
@@ -178,7 +215,7 @@ class Checkpoint(DomainModel):
     message_sequence: int = Field(ge=0)
     workspace_snapshot_uri: NonEmptyString
     workspace_revision: IdentifierString
-    task_plan: JsonObject
+    task_plan: FrozenJsonObject
     context_summary: str | None = None
     created_at: AwareTimestamp
 

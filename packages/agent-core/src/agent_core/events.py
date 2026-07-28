@@ -8,9 +8,12 @@ from typing import Annotated, ClassVar, Literal, Self
 
 from pydantic import Field, StringConstraints, TypeAdapter, model_validator
 
-from agent_core.domain.base import AwareTimestamp, DomainModel, JsonObject
+from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject
+from agent_core.domain.errors import ErrorDetail
 from agent_core.domain.models import IdentifierString, Sha256Hex, ToolName, canonical_argument_hash
 from agent_core.domain.status import ToolCallStatus
+
+MAX_EVENT_PAYLOAD_BYTES = 1024 * 1024
 
 
 class EventType(StrEnum):
@@ -34,23 +37,6 @@ class EventType(StrEnum):
 
 class EventPayload(DomainModel):
     """Base for closed-schema event payloads."""
-
-
-class ErrorDetail(DomainModel):
-    """Transport-safe failure detail without provider-specific exception objects."""
-
-    code: Annotated[
-        str,
-        StringConstraints(
-            strip_whitespace=True,
-            min_length=1,
-            max_length=100,
-            pattern=r"^[a-z][a-z0-9_]*$",
-        ),
-    ]
-    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-    retryable: bool = False
-    details: JsonObject = Field(default_factory=dict)
 
 
 class RunStartedPayload(EventPayload):
@@ -78,7 +64,7 @@ class ModelToolCallReceivedPayload(EventPayload):
     model_call_id: IdentifierString
     tool_call_id: IdentifierString
     tool_name: ToolName
-    arguments: JsonObject
+    arguments: FrozenJsonObject
     argument_hash: Sha256Hex
 
     @model_validator(mode="after")
@@ -91,7 +77,7 @@ class ModelToolCallReceivedPayload(EventPayload):
 class ToolApprovalRequiredPayload(EventPayload):
     tool_call_id: IdentifierString
     tool_name: ToolName
-    arguments: JsonObject
+    arguments: FrozenJsonObject
     argument_hash: Sha256Hex
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -120,7 +106,7 @@ class ToolCompletedPayload(EventPayload):
         ToolCallStatus.FAILED,
         ToolCallStatus.CANCELLED,
     ]
-    result: JsonObject | None = None
+    result: FrozenJsonObject | None = None
     error: ErrorDetail | None = None
 
     @model_validator(mode="after")
@@ -168,6 +154,11 @@ class AgentEvent[PayloadT: EventPayload](DomainModel):
     def validate_concrete_event(self) -> Self:
         if not self.is_concrete_event:
             raise ValueError("AgentEvent must use a concrete event type")
+        payload_size = len(self.payload.model_dump_json().encode("utf-8"))
+        if payload_size > MAX_EVENT_PAYLOAD_BYTES:
+            raise ValueError(
+                f"serialized event payload exceeds {MAX_EVENT_PAYLOAD_BYTES}-byte limit"
+            )
         return self
 
     @property
@@ -274,6 +265,7 @@ def parse_agent_event(value: object) -> AnyAgentEvent:
 
 
 __all__ = [
+    "MAX_EVENT_PAYLOAD_BYTES",
     "AgentEvent",
     "AnyAgentEvent",
     "CheckpointCreatedEvent",

@@ -1,7 +1,11 @@
 """Core domain models and centrally validated state transitions."""
 
-from agent_core.domain.base import AwareTimestamp, DomainModel, JsonObject
-from agent_core.domain.errors import DomainOperationError, InvalidRunTransitionError
+from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject, JsonObject
+from agent_core.domain.errors import (
+    DomainOperationError,
+    ErrorDetail,
+    InvalidRunTransitionError,
+)
 from agent_core.domain.models import (
     Checkpoint,
     ModelCall,
@@ -30,6 +34,8 @@ __all__ = [
     "Checkpoint",
     "DomainModel",
     "DomainOperationError",
+    "ErrorDetail",
+    "FrozenJsonObject",
     "InvalidRunTransitionError",
     "JsonObject",
     "ModelCall",

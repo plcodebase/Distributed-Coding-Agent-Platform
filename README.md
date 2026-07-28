@@ -24,7 +24,9 @@ Sequence 2 provides:
 - a centrally enforced run state machine with structured transition errors;
 - canonical tool-argument hashes for stable idempotency comparisons;
 - typed payload contracts for every agent event named in the design;
-- closed-schema parsing for untrusted event data and UTC-aware timestamps.
+- finite, immutable domain JSON with ordinary JSON wire serialization;
+- closed-schema parsing, 1 MiB event-payload limits, and UTC-aware timestamps;
+- explicit approval policies and lease-free approval/retry suspension states.
 
 ## Local setup
 

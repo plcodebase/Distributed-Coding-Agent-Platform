@@ -1,14 +1,19 @@
+import operator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
 from agent_core.domain import (
+    RUN_STATUS_TRANSITIONS,
     ApprovalMode,
     Checkpoint,
     DomainOperationError,
+    ErrorDetail,
+    FrozenJsonObject,
     InvalidRunTransitionError,
     JsonObject,
     ModelCall,
@@ -34,6 +39,10 @@ CHECKPOINT_ID = UUID("50000000-0000-0000-0000-000000000005")
 
 def assign_attribute(target: object, name: str, value: object) -> None:
     setattr(target, name, value)
+
+
+def assign_mapping_item(target: Any, key: str, value: object) -> None:
+    operator.setitem(target, key, value)
 
 
 def queued_run() -> Run:
@@ -69,7 +78,7 @@ def test_session_is_closed_immutable_and_normalizes_timestamps() -> None:
         tenant_id=TENANT_ID,
         workspace_id=WORKSPACE_ID,
         status=SessionStatus.ACTIVE,
-        approval_mode=ApprovalMode.ON_REQUEST,
+        approval_mode=ApprovalMode.REQUIRE_SENSITIVE,
         model_route=" coding-default ",
         created_at="2026-07-28T05:00:00-07:00",
         updated_at="2026-07-28T12:01:00Z",
@@ -89,7 +98,7 @@ def test_session_rejects_naive_and_reversed_timestamps() -> None:
         "tenant_id": TENANT_ID,
         "workspace_id": WORKSPACE_ID,
         "status": SessionStatus.ACTIVE,
-        "approval_mode": ApprovalMode.ALWAYS,
+        "approval_mode": ApprovalMode.REQUIRE_ALL,
         "model_route": "coding-default",
         "created_at": NOW,
         "updated_at": NOW,
@@ -101,6 +110,28 @@ def test_session_rejects_naive_and_reversed_timestamps() -> None:
         )
     with pytest.raises(ValidationError, match="may not precede"):
         Session.model_validate({**values, "updated_at": NOW - timedelta(seconds=1)})
+
+
+def test_approval_modes_have_explicit_human_confirmation_semantics() -> None:
+    assert [mode.value for mode in ApprovalMode] == [
+        "require_all",
+        "require_sensitive",
+        "auto_approve",
+    ]
+
+    values = {
+        "id": SESSION_ID,
+        "tenant_id": TENANT_ID,
+        "workspace_id": WORKSPACE_ID,
+        "status": SessionStatus.ACTIVE,
+        "model_route": "coding-default",
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+    for mode in ApprovalMode:
+        assert Session.model_validate({**values, "approval_mode": mode.value}).approval_mode is mode
+    with pytest.raises(ValidationError, match="Input should be"):
+        Session.model_validate({**values, "approval_mode": "never"})
 
 
 def test_run_follows_happy_path_and_sets_lifecycle_fields() -> None:
@@ -121,34 +152,169 @@ def test_run_follows_happy_path_and_sets_lifecycle_fields() -> None:
         RunStatus.WAITING_APPROVAL,
         occurred_at=NOW + timedelta(seconds=3),
     )
-    resumed = transition_run(
+    approval_requeued = transition_run(
         waiting,
-        RunStatus.RUNNING,
+        RunStatus.QUEUED,
         occurred_at=NOW + timedelta(seconds=4),
+    )
+    approval_leased = transition_run(
+        approval_requeued,
+        RunStatus.LEASED,
+        occurred_at=NOW + timedelta(seconds=5),
+        worker_id="worker-2",
+        lease_expires_at=NOW + timedelta(seconds=30),
+    )
+    resumed = transition_run(
+        approval_leased,
+        RunStatus.RUNNING,
+        occurred_at=NOW + timedelta(seconds=6),
     )
     retrying = transition_run(
         resumed,
         RunStatus.RETRY_PENDING,
-        occurred_at=NOW + timedelta(seconds=5),
+        occurred_at=NOW + timedelta(seconds=7),
+    )
+    retry_requeued = transition_run(
+        retrying,
+        RunStatus.QUEUED,
+        occurred_at=NOW + timedelta(seconds=8),
+    )
+    retry_leased = transition_run(
+        retry_requeued,
+        RunStatus.LEASED,
+        occurred_at=NOW + timedelta(seconds=9),
+        worker_id="worker-3",
+        lease_expires_at=NOW + timedelta(seconds=40),
     )
     retried = transition_run(
-        retrying,
+        retry_leased,
         RunStatus.RUNNING,
-        occurred_at=NOW + timedelta(seconds=6),
+        occurred_at=NOW + timedelta(seconds=10),
     )
     completed = transition_run(
         retried,
         RunStatus.COMPLETED,
-        occurred_at=NOW + timedelta(seconds=7),
+        occurred_at=NOW + timedelta(seconds=11),
     )
 
     assert leased.assigned_worker_id == "worker-1"
     assert running.started_at == NOW + timedelta(seconds=2)
+    assert waiting.assigned_worker_id is None
+    assert waiting.lease_expires_at is None
+    assert approval_requeued.attempt == 1
     assert resumed.started_at == running.started_at
-    assert completed.completed_at == NOW + timedelta(seconds=7)
-    assert completed.assigned_worker_id == "worker-1"
+    assert retrying.assigned_worker_id is None
+    assert retrying.lease_expires_at is None
+    assert retry_requeued.attempt == 2
+    assert completed.completed_at == NOW + timedelta(seconds=11)
+    assert completed.assigned_worker_id == "worker-3"
     assert completed.lease_expires_at is None
     assert allowed_run_transitions(completed.status) == frozenset()
+
+
+def run_in_status(status: RunStatus) -> Run:
+    """Build each valid state through the transition API for matrix tests."""
+
+    if status is RunStatus.QUEUED:
+        return queued_run()
+    if status is RunStatus.CANCELLED:
+        return transition_run(
+            queued_run(),
+            status,
+            occurred_at=NOW + timedelta(seconds=1),
+        )
+
+    leased = transition_run(
+        queued_run(),
+        RunStatus.LEASED,
+        occurred_at=NOW + timedelta(seconds=1),
+        worker_id="worker-matrix",
+        lease_expires_at=NOW + timedelta(seconds=30),
+    )
+    if status is RunStatus.LEASED:
+        return leased
+    if status is RunStatus.LOST:
+        return transition_run(
+            leased,
+            status,
+            occurred_at=NOW + timedelta(seconds=2),
+        )
+
+    running = transition_run(
+        leased,
+        RunStatus.RUNNING,
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+    if status is RunStatus.RUNNING:
+        return running
+    return transition_run(
+        running,
+        status,
+        occurred_at=NOW + timedelta(seconds=3),
+    )
+
+
+def transition_for_matrix(run: Run, requested_status: RunStatus) -> Run:
+    if requested_status is RunStatus.LEASED:
+        return transition_run(
+            run,
+            requested_status,
+            occurred_at=NOW + timedelta(seconds=100),
+            worker_id="worker-next",
+            lease_expires_at=NOW + timedelta(seconds=200),
+        )
+    return transition_run(
+        run,
+        requested_status,
+        occurred_at=NOW + timedelta(seconds=100),
+    )
+
+
+def test_run_transition_matrix_allows_and_rejects_every_status_pair() -> None:
+    expected = {
+        RunStatus.QUEUED: {RunStatus.LEASED, RunStatus.CANCELLED},
+        RunStatus.LEASED: {
+            RunStatus.RUNNING,
+            RunStatus.QUEUED,
+            RunStatus.CANCELLED,
+            RunStatus.LOST,
+        },
+        RunStatus.RUNNING: {
+            RunStatus.WAITING_APPROVAL,
+            RunStatus.RETRY_PENDING,
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.LOST,
+        },
+        RunStatus.WAITING_APPROVAL: {
+            RunStatus.QUEUED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        },
+        RunStatus.RETRY_PENDING: {
+            RunStatus.QUEUED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        },
+        RunStatus.LOST: {RunStatus.QUEUED, RunStatus.CANCELLED},
+        RunStatus.COMPLETED: set(),
+        RunStatus.FAILED: set(),
+        RunStatus.CANCELLED: set(),
+    }
+    assert {
+        status: set(successors) for status, successors in RUN_STATUS_TRANSITIONS.items()
+    } == expected
+
+    for current_status in RunStatus:
+        for requested_status in RunStatus:
+            run = run_in_status(current_status)
+            if requested_status in expected[current_status]:
+                transitioned = transition_for_matrix(run, requested_status)
+                assert transitioned.status is requested_status
+            else:
+                with pytest.raises(InvalidRunTransitionError):
+                    transition_for_matrix(run, requested_status)
 
 
 def test_invalid_transition_has_stable_structured_error() -> None:
@@ -164,6 +330,7 @@ def test_invalid_transition_has_stable_structured_error() -> None:
     assert error.as_dict() == {
         "code": "invalid_run_transition",
         "message": "run cannot transition from queued to completed",
+        "retryable": False,
         "details": {
             "current_status": "queued",
             "requested_status": "completed",
@@ -300,6 +467,32 @@ def test_run_model_rejects_temporal_and_lease_invariants(
         Run.model_validate({**queued_run().model_dump(), **updates})
 
 
+def test_model_copy_revalidates_and_run_status_requires_transition_api() -> None:
+    run = queued_run()
+
+    assert run.model_copy(update={"priority": 20}).priority == 20
+    with pytest.raises(DomainOperationError) as captured:
+        run.model_copy(update={"status": RunStatus.COMPLETED})
+    assert captured.value.code == "run_status_update_requires_transition"
+    assert captured.value.as_dict()["details"] == {
+        "run_id": str(RUN_ID),
+        "current_status": "queued",
+        "requested_status": "completed",
+    }
+
+    with pytest.raises(ValidationError, match="started_at may not precede"):
+        run.model_copy(update={"started_at": NOW - timedelta(seconds=1)})
+
+
+def test_suspended_run_models_reject_retained_worker_capacity() -> None:
+    running = running_run()
+    values = running.model_dump()
+
+    for status in (RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING):
+        with pytest.raises(ValidationError, match="may not retain a worker lease"):
+            Run.model_validate({**values, "status": status})
+
+
 def test_cancellation_marks_request_and_completion() -> None:
     cancelled = transition_run(
         queued_run(),
@@ -332,10 +525,21 @@ def test_tool_call_hash_is_canonical_and_validated() -> None:
         argument_hash=argument_hash,
         status=ToolCallStatus.RECEIVED,
     )
+    assert isinstance(call.arguments, FrozenJsonObject)
+    assert isinstance(call.arguments["replacements"], tuple)
+    replacements = call.arguments["replacements"]
+    assert isinstance(replacements, tuple)
+    assert isinstance(replacements[0], FrozenJsonObject)
     assert call.model_dump()["arguments"] == arguments
     assert ToolCall.model_validate_json(call.model_dump_json()) == call
     with pytest.raises(TypeError, match="does not support item assignment"):
-        call.arguments["path"] = "mutated.py"
+        assign_mapping_item(call.arguments, "path", "mutated.py")
+    with pytest.raises(AttributeError, match="immutable"):
+        assign_attribute(call.arguments, "_values", {})
+
+    wire_arguments = call.arguments.to_json_object()
+    wire_arguments["path"] = "wire-copy.py"
+    assert call.arguments["path"] == "src/main.py"
 
     with pytest.raises(ValidationError, match="does not match"):
         ToolCall.model_validate({**call.model_dump(), "argument_hash": "0" * 64})
@@ -359,7 +563,8 @@ def test_tool_call_validates_execution_timestamps() -> None:
     }
 
     completed = ToolCall.model_validate(values)
-    assert completed.result == {"exit_code": 0}
+    assert completed.result is not None
+    assert completed.result.to_json_object() == {"exit_code": 0}
     with pytest.raises(ValidationError, match="must have started_at"):
         ToolCall.model_validate({**values, "started_at": None})
     with pytest.raises(ValidationError, match="may not precede"):
@@ -373,6 +578,24 @@ def test_tool_call_validates_execution_timestamps() -> None:
                 "status": ToolCallStatus.RECEIVED,
             }
         )
+
+
+def test_tool_call_model_copy_revalidates_hash_and_lifecycle() -> None:
+    arguments: JsonObject = {"path": "src/main.py"}
+    call = ToolCall(
+        id="copy-safe-tool-call",
+        run_id=RUN_ID,
+        turn_number=1,
+        tool_name="read_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.RECEIVED,
+    )
+
+    with pytest.raises(ValidationError, match="does not match canonical arguments"):
+        call.model_copy(update={"arguments": {"path": "secrets.txt"}})
+    with pytest.raises(ValidationError, match="must have started_at"):
+        call.model_copy(update={"status": ToolCallStatus.RUNNING})
 
 
 def test_checkpoint_preserves_recovery_identifiers_and_json_plan() -> None:
@@ -389,6 +612,7 @@ def test_checkpoint_preserves_recovery_identifiers_and_json_plan() -> None:
     )
 
     assert checkpoint.workspace_revision == "abc123"
+    assert isinstance(checkpoint.task_plan, FrozenJsonObject)
     assert checkpoint.model_dump()["task_plan"]["steps"] == [{"title": "test", "completed": False}]
 
 
@@ -473,3 +697,84 @@ def test_model_call_rejects_inconsistent_persisted_lifecycle(
     }
     with pytest.raises(ValidationError, match=message):
         ModelCall.model_validate({**values, **updates})
+
+
+def test_model_call_model_copy_revalidates_lifecycle() -> None:
+    call = ModelCall(
+        id="model-call-copy",
+        run_id=RUN_ID,
+        request_id="request-copy",
+        route_name="coding-default",
+        status=ModelCallStatus.STARTED,
+        retry_count=0,
+        fallback_count=0,
+        started_at=NOW,
+    )
+
+    with pytest.raises(ValidationError, match="must have completed_at"):
+        call.model_copy(update={"status": ModelCallStatus.COMPLETED})
+    with pytest.raises(ValidationError, match="greater than or equal"):
+        call.model_copy(update={"retry_count": -1})
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_numbers_are_rejected_recursively(number: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        FrozenJsonObject({"nested": [{"number": number}]})
+
+    arguments: JsonObject = {"path": "src/main.py"}
+    tool_values = {
+        "id": "finite-tool-call",
+        "run_id": RUN_ID,
+        "turn_number": 1,
+        "tool_name": "read_file",
+        "arguments": arguments,
+        "argument_hash": canonical_argument_hash(arguments),
+        "status": ToolCallStatus.RECEIVED,
+    }
+    with pytest.raises(ValidationError, match="finite"):
+        ToolCall.model_validate({**tool_values, "result": {"number": number}})
+    with pytest.raises(ValidationError, match="finite"):
+        Checkpoint(
+            id=CHECKPOINT_ID,
+            run_id=RUN_ID,
+            session_id=SESSION_ID,
+            message_sequence=0,
+            workspace_snapshot_uri="s3://agent-platform/checkpoints/finite",
+            workspace_revision="finite",
+            task_plan={"nested": [number]},
+            created_at=NOW,
+        )
+    with pytest.raises(ValidationError, match="finite"):
+        ErrorDetail(
+            code="invalid_number",
+            message="details must be valid JSON",
+            details={"nested": [number]},
+        )
+
+
+def test_structured_errors_validate_and_serialize_defensively() -> None:
+    error = DomainOperationError(
+        code="invalid_workspace",
+        message=" workspace is unavailable ",
+        retryable=True,
+        details={"paths": ["src/main.py"]},
+    )
+
+    assert error.message == "workspace is unavailable"
+    assert error.retryable is True
+    assert isinstance(error.details, FrozenJsonObject)
+    first_wire_value = error.as_dict()
+    first_wire_value["details"] = {"mutated": True}
+    assert error.as_dict()["details"] == {"paths": ["src/main.py"]}
+
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        DomainOperationError(code="INVALID", message="bad code")
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        DomainOperationError(code="invalid_workspace", message=" ")
+    with pytest.raises(ValidationError, match="valid JSON"):
+        DomainOperationError(
+            code="invalid_workspace",
+            message="bad details",
+            details={"value": object()},  # type: ignore[dict-item]
+        )
