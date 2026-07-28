@@ -8,10 +8,11 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from agent_core.domain.base import normalize_timestamp
-from agent_core.domain.errors import DomainOperationError
+from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.gateway import (
     GatewayEvent,
     GatewayFinishReason,
+    GatewayInvalidToolCallEvent,
     GatewayRequest,
     GatewayResponseCompleted,
     GatewayTextDelta,
@@ -72,6 +73,31 @@ class ScriptedGatewayTurn:
             events=(
                 *((GatewayTextDelta(delta=text),) if text else ()),
                 *(GatewayToolCallEvent(tool_call=tool_call) for tool_call in tool_calls),
+                GatewayResponseCompleted(finish_reason=GatewayFinishReason.TOOL_CALLS),
+            )
+        )
+
+    @classmethod
+    def invalid_tool_call(
+        cls,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        error: ErrorDetail | None = None,
+    ) -> ScriptedGatewayTurn:
+        """Build a call whose provider arguments could not be parsed as JSON."""
+
+        return cls(
+            events=(
+                GatewayInvalidToolCallEvent(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    error=error
+                    or ErrorDetail(
+                        code="malformed_tool_arguments",
+                        message="model-generated tool arguments were not valid JSON",
+                    ),
+                ),
                 GatewayResponseCompleted(finish_reason=GatewayFinishReason.TOOL_CALLS),
             )
         )

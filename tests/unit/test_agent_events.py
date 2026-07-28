@@ -227,6 +227,48 @@ def test_event_payload_rejects_extra_or_mismatched_fields() -> None:
         parse_agent_event({**base, "payload": {**payload, "provider_specific": "value"}})
     with pytest.raises(ValidationError, match="does not match"):
         parse_agent_event({**base, "payload": {**payload, "argument_hash": "0" * 64}})
+    with pytest.raises(ValidationError, match="requires arguments"):
+        parse_agent_event(
+            {
+                **base,
+                "payload": {
+                    "model_call_id": "model-call-1",
+                    "tool_call_id": "tool-call-1",
+                    "tool_name": "read_file",
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="may not contain arguments"):
+        parse_agent_event(
+            {
+                **base,
+                "payload": {
+                    **payload,
+                    "error": {
+                        "code": "malformed_tool_arguments",
+                        "message": "arguments were invalid",
+                    },
+                },
+            }
+        )
+
+    rejected = parse_agent_event(
+        {
+            **base,
+            "payload": {
+                "model_call_id": "model-call-1",
+                "tool_call_id": "tool-call-1",
+                "tool_name": "read_file",
+                "error": {
+                    "code": "malformed_tool_arguments",
+                    "message": "arguments were invalid",
+                },
+            },
+        }
+    )
+    assert isinstance(rejected, ModelToolCallReceivedEvent)
+    assert rejected.payload.arguments is None
+    assert rejected.payload.error is not None
 
     with pytest.raises(ValidationError, match="does not match"):
         parse_agent_event(

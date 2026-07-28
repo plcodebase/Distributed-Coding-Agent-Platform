@@ -1,13 +1,15 @@
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
-from agent_core.domain import DomainOperationError, FrozenJsonObject
+from agent_core.domain import DomainOperationError, ErrorDetail, FrozenJsonObject
 from agent_core.fakes import ScriptedGatewayTurn, SequentialIdGenerator, SteppingClock
 from agent_core.gateway import (
     GatewayEventKind,
     GatewayFinishReason,
+    GatewayInvalidToolCallEvent,
     GatewayMessage,
     GatewayRequest,
     GatewayResponseCompleted,
@@ -21,7 +23,9 @@ from agent_core.gateway import (
 from agent_core.tools import (
     RegisteredTool,
     ToolArguments,
-    ToolExecutionResult,
+    ToolExecutionCompleted,
+    ToolExecutionContext,
+    ToolExecutionEvent,
     ToolRegistry,
 )
 
@@ -36,9 +40,14 @@ class ReadHandler:
     def __init__(self) -> None:
         self.calls: list[ReadArguments] = []
 
-    async def __call__(self, arguments: ReadArguments) -> ToolExecutionResult:
+    async def __call__(
+        self,
+        arguments: ReadArguments,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        assert context.max_output_bytes > 0
         self.calls.append(arguments)
-        return ToolExecutionResult(result={"path": arguments.path})
+        yield ToolExecutionCompleted(result={"path": arguments.path})
 
 
 def read_registration(handler: ReadHandler | None = None) -> RegisteredTool[ReadArguments]:
@@ -116,6 +125,18 @@ def test_gateway_request_rejects_empty_messages_and_duplicate_tools() -> None:
             GatewayToolCallEvent,
         ),
         (
+            {
+                "kind": "invalid_tool_call",
+                "tool_call_id": "call-invalid",
+                "tool_name": "read_file",
+                "error": {
+                    "code": "malformed_tool_arguments",
+                    "message": "arguments were not valid JSON",
+                },
+            },
+            GatewayInvalidToolCallEvent,
+        ),
+        (
             {"kind": "response_completed", "finish_reason": "stop"},
             GatewayResponseCompleted,
         ),
@@ -148,11 +169,17 @@ async def test_tool_registry_validates_before_handler_execution() -> None:
 
     prepared = registry.prepare("read_file", raw_arguments)
     assert handler.calls == []
-    result = await prepared.execute()
+    result = [
+        item
+        async for item in prepared.stream(
+            ToolExecutionContext(max_output_bytes=1024, max_result_bytes=1024)
+        )
+    ]
 
     assert len(handler.calls) == 1
     assert handler.calls[0].path == "src/main.py"
-    assert result.result.to_json_object() == {"path": "src/main.py"}
+    assert isinstance(result[-1], ToolExecutionCompleted)
+    assert result[-1].result.to_json_object() == {"path": "src/main.py"}
     assert registry.definitions[0].input_schema["additionalProperties"] is False
 
 
@@ -196,6 +223,15 @@ def test_deterministic_fakes_validate_scripts_time_and_identifiers() -> None:
     tool_call = GatewayToolCall(id="call-1", name="read_file", arguments={"path": "x"})
     tool_turn = ScriptedGatewayTurn.tool_calls(tool_call)
     assert isinstance(tool_turn.events[0], GatewayToolCallEvent)
+    invalid_turn = ScriptedGatewayTurn.invalid_tool_call(
+        tool_call_id="call-invalid",
+        tool_name="read_file",
+        error=ErrorDetail(
+            code="malformed_tool_arguments",
+            message="arguments were not valid JSON",
+        ),
+    )
+    assert isinstance(invalid_turn.events[0], GatewayInvalidToolCallEvent)
     with pytest.raises(ValueError, match="positive"):
         ScriptedGatewayTurn.text("text", chunk_size=0)
     with pytest.raises(ValueError, match="negative"):

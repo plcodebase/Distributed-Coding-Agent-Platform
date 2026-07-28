@@ -64,12 +64,21 @@ class ModelToolCallReceivedPayload(EventPayload):
     model_call_id: IdentifierString
     tool_call_id: IdentifierString
     tool_name: ToolName
-    arguments: FrozenJsonObject
-    argument_hash: Sha256Hex
+    arguments: FrozenJsonObject | None = None
+    argument_hash: Sha256Hex | None = None
+    error: ErrorDetail | None = None
 
     @model_validator(mode="after")
-    def validate_argument_hash(self) -> Self:
-        if self.argument_hash != canonical_argument_hash(self.arguments):
+    def validate_outcome(self) -> Self:
+        has_arguments = self.arguments is not None
+        has_hash = self.argument_hash is not None
+        if self.error is None and not (has_arguments and has_hash):
+            raise ValueError("accepted tool-call event requires arguments and their hash")
+        if self.error is not None and (has_arguments or has_hash):
+            raise ValueError("rejected tool-call event may not contain arguments or their hash")
+        if self.arguments is not None and self.argument_hash != canonical_argument_hash(
+            self.arguments
+        ):
             raise ValueError("argument_hash does not match canonical arguments")
         return self
 

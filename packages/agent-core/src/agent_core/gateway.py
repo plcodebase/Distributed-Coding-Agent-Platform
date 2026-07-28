@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
 from pydantic import Field, StringConstraints, TypeAdapter, model_validator
 
 from agent_core.domain.base import DomainModel, FrozenJsonObject
+from agent_core.domain.errors import ErrorDetail  # noqa: TC001 - Pydantic resolves at runtime
 from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves these at runtime
     IdentifierString,
     NonEmptyString,
@@ -97,6 +98,7 @@ class GatewayEventKind(StrEnum):
 
     TEXT_DELTA = "text_delta"
     TOOL_CALL = "tool_call"
+    INVALID_TOOL_CALL = "invalid_tool_call"
     RESPONSE_COMPLETED = "response_completed"
 
 
@@ -112,6 +114,15 @@ class GatewayToolCallEvent(DomainModel):
 
     kind: Literal[GatewayEventKind.TOOL_CALL] = GatewayEventKind.TOOL_CALL
     tool_call: GatewayToolCall
+
+
+class GatewayInvalidToolCallEvent(DomainModel):
+    """A provider call whose raw arguments could not be normalized safely."""
+
+    kind: Literal[GatewayEventKind.INVALID_TOOL_CALL] = GatewayEventKind.INVALID_TOOL_CALL
+    tool_call_id: IdentifierString
+    tool_name: ToolName
+    error: ErrorDetail
 
 
 class GatewayFinishReason(StrEnum):
@@ -136,7 +147,10 @@ class GatewayResponseCompleted(DomainModel):
 
 
 type GatewayEvent = Annotated[
-    GatewayTextDelta | GatewayToolCallEvent | GatewayResponseCompleted,
+    GatewayTextDelta
+    | GatewayToolCallEvent
+    | GatewayInvalidToolCallEvent
+    | GatewayResponseCompleted,
     Field(discriminator="kind"),
 ]
 
@@ -160,6 +174,7 @@ __all__ = [
     "GatewayEvent",
     "GatewayEventKind",
     "GatewayFinishReason",
+    "GatewayInvalidToolCallEvent",
     "GatewayMessage",
     "GatewayRequest",
     "GatewayResponseCompleted",

@@ -1,3 +1,4 @@
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -15,7 +16,9 @@ from agent_core.loop import AgentLoop, AgentLoopInput
 from agent_core.tools import (
     RegisteredTool,
     ToolArguments,
-    ToolExecutionResult,
+    ToolExecutionCompleted,
+    ToolExecutionContext,
+    ToolExecutionEvent,
     ToolRegistry,
 )
 
@@ -32,9 +35,11 @@ class InMemoryRepository:
     async def inspect_file(
         self,
         arguments: InspectFileArguments,
-    ) -> ToolExecutionResult:
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        assert context.max_result_bytes > 0
         self.inspected_paths.append(arguments.path)
-        return ToolExecutionResult(
+        yield ToolExecutionCompleted(
             result={
                 "path": arguments.path,
                 "content": self.files[arguments.path],

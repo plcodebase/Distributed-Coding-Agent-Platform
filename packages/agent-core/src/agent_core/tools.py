@@ -1,8 +1,10 @@
-"""Typed tool registration and argument validation for the deterministic loop."""
+"""Typed, streaming tool registration for the deterministic agent loop."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Protocol
+from collections.abc import AsyncGenerator, Sequence
+from enum import StrEnum
+from typing import Annotated, Literal, Protocol
 
 from pydantic import Field, JsonValue, StringConstraints, ValidationError
 
@@ -10,36 +12,71 @@ from agent_core.domain.base import DomainModel, FrozenJsonObject, JsonObject
 from agent_core.domain.errors import DomainOperationError
 from agent_core.gateway import GatewayToolDefinition
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-type OutputChunk = Annotated[str, StringConstraints(min_length=1)]
+type ToolOutputText = Annotated[str, StringConstraints(min_length=1)]
 
 
 class ToolArguments(DomainModel):
     """Base class for closed, immutable, tool-specific argument schemas."""
 
 
-class ToolExecutionResult(DomainModel):
-    """A completed tool result plus bounded-output candidates for event rendering."""
+class ToolExecutionContext(DomainModel):
+    """Resource ceilings a handler must observe before producing data."""
 
+    max_output_bytes: int = Field(ge=1)
+    max_result_bytes: int = Field(ge=1)
+
+
+class ToolExecutionEventKind(StrEnum):
+    """Discriminator values for one tool execution stream."""
+
+    OUTPUT = "output"
+    COMPLETED = "completed"
+
+
+class ToolOutputChannel(StrEnum):
+    """Ordered output channels produced by a tool."""
+
+    STDOUT = "stdout"
+    STDERR = "stderr"
+
+
+class ToolOutputChunk(DomainModel):
+    """One ordered, non-empty output chunk from a running tool."""
+
+    kind: Literal[ToolExecutionEventKind.OUTPUT] = ToolExecutionEventKind.OUTPUT
+    channel: ToolOutputChannel
+    chunk: ToolOutputText
+
+
+class ToolExecutionCompleted(DomainModel):
+    """The single terminal value of a successful tool execution stream."""
+
+    kind: Literal[ToolExecutionEventKind.COMPLETED] = ToolExecutionEventKind.COMPLETED
     result: FrozenJsonObject = Field(default_factory=lambda: FrozenJsonObject({}))
-    stdout: tuple[OutputChunk, ...] = ()
-    stderr: tuple[OutputChunk, ...] = ()
+
+
+type ToolExecutionEvent = ToolOutputChunk | ToolExecutionCompleted
 
 
 class ToolHandler[ArgumentsT: ToolArguments](Protocol):
-    """A handler that can only receive arguments validated against its declared type."""
+    """A handler receiving validated arguments and explicit resource ceilings."""
 
-    async def __call__(self, arguments: ArgumentsT) -> ToolExecutionResult:
-        """Execute one validated logical tool call."""
+    def __call__(
+        self,
+        arguments: ArgumentsT,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        """Stream ordered output followed by exactly one terminal result."""
 
 
 class PreparedToolExecution(Protocol):
-    """A validated, single-use tool operation ready for execution."""
+    """A validated, single-use tool operation ready for bounded execution."""
 
-    async def execute(self) -> ToolExecutionResult:
-        """Invoke the registered handler with its already validated arguments."""
+    def stream(
+        self,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        """Create the execution stream for the already validated arguments."""
 
 
 class _PreparedToolExecution[ArgumentsT: ToolArguments]:
@@ -52,11 +89,14 @@ class _PreparedToolExecution[ArgumentsT: ToolArguments]:
         self._handler = handler
         self._arguments = arguments
 
-    async def execute(self) -> ToolExecutionResult:
-        result = await self._handler(self._arguments)
-        if not isinstance(result, ToolExecutionResult):
-            raise TypeError("tool handler must return ToolExecutionResult")
-        return result
+    def stream(
+        self,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        stream = self._handler(self._arguments, context)
+        if not isinstance(stream, AsyncGenerator):
+            raise TypeError("tool handler must return an async generator")
+        return stream
 
 
 class ToolRegistration(Protocol):
@@ -71,7 +111,7 @@ class ToolRegistration(Protocol):
 
 
 class RegisteredTool[ArgumentsT: ToolArguments]:
-    """Bind one typed Pydantic argument model to one async tool handler."""
+    """Bind one typed Pydantic argument model to one streaming tool handler."""
 
     def __init__(
         self,
@@ -149,8 +189,13 @@ __all__ = [
     "PreparedToolExecution",
     "RegisteredTool",
     "ToolArguments",
-    "ToolExecutionResult",
+    "ToolExecutionCompleted",
+    "ToolExecutionContext",
+    "ToolExecutionEvent",
+    "ToolExecutionEventKind",
     "ToolHandler",
+    "ToolOutputChannel",
+    "ToolOutputChunk",
     "ToolRegistration",
     "ToolRegistry",
 ]

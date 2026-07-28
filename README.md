@@ -36,7 +36,10 @@ Sequence 3 provides:
 - a deterministic scripted gateway that requires no credentials or network access;
 - a bounded async agent loop with typed event emission and injected clocks/IDs;
 - Pydantic tool schemas that validate model-generated arguments before execution;
-- model/tool timeouts plus turn, tool-call, semantic-retry, and UTF-8 byte limits;
+- incrementally bounded, ordered tool streams with producer cancellation at output limits;
+- sanitized tool output/results/errors and safe malformed-call retry feedback;
+- same-run duplicate suppression plus context, request, turn, call, retry, timeout, and
+  UTF-8 byte limits;
 - unit and integration tests for final text, tool calls, malformed arguments, failures,
   and termination limits.
 
