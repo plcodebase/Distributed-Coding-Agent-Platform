@@ -28,6 +28,18 @@ Sequence 2 provides:
 - closed-schema parsing, 1 MiB event-payload limits, and UTC-aware timestamps;
 - explicit approval policies and lease-free approval/retry suspension states.
 
+### Sequence 3: fake model and deterministic agent loop
+
+Sequence 3 provides:
+
+- a provider-neutral streaming model-gateway contract;
+- a deterministic scripted gateway that requires no credentials or network access;
+- a bounded async agent loop with typed event emission and injected clocks/IDs;
+- Pydantic tool schemas that validate model-generated arguments before execution;
+- model/tool timeouts plus turn, tool-call, semantic-retry, and UTF-8 byte limits;
+- unit and integration tests for final text, tool calls, malformed arguments, failures,
+  and termination limits.
+
 ## Local setup
 
 ```shell

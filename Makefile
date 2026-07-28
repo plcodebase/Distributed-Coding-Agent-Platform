@@ -9,7 +9,7 @@ AUDIT_REQUIREMENTS ?= .cache/audit-requirements.txt
 export UV_CACHE_DIR ?= $(CURDIR)/.cache/uv
 export PRE_COMMIT_HOME ?= $(CURDIR)/.cache/pre-commit
 
-.PHONY: bootstrap sync format lint typecheck unit coverage audit check test compose-config compose-up compose-smoke compose-down
+.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test compose-config compose-up compose-smoke compose-down
 
 bootstrap:
 	$(UV) python install 3.12
@@ -32,6 +32,9 @@ typecheck:
 unit:
 	$(UV) run pytest tests/unit
 
+integration:
+	$(UV) run pytest tests/integration
+
 coverage:
 	$(UV) run pytest tests/unit --cov --cov-report=term-missing --cov-report=xml
 
@@ -41,7 +44,7 @@ audit:
 
 check: lint typecheck coverage
 
-test: check
+test: check integration
 
 compose-config:
 	$(COMPOSE) --env-file $(ENV_FILE) config --quiet
