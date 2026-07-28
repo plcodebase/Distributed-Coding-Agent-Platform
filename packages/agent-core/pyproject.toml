@@ -1,7 +1,7 @@
 [project]
 name = "agent-core"
 version = "0.1.0"
-description = "Shared configuration foundation for the agent platform"
+description = "Provider-independent domain contracts for the agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "platform-telemetry",

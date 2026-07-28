@@ -4,15 +4,27 @@ This repository implements the system specified in [`DESIGN.md`](DESIGN.md). Wor
 delivered phase by phase so each layer has a runnable verification gate before later
 distributed-system and sandbox features are added.
 
-## Sequence 1: repository bootstrap and CI
+## Implemented sequences
 
-The current sequence provides:
+### Sequence 1: repository bootstrap and CI
+
+Sequence 1 provides:
 
 - a Python 3.12 `uv` workspace with locked dependencies;
 - lint, type-check, unit-test, coverage, pre-commit, and CI configuration;
 - local PostgreSQL, Redis, S3-compatible storage, LiteLLM, Prometheus, Grafana, and
   deterministic fake-provider services orchestrated by Podman;
 - Pydantic Settings, structured JSON logging, and recursive secret redaction.
+
+### Sequence 2: core agent events and domain models
+
+Sequence 2 provides:
+
+- immutable, validated session, run, tool-call, checkpoint, and model-call models;
+- a centrally enforced run state machine with structured transition errors;
+- canonical tool-argument hashes for stable idempotency comparisons;
+- typed payload contracts for every agent event named in the design;
+- closed-schema parsing for untrusted event data and UTC-aware timestamps.
 
 ## Local setup
 
