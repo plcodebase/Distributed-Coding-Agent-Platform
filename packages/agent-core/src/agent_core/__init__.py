@@ -1,5 +1,6 @@
 """Provider-independent domain contracts for the agent platform."""
 
+from agent_core.checkpoints import CheckpointCoordinator, RewindState
 from agent_core.domain import (
     ApprovalMode,
     Checkpoint,
@@ -49,11 +50,20 @@ from agent_core.loop import (
     Clock,
     IdGenerator,
 )
+from agent_core.sandbox import (
+    CommandCompleted,
+    CommandEvent,
+    CommandOutput,
+    CommandSpec,
+    Sandbox,
+    WorkspaceSnapshot,
+)
 from agent_core.settings import PlatformSettings
 from agent_core.tools import (
     PreparedToolExecution,
     RegisteredTool,
     ToolArguments,
+    ToolEffect,
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolExecutionEvent,
@@ -76,7 +86,12 @@ __all__ = [
     "AnyAgentEvent",
     "ApprovalMode",
     "Checkpoint",
+    "CheckpointCoordinator",
     "Clock",
+    "CommandCompleted",
+    "CommandEvent",
+    "CommandOutput",
+    "CommandSpec",
     "DomainOperationError",
     "ErrorDetail",
     "EventType",
@@ -101,13 +116,16 @@ __all__ = [
     "PlatformSettings",
     "PreparedToolExecution",
     "RegisteredTool",
+    "RewindState",
     "Run",
     "RunStatus",
+    "Sandbox",
     "Session",
     "SessionStatus",
     "ToolArguments",
     "ToolCall",
     "ToolCallStatus",
+    "ToolEffect",
     "ToolExecutionCompleted",
     "ToolExecutionContext",
     "ToolExecutionEvent",
@@ -117,6 +135,7 @@ __all__ = [
     "ToolOutputChunk",
     "ToolRegistration",
     "ToolRegistry",
+    "WorkspaceSnapshot",
     "parse_agent_event",
     "parse_gateway_event",
     "transition_run",

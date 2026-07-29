@@ -36,6 +36,7 @@ from agent_core.loop import AgentLoop, AgentLoopConfig, AgentLoopInput
 from agent_core.tools import (
     RegisteredTool,
     ToolArguments,
+    ToolEffect,
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolExecutionEvent,
@@ -140,6 +141,7 @@ def read_tool(handler: ToolHandler[ReadArguments]) -> RegisteredTool[ReadArgumen
         description="Read one workspace file",
         arguments_type=ReadArguments,
         handler=handler,
+        effect=ToolEffect.READ_ONLY,
     )
 
 
@@ -959,7 +961,12 @@ async def test_model_and_tool_output_limits_are_enforced() -> None:
     assert output_failure.payload.error.code == "tool_output_limit"
     assert handler.closed is True
     assert handler.contexts == [
-        ToolExecutionContext(max_output_bytes=64, max_result_bytes=256 * 1024)
+        ToolExecutionContext(
+            run_id=RUN_ID,
+            tool_call_id="tool-call-output",
+            max_output_bytes=64,
+            max_result_bytes=256 * 1024,
+        )
     ]
 
 

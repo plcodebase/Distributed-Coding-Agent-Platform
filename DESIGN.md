@@ -3,7 +3,7 @@
 **Status:** Draft
 **Audience:** Codex implementation agent and project maintainers
 **Primary language:** Python
-**Deployment target:** Local Docker Compose first, Kubernetes second
+**Deployment target:** Local Podman Compose first, Kubernetes second
 
 ---
 
@@ -45,7 +45,7 @@ The final project should demonstrate four primary engineering capabilities:
 
 * PostgreSQL as the durable system of record
 * Redis for short-lived coordination, rate limiting, and caching
-* Docker for local sandbox execution
+* Podman for local sandbox execution
 * Kubernetes for distributed deployment and horizontal scaling
 * MinIO or S3-compatible storage for logs, snapshots, and artifacts
 
@@ -82,7 +82,7 @@ Use current stable package releases and commit a lockfile. Do not rely on floati
 * Task planning and progress tracking
 * Context compression
 * Checkpoints and rewind
-* Docker sandbox isolation
+* Podman sandbox isolation
 * Distributed task scheduling
 * Worker leases and heartbeats
 * Checkpoint-based recovery
@@ -104,7 +104,8 @@ Use current stable package releases and commit a lockfile. Do not rely on floati
 * Autonomous production deployments
 * Running arbitrary untrusted workloads with a formal security guarantee
 
-The architecture must permit later support for gVisor or Firecracker, but the first implementation should use hardened Docker containers.
+The architecture must permit later support for gVisor or Firecracker, but the first
+implementation should use hardened rootless Podman containers.
 
 ---
 
@@ -195,7 +196,7 @@ All information needed for recovery must be stored in PostgreSQL or object stora
 
 The agent core must not import:
 
-* Docker SDK
+* Podman-compatible runtime API
 * LiteLLM-specific classes
 * PostgreSQL drivers
 * Redis clients
@@ -311,7 +312,7 @@ agent-platform/
 │       └── policies/
 │
 ├── deployments/
-│   ├── docker-compose/
+│   ├── podman-compose/
 │   └── kubernetes/
 │
 ├── tests/
@@ -335,7 +336,7 @@ agent-platform/
 │
 ├── pyproject.toml
 ├── uv.lock
-├── docker-compose.yml
+├── compose.yaml
 └── DESIGN.md
 ```
 
@@ -632,7 +633,7 @@ Create a reproducible monorepo with automated quality checks.
    * container build
 6. Create shared configuration using Pydantic Settings.
 7. Add structured JSON logging.
-8. Add local Docker Compose services:
+8. Add local Podman Compose services:
 
    * PostgreSQL
    * Redis
@@ -643,7 +644,7 @@ Create a reproducible monorepo with automated quality checks.
 ### Acceptance criteria
 
 * `make test` or equivalent runs all checks.
-* `docker compose up` starts all dependencies.
+* `podman-compose up` starts all dependencies through the native Podman runtime.
 * No secrets are committed.
 * A sample configuration file documents every required variable.
 * CI passes from a clean checkout.
@@ -659,6 +660,12 @@ Implement a local coding agent before adding distribution.
 ### Tasks
 
 1. Define the main coding agent using OpenAI Agents SDK.
+
+   Sequence 4 implements this by adapting the SDK `ModelProvider` and streaming `Model`
+   interfaces beneath the platform `ModelGateway`. The platform `AgentLoop` remains the
+   sole owner of turns, tool execution, validation, limits, redaction, and typed events;
+   SDK `Runner` and SDK sessions are not used because they would introduce a second
+   orchestration and state boundary.
 2. Implement tools:
 
    * `list_files`
@@ -691,7 +698,7 @@ The Agents SDK can manage agent turns, tools, sessions, and human-in-the-loop in
 * The agent can inspect and modify a sample repository.
 * The agent can run tests and react to failures.
 * Core tests do not require a real model API.
-* The agent core contains no direct Docker, PostgreSQL, Redis, or FastAPI imports.
+* The agent core contains no direct Podman, PostgreSQL, Redis, or FastAPI imports.
 * Every action produces a typed event.
 
 ---
@@ -745,7 +752,7 @@ Make repository mutation safe, reviewable, and reversible.
 
 ---
 
-## Phase 3 — Docker Sandbox Runtime
+## Phase 3 — Podman Sandbox Runtime
 
 ### Goal
 
@@ -754,7 +761,7 @@ Move shell and filesystem execution into an isolated environment.
 ### Tasks
 
 1. Implement `LocalSandbox` for development tests only.
-2. Implement `DockerSandbox`.
+2. Implement `PodmanSandbox`.
 3. Use a non-root user.
 4. Drop Linux capabilities.
 5. Enable `no-new-privileges`.
@@ -771,7 +778,7 @@ Move shell and filesystem execution into an isolated environment.
    * command duration
 10. Do not mount:
 
-    * Docker socket
+    * Podman service socket
     * SSH credentials
     * cloud credentials
     * user home directory
@@ -787,10 +794,11 @@ Move shell and filesystem execution into an isolated environment.
     * memory exhaustion
     * infinite execution
     * network exfiltration
-    * access Docker socket
+    * access Podman service socket
 15. Add an optional runtime configuration for gVisor later.
 
-Docker rootless mode, namespace isolation, and seccomp should be used where supported; the default seccomp profile must not be disabled.
+Podman rootless mode, namespace isolation, and seccomp should be used where supported;
+the default seccomp profile must not be disabled.
 
 ### Acceptance criteria
 
@@ -810,7 +818,7 @@ Route all model calls through LiteLLM Proxy.
 
 ### Tasks
 
-1. Deploy LiteLLM Proxy through Docker Compose.
+1. Deploy LiteLLM Proxy through Podman Compose.
 2. Configure aliases:
 
    * `coding-default`
@@ -1320,7 +1328,7 @@ NETWORK
 PROHIBITED
     privileged execution
     host filesystem mounts
-    Docker socket access
+    Podman service socket access
     secret access
 ```
 
@@ -1406,7 +1414,7 @@ The sandbox enforces the maximum possible impact even after permission is grante
 2. Sandboxes receive no host cloud credentials.
 3. Sandboxes use temporary workspaces.
 4. Network is disabled by default.
-5. Host Docker socket is never mounted.
+5. Host Podman service socket is never mounted.
 6. Containers do not run privileged.
 7. Root filesystem is read-only.
 8. Workspace paths are canonicalized.
@@ -1435,7 +1443,7 @@ Codex must follow these rules while implementing this design:
 8. Do not let workers call model providers directly.
 9. Do not execute shell commands on the host outside explicit development tests.
 10. Do not claim security or scale properties that are not tested.
-11. Do not introduce Kubernetes before the Docker Compose system works.
+11. Do not introduce Kubernetes before the Podman Compose system works.
 12. Do not optimize routing before baseline metrics exist.
 13. Prefer deterministic routing policies over LLM-selected routing.
 14. Use typed domain models and validated state transitions.
@@ -1459,7 +1467,7 @@ PR 05  Read/search/file tools
 PR 06  Reliable edit tool and Git worktrees
 PR 07  Checkpoints and rewind
 PR 08  Local sandbox abstraction
-PR 09  Hardened Docker sandbox
+PR 09  Hardened Podman sandbox
 PR 10  Sandbox security tests
 PR 11  LiteLLM Proxy deployment
 PR 12  Typed gateway client and normalized streaming
@@ -1548,4 +1556,3 @@ The project is complete when all of the following are true:
 * Failure scenarios are covered by chaos tests.
 * No accepted tasks are silently lost during tested failures.
 * Benchmark and architecture reports are committed.
-

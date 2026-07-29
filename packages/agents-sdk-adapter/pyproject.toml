@@ -1,0 +1,20 @@
+[project]
+name = "agents-sdk-adapter"
+version = "0.1.0"
+description = "OpenAI Agents SDK model adapter for the agent platform"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "agent-core",
+  "httpx>=0.27,<1",
+  "openai-agents>=0.18.3,<0.19",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agents_sdk_adapter"]
+
+[tool.uv.sources]
+agent-core = { workspace = true }

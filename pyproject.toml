@@ -5,7 +5,9 @@ description = "Distributed coding-agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
+  "agents-sdk-adapter",
   "platform-telemetry",
+  "sandbox-runtime",
 ]
 
 [dependency-groups]
@@ -25,12 +27,16 @@ package = false
 
 [tool.uv.sources]
 agent-core = { workspace = true }
+agents-sdk-adapter = { workspace = true }
 platform-telemetry = { workspace = true }
+sandbox-runtime = { workspace = true }
 
 [tool.uv.workspace]
 members = [
   "packages/agent-core",
+  "packages/agents-sdk-adapter",
   "packages/telemetry",
+  "packages/sandbox-runtime",
 ]
 
 [tool.pytest.ini_options]
@@ -49,7 +55,13 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["agent_core", "platform_telemetry", "scripts"]
+source = [
+  "agent_core",
+  "agents_sdk_adapter",
+  "platform_telemetry",
+  "sandbox_runtime",
+  "scripts",
+]
 
 [tool.coverage.report]
 fail_under = 85
@@ -61,7 +73,9 @@ line-length = 100
 target-version = "py312"
 src = [
   "packages/agent-core/src",
+  "packages/agents-sdk-adapter/src",
   "packages/telemetry/src",
+  "packages/sandbox-runtime/src",
   "scripts",
   "tests",
 ]
@@ -107,7 +121,9 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 mypy_path = [
   "packages/agent-core/src",
+  "packages/agents-sdk-adapter/src",
   "packages/telemetry/src",
+  "packages/sandbox-runtime/src",
 ]
 
 [[tool.mypy.overrides]]

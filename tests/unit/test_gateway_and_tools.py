@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,7 @@ from agent_core.gateway import (
 from agent_core.tools import (
     RegisteredTool,
     ToolArguments,
+    ToolEffect,
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolExecutionEvent,
@@ -56,6 +58,7 @@ def read_registration(handler: ReadHandler | None = None) -> RegisteredTool[Read
         description="Read one workspace file",
         arguments_type=ReadArguments,
         handler=handler or ReadHandler(),
+        effect=ToolEffect.READ_ONLY,
     )
 
 
@@ -172,7 +175,12 @@ async def test_tool_registry_validates_before_handler_execution() -> None:
     result = [
         item
         async for item in prepared.stream(
-            ToolExecutionContext(max_output_bytes=1024, max_result_bytes=1024)
+            ToolExecutionContext(
+                run_id=UUID("00000000-0000-0000-0000-000000000001"),
+                tool_call_id="call-direct",
+                max_output_bytes=1024,
+                max_result_bytes=1024,
+            )
         )
     ]
 

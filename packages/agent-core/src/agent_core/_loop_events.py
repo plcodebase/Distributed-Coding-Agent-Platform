@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_core.events import (
+    CheckpointCreatedEvent,
+    CheckpointCreatedPayload,
     ContextBuildStartedEvent,
     ContextBuildStartedPayload,
     ModelRequestStartedEvent,
@@ -202,12 +204,39 @@ class LoopEventFactory:
             created_at=created_at,
         )
 
-    def run_completed(self, *, final_text: str) -> RunCompletedEvent:
+    def checkpoint_created(
+        self,
+        *,
+        checkpoint_id: uuid.UUID,
+        message_sequence: int,
+        workspace_revision: str,
+    ) -> CheckpointCreatedEvent:
+        sequence, created_at = self._metadata()
+        return CheckpointCreatedEvent(
+            run_id=self._run_id,
+            sequence=sequence,
+            payload=CheckpointCreatedPayload(
+                checkpoint_id=checkpoint_id,
+                message_sequence=message_sequence,
+                workspace_revision=workspace_revision,
+            ),
+            created_at=created_at,
+        )
+
+    def run_completed(
+        self,
+        *,
+        final_text: str,
+        checkpoint_id: uuid.UUID | None = None,
+    ) -> RunCompletedEvent:
         sequence, created_at = self._metadata()
         return RunCompletedEvent(
             run_id=self._run_id,
             sequence=sequence,
-            payload=RunCompletedPayload(final_text=final_text),
+            payload=RunCompletedPayload(
+                final_text=final_text,
+                checkpoint_id=checkpoint_id,
+            ),
             created_at=created_at,
         )
 

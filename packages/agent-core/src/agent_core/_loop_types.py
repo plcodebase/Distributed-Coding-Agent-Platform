@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field
 
-from agent_core.domain.base import DomainModel
+from agent_core.domain.base import DomainModel, FrozenJsonObject
 from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves this field at runtime
     IdentifierString,
 )
@@ -82,6 +82,8 @@ class AgentLoopInput(DomainModel):
     route_name: IdentifierString
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     checkpoint_id: uuid.UUID | None = None
+    task_plan: FrozenJsonObject = Field(default_factory=lambda: FrozenJsonObject({}))
+    context_summary: str | None = None
 
 
 __all__ = [

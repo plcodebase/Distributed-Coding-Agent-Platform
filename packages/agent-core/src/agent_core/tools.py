@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid  # noqa: TC003 - Pydantic resolves this field type at runtime
 from collections.abc import AsyncGenerator, Sequence
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol
@@ -19,9 +20,28 @@ class ToolArguments(DomainModel):
     """Base class for closed, immutable, tool-specific argument schemas."""
 
 
-class ToolExecutionContext(DomainModel):
-    """Resource ceilings a handler must observe before producing data."""
+class ToolEffect(StrEnum):
+    """Declared side-effect class used by checkpoint and approval policy."""
 
+    READ_ONLY = "read_only"
+    WORKSPACE_MUTATION = "workspace_mutation"
+    COMMAND = "command"
+    INTERACTION = "interaction"
+
+
+class ToolExecutionContext(DomainModel):
+    """Execution identity, checkpoint metadata, and resource ceilings."""
+
+    run_id: uuid.UUID
+    tool_call_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    checkpoint_id: uuid.UUID | None = None
+    workspace_revision: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, min_length=1),
+        ]
+        | None
+    ) = None
     max_output_bytes: int = Field(ge=1)
     max_result_bytes: int = Field(ge=1)
 
@@ -72,6 +92,10 @@ class ToolHandler[ArgumentsT: ToolArguments](Protocol):
 class PreparedToolExecution(Protocol):
     """A validated, single-use tool operation ready for bounded execution."""
 
+    @property
+    def effect(self) -> ToolEffect:
+        """Return the registration's declared side-effect class."""
+
     def stream(
         self,
         context: ToolExecutionContext,
@@ -85,9 +109,15 @@ class _PreparedToolExecution[ArgumentsT: ToolArguments]:
         *,
         handler: ToolHandler[ArgumentsT],
         arguments: ArgumentsT,
+        effect: ToolEffect,
     ) -> None:
         self._handler = handler
         self._arguments = arguments
+        self._effect = effect
+
+    @property
+    def effect(self) -> ToolEffect:
+        return self._effect
 
     def stream(
         self,
@@ -106,6 +136,10 @@ class ToolRegistration(Protocol):
     def definition(self) -> GatewayToolDefinition:
         """Return the provider-neutral schema advertised to the model."""
 
+    @property
+    def effect(self) -> ToolEffect:
+        """Return the registration's declared side-effect class."""
+
     def prepare(self, arguments: FrozenJsonObject) -> PreparedToolExecution:
         """Validate raw model arguments without executing the tool."""
 
@@ -120,9 +154,11 @@ class RegisteredTool[ArgumentsT: ToolArguments]:
         description: str,
         arguments_type: type[ArgumentsT],
         handler: ToolHandler[ArgumentsT],
+        effect: ToolEffect,
     ) -> None:
         self._arguments_type = arguments_type
         self._handler = handler
+        self._effect = effect
         self._definition = GatewayToolDefinition(
             name=name,
             description=description,
@@ -133,9 +169,17 @@ class RegisteredTool[ArgumentsT: ToolArguments]:
     def definition(self) -> GatewayToolDefinition:
         return self._definition
 
+    @property
+    def effect(self) -> ToolEffect:
+        return self._effect
+
     def prepare(self, arguments: FrozenJsonObject) -> PreparedToolExecution:
         validated = self._arguments_type.model_validate(arguments.to_json_object())
-        return _PreparedToolExecution(handler=self._handler, arguments=validated)
+        return _PreparedToolExecution(
+            handler=self._handler,
+            arguments=validated,
+            effect=self._effect,
+        )
 
 
 class ToolRegistry:
@@ -189,6 +233,7 @@ __all__ = [
     "PreparedToolExecution",
     "RegisteredTool",
     "ToolArguments",
+    "ToolEffect",
     "ToolExecutionCompleted",
     "ToolExecutionContext",
     "ToolExecutionEvent",

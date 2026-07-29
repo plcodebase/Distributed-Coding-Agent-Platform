@@ -36,6 +36,7 @@ from platform_telemetry import Redactor
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from agent_core.checkpoints import CheckpointCoordinator
     from agent_core.tools import ToolRegistry
 
 
@@ -74,6 +75,7 @@ class AgentLoop:
         id_generator: IdGenerator,
         config: AgentLoopConfig | None = None,
         redactor: Redactor | None = None,
+        checkpoints: CheckpointCoordinator | None = None,
     ) -> None:
         self._tools = tools
         self._clock = clock
@@ -89,6 +91,7 @@ class AgentLoop:
             tools=tools,
             config=self._config,
             redactor=self._redactor,
+            checkpoints=checkpoints,
         )
 
     async def run(  # noqa: PLR0911, PLR0912, PLR0915 - explicit terminal policy paths
@@ -102,6 +105,7 @@ class AgentLoop:
         tool_call_count = 0
         semantic_retry_count = 0
         outcomes: dict[str, ToolOutcome] = {}
+        last_checkpoint_id = loop_input.checkpoint_id
 
         yield events.run_started(
             attempt=loop_input.attempt,
@@ -209,7 +213,12 @@ class AgentLoop:
                     transcript=transcript,
                     outcomes=outcomes,
                     semantic_retry_count=semantic_retry_count,
+                    run_id=loop_input.run_id,
+                    task_plan=loop_input.task_plan,
+                    context_summary=loop_input.context_summary,
                 )
+                if report.last_checkpoint_id is not None:
+                    last_checkpoint_id = report.last_checkpoint_id
                 semantic_retry_count += report.semantic_failures
                 for event in report.events:
                     yield event
@@ -236,7 +245,10 @@ class AgentLoop:
                 )
                 return
             if turn_result.text:
-                completion_payload = RunCompletedPayload(final_text=turn_result.text)
+                completion_payload = RunCompletedPayload(
+                    final_text=turn_result.text,
+                    checkpoint_id=last_checkpoint_id,
+                )
                 if (
                     len(completion_payload.model_dump_json().encode("utf-8"))
                     > MAX_EVENT_PAYLOAD_BYTES
@@ -249,7 +261,10 @@ class AgentLoop:
                         )
                     )
                     return
-                yield events.run_completed(final_text=turn_result.text)
+                yield events.run_completed(
+                    final_text=turn_result.text,
+                    checkpoint_id=last_checkpoint_id,
+                )
                 return
 
             semantic_retry_count += 1

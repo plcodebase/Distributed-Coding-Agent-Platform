@@ -9,22 +9,29 @@ from typing import TYPE_CHECKING
 
 from agent_core._loop_safety import redact_error, redact_json
 from agent_core._loop_support import invalid_call_feedback, json_size, loop_error, tool_message
+from agent_core.domain.base import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
-from agent_core.domain.models import canonical_argument_hash
+from agent_core.domain.models import Checkpoint, canonical_argument_hash
 from agent_core.domain.status import ToolCallStatus
 from agent_core.tools import (
     PreparedToolExecution,
+    ToolEffect,
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolOutputChannel,
     ToolOutputChunk,
 )
 
+_WORKSPACE_RESULT_METADATA_RESERVE_BYTES = 2048
+_MAX_WORKSPACE_REVISION_CHARACTERS = 255
+
 if TYPE_CHECKING:
+    import uuid
+
     from agent_core._loop_events import LoopEventFactory
     from agent_core._loop_types import AgentLoopConfig
     from agent_core._model_turn import InvalidToolCall
-    from agent_core.domain.base import FrozenJsonObject
+    from agent_core.checkpoints import CheckpointCoordinator
     from agent_core.events import AnyAgentEvent
     from agent_core.gateway import GatewayMessage, GatewayToolCall
     from agent_core.tools import ToolRegistry
@@ -48,6 +55,7 @@ class ToolTurnReport:
     events: tuple[AnyAgentEvent, ...]
     semantic_failures: int = 0
     terminal: bool = False
+    last_checkpoint_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,12 +158,14 @@ class ToolTurnExecutor:
         tools: ToolRegistry,
         config: AgentLoopConfig,
         redactor: Redactor,
+        checkpoints: CheckpointCoordinator | None = None,
     ) -> None:
         self._tools = tools
         self._config = config
         self._redactor = redactor
+        self._checkpoints = checkpoints
 
-    async def execute(
+    async def execute(  # noqa: PLR0911, PLR0912, PLR0915 - fail-closed orchestration paths
         self,
         tool_calls: tuple[GatewayToolCall, ...],
         invalid_tool_calls: tuple[InvalidToolCall, ...],
@@ -164,6 +174,9 @@ class ToolTurnExecutor:
         transcript: list[GatewayMessage],
         outcomes: dict[str, ToolOutcome],
         semantic_retry_count: int,
+        run_id: uuid.UUID,
+        task_plan: FrozenJsonObject,
+        context_summary: str | None,
     ) -> ToolTurnReport:
         conflict = self._find_id_conflict(tool_calls, invalid_tool_calls, outcomes)
         if conflict is not None:
@@ -187,6 +200,7 @@ class ToolTurnExecutor:
             )
 
         emitted: list[AnyAgentEvent] = []
+        last_checkpoint_id: uuid.UUID | None = None
         for item in prepared_calls:
             prior = outcomes.get(item.tool_call.id)
             if prior is not None:
@@ -202,8 +216,79 @@ class ToolTurnExecutor:
             if item.prepared is None:
                 raise AssertionError("new validated call must have a prepared execution")
 
+            checkpoint: Checkpoint | None = None
+            if item.prepared.effect in {ToolEffect.WORKSPACE_MUTATION, ToolEffect.COMMAND}:
+                if self._checkpoints is None:
+                    error = loop_error(
+                        "checkpoint_required",
+                        "side-effecting tools require a checkpoint coordinator",
+                        details={
+                            "tool_call_id": item.tool_call.id,
+                            "tool_name": item.tool_call.name,
+                        },
+                    )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=error))
+                    return ToolTurnReport(events=tuple(emitted), terminal=True)
+                try:
+                    checkpoint = await self._checkpoints.create_before_tool(
+                        run_id=run_id,
+                        tool_call_id=item.tool_call.id,
+                        messages=tuple(transcript),
+                        task_plan=task_plan,
+                        context_summary=context_summary,
+                    )
+                except DomainOperationError as checkpoint_error:
+                    error = redact_error(checkpoint_error.error, self._redactor)
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=error))
+                    return ToolTurnReport(events=tuple(emitted), terminal=True)
+                except Exception:
+                    error = loop_error(
+                        "checkpoint_create_failed",
+                        "the pre-tool checkpoint could not be created",
+                        details={
+                            "tool_call_id": item.tool_call.id,
+                            "tool_name": item.tool_call.name,
+                        },
+                    )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=error))
+                    return ToolTurnReport(events=tuple(emitted), terminal=True)
+                last_checkpoint_id = checkpoint.id
+                emitted.append(
+                    events.checkpoint_created(
+                        checkpoint_id=checkpoint.id,
+                        message_sequence=checkpoint.message_sequence,
+                        workspace_revision=checkpoint.workspace_revision,
+                    )
+                )
+
             emitted.append(events.tool_started(tool_call=item.tool_call))
-            run_result = await self._run_tool(item.prepared, tool_call=item.tool_call)
+            run_result = await self._run_tool(
+                item.prepared,
+                tool_call=item.tool_call,
+                run_id=run_id,
+                checkpoint=checkpoint,
+            )
             emitted.extend(
                 events.tool_output(
                     tool_call_id=item.tool_call.id,
@@ -213,6 +298,129 @@ class ToolTurnExecutor:
                 )
                 for output in run_result.output
             )
+
+            if run_result.error is not None and checkpoint is not None:
+                coordinator = self._checkpoints
+                if coordinator is None:
+                    raise AssertionError("checkpoint requires a coordinator")
+                try:
+                    await coordinator.rollback(checkpoint)
+                except Exception:
+                    restore_error = loop_error(
+                        "checkpoint_restore_failed",
+                        "the workspace could not be restored after tool failure",
+                        details={
+                            "checkpoint_id": str(checkpoint.id),
+                            "tool_call_id": item.tool_call.id,
+                        },
+                    )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=restore_error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=restore_error))
+                    return ToolTurnReport(
+                        events=tuple(emitted),
+                        terminal=True,
+                        last_checkpoint_id=last_checkpoint_id,
+                    )
+            elif run_result.result is not None and checkpoint is not None:
+                coordinator = self._checkpoints
+                if coordinator is None:
+                    raise AssertionError("checkpoint requires a coordinator")
+                try:
+                    workspace_revision = await coordinator.complete_tool(
+                        checkpoint,
+                        tool_call_id=item.tool_call.id,
+                    )
+                except Exception:
+                    try:
+                        await coordinator.rollback(checkpoint)
+                    except Exception:
+                        error_code = "checkpoint_restore_failed"
+                        error_message = "workspace restoration failed after checkpoint finalization"
+                    else:
+                        error_code = "checkpoint_finalize_failed"
+                        error_message = "the successful tool state could not be checkpointed"
+                    finalize_error = loop_error(
+                        error_code,
+                        error_message,
+                        details={
+                            "checkpoint_id": str(checkpoint.id),
+                            "tool_call_id": item.tool_call.id,
+                        },
+                    )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=finalize_error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=finalize_error))
+                    return ToolTurnReport(
+                        events=tuple(emitted),
+                        terminal=True,
+                        last_checkpoint_id=last_checkpoint_id,
+                    )
+                result_value = run_result.result.to_json_object()
+                result_value["workspace_revision"] = workspace_revision
+                completed_result = FrozenJsonObject(result_value)
+                result_error: ErrorDetail | None = None
+                if (
+                    not workspace_revision.strip()
+                    or len(workspace_revision) > _MAX_WORKSPACE_REVISION_CHARACTERS
+                ):
+                    result_error = loop_error(
+                        "checkpoint_finalize_failed",
+                        "the checkpoint coordinator returned an invalid workspace revision",
+                        details={
+                            "checkpoint_id": str(checkpoint.id),
+                            "tool_call_id": item.tool_call.id,
+                        },
+                    )
+                elif json_size(completed_result) > self._config.max_tool_result_bytes:
+                    result_error = loop_error(
+                        "tool_result_limit",
+                        "the completed tool metadata exceeded the configured byte limit",
+                        details={
+                            "tool_call_id": item.tool_call.id,
+                            "tool_name": item.tool_call.name,
+                            "limit_bytes": self._config.max_tool_result_bytes,
+                        },
+                    )
+                if result_error is not None:
+                    try:
+                        await coordinator.rollback(checkpoint)
+                    except Exception:
+                        result_error = loop_error(
+                            "checkpoint_restore_failed",
+                            "workspace restoration failed after invalid completion metadata",
+                            details={
+                                "checkpoint_id": str(checkpoint.id),
+                                "tool_call_id": item.tool_call.id,
+                            },
+                        )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=result_error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=result_error))
+                    return ToolTurnReport(
+                        events=tuple(emitted),
+                        terminal=True,
+                        last_checkpoint_id=last_checkpoint_id,
+                    )
+                run_result = _ToolRunResult(
+                    output=run_result.output,
+                    result=completed_result,
+                )
 
             if run_result.error is not None:
                 outcome = ToolOutcome(
@@ -239,7 +447,10 @@ class ToolTurnExecutor:
                 )
             )
 
-        return ToolTurnReport(events=tuple(emitted))
+        return ToolTurnReport(
+            events=tuple(emitted),
+            last_checkpoint_id=last_checkpoint_id,
+        )
 
     def _find_id_conflict(
         self,
@@ -426,15 +637,27 @@ class ToolTurnExecutor:
             terminal=terminal,
         )
 
-    async def _run_tool(  # noqa: PLR0911 - every stream failure returns a safe outcome
+    async def _run_tool(  # noqa: PLR0911, PLR0912 - fail-closed stream protocol
         self,
         prepared: PreparedToolExecution,
         *,
         tool_call: GatewayToolCall,
+        run_id: uuid.UUID,
+        checkpoint: Checkpoint | None,
     ) -> _ToolRunResult:
+        result_limit = self._config.max_tool_result_bytes
+        if checkpoint is not None:
+            result_limit = max(
+                1,
+                result_limit - _WORKSPACE_RESULT_METADATA_RESERVE_BYTES,
+            )
         context = ToolExecutionContext(
+            run_id=run_id,
+            tool_call_id=tool_call.id,
+            checkpoint_id=checkpoint.id if checkpoint is not None else None,
+            workspace_revision=(checkpoint.workspace_revision if checkpoint is not None else None),
             max_output_bytes=self._config.max_tool_output_bytes,
-            max_result_bytes=self._config.max_tool_result_bytes,
+            max_result_bytes=result_limit,
         )
         output: list[_BufferedOutput] = []
         remaining = context.max_output_bytes

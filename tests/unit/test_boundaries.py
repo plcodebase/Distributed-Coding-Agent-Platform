@@ -5,16 +5,21 @@ import pytest
 
 CORE_ROOTS = (
     Path("packages/agent-core/src"),
+    Path("packages/sandbox-runtime/src"),
     Path("packages/telemetry/src"),
 )
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
+        "agents",
+        "agents_sdk_adapter",
         "alembic",
         "asyncpg",
         "docker",
         "fastapi",
+        "httpx",
         "kubernetes",
         "litellm",
+        "openai",
         "podman",
         "psycopg",
         "redis",

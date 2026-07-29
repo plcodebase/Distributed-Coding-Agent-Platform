@@ -16,6 +16,7 @@ from agent_core.loop import AgentLoop, AgentLoopInput
 from agent_core.tools import (
     RegisteredTool,
     ToolArguments,
+    ToolEffect,
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolExecutionEvent,
@@ -68,6 +69,7 @@ async def test_scripted_model_drives_complete_typed_agent_loop_without_network()
                 description="Inspect a file in the current workspace",
                 arguments_type=InspectFileArguments,
                 handler=repository.inspect_file,
+                effect=ToolEffect.READ_ONLY,
             ),
         )
     )
