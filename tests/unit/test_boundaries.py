@@ -8,6 +8,16 @@ CORE_ROOTS = (
     Path("packages/sandbox-runtime/src"),
     Path("packages/telemetry/src"),
 )
+PERSISTENCE_ADAPTER_ROOTS = (
+    Path("packages/persistence/src"),
+    Path("packages/event-store/src"),
+)
+API_CORE_ROOTS = (
+    Path("apps/agent-api/src/agent_api/app.py"),
+    Path("apps/agent-api/src/agent_api/auth.py"),
+    Path("apps/agent-api/src/agent_api/dependencies.py"),
+    Path("apps/agent-api/src/agent_api/schemas.py"),
+)
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
         "agents",
@@ -49,3 +59,39 @@ def imported_roots(path: Path) -> set[str]:
 )
 def test_foundation_packages_do_not_import_provider_adapters(path: Path) -> None:
     assert imported_roots(path).isdisjoint(FORBIDDEN_IMPORT_ROOTS)
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(
+        (path for root in PERSISTENCE_ADAPTER_ROOTS for path in root.rglob("*.py")),
+        key=str,
+    ),
+    ids=str,
+)
+def test_persistence_adapters_do_not_import_api_provider_or_runtime_layers(path: Path) -> None:
+    forbidden = {
+        "agents",
+        "agents_sdk_adapter",
+        "fastapi",
+        "httpx",
+        "litellm",
+        "openai",
+        "podman",
+    }
+    assert imported_roots(path).isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize("path", API_CORE_ROOTS, ids=str)
+def test_api_handlers_depend_on_protocols_not_persistence_adapters(path: Path) -> None:
+    forbidden = {
+        "agents",
+        "agents_sdk_adapter",
+        "alembic",
+        "asyncpg",
+        "openai",
+        "platform_persistence",
+        "podman",
+        "sqlalchemy",
+    }
+    assert imported_roots(path).isdisjoint(forbidden)

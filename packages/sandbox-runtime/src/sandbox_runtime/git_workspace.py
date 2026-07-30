@@ -158,7 +158,7 @@ class _BoundedGitRunner:
         output_limit_bytes: int | None = None,
         allowed_exit_codes: Set[int] = frozenset({0}),
     ) -> str | bytes:
-        limit = output_limit_bytes or self._output_limit_bytes
+        limit = self._output_limit_bytes if output_limit_bytes is None else output_limit_bytes
         if type(limit) is not int or limit <= 0:
             raise ValueError("Git output limits must be positive integers")
         argv = (
@@ -374,6 +374,7 @@ class GitWorktreeWorkspace(RootedWorkspace):
         self._git_output_limit_bytes = git_output_limit_bytes
         self._worktree_removed = False
         self._destroyed = False
+        self._destroy_lock = asyncio.Lock()
 
     @property
     def baseline_revision(self) -> str:
@@ -400,12 +401,13 @@ class GitWorktreeWorkspace(RootedWorkspace):
             )
 
     def commit_state(self, *, label: str) -> str:
-        if (
-            not isinstance(label, str)
-            or not label
-            or "\x00" in label
-            or len(label.encode("utf-8")) > _MAX_LABEL_BYTES
-        ):
+        if not isinstance(label, str):
+            raise TypeError("Git snapshot labels must be text")
+        try:
+            encoded_label = label.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("Git snapshot labels must be valid UTF-8 text") from error
+        if not label or "\x00" in label or len(encoded_label) > _MAX_LABEL_BYTES:
             raise ValueError("Git snapshot labels must be non-empty bounded text")
         self._require_no_external_filters()
         self._git_runner.run(self.root, ("add", "-A"))
@@ -473,10 +475,34 @@ class GitWorktreeWorkspace(RootedWorkspace):
         return patch
 
     async def destroy(self) -> None:
-        if self._destroyed:
-            return
-        await self.close()
-        await asyncio.to_thread(self._destroy_sync)
+        cleanup = asyncio.create_task(self._destroy())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+
+    async def _destroy(self) -> None:
+        async with self._destroy_lock:
+            if self._destroyed:
+                return
+            try:
+                await self.close()
+                await asyncio.to_thread(self._destroy_sync)
+            except DomainOperationError as error:
+                if error.code == "workspace_cleanup_failed":
+                    raise
+                raise _git_error(
+                    "workspace_cleanup_failed",
+                    "the isolated workspace could not be removed; cleanup may be retried",
+                    details={"retryable": True},
+                ) from error
+            except Exception as error:
+                raise _git_error(
+                    "workspace_cleanup_failed",
+                    "the isolated workspace could not be removed; cleanup may be retried",
+                    details={"retryable": True},
+                ) from error
 
     def _destroy_sync(self) -> None:
         try:
@@ -643,14 +669,15 @@ class GitWorktreeManager:
 
     @staticmethod
     def _run_token(run_id: str) -> str:
-        if (
-            not isinstance(run_id, str)
-            or not run_id
-            or "\x00" in run_id
-            or len(run_id.encode("utf-8")) > _MAX_RUN_ID_BYTES
-        ):
+        if not isinstance(run_id, str):
+            raise TypeError("run_id must be text")
+        try:
+            encoded_run_id = run_id.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("run_id must be valid UTF-8 text") from error
+        if not run_id or "\x00" in run_id or len(encoded_run_id) > _MAX_RUN_ID_BYTES:
             raise ValueError("run_id must be non-empty bounded text")
-        return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+        return hashlib.sha256(encoded_run_id).hexdigest()[:20]
 
     def _require_no_external_filters(self, repository: Path) -> None:
         configured = _require_text(

@@ -11,11 +11,19 @@ if TYPE_CHECKING:
     from httpx import AsyncClient
 
     from agent_core.settings import PlatformSettings
+    from gateway_client.reliability import (
+        GatewayCircuitBreaker,
+        GatewayRateLimiter,
+        GatewayRequestStore,
+    )
 
 
 def create_gateway_client(
     settings: PlatformSettings,
     *,
+    request_store: GatewayRequestStore,
+    rate_limiter: GatewayRateLimiter,
+    circuit_breaker: GatewayCircuitBreaker,
     config: GatewayClientConfig | None = None,
     http_client: AsyncClient | None = None,
 ) -> GatewayClient:
@@ -29,6 +37,9 @@ def create_gateway_client(
         adapter,
         config=config,
         close=adapter.aclose,
+        request_store=request_store,
+        rate_limiter=rate_limiter,
+        circuit_breaker=circuit_breaker,
     )
 
 

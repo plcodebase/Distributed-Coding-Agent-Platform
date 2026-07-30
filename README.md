@@ -101,7 +101,9 @@ Sequence 6 provides:
   hooks, signing, filesystem monitors, external diffs, text conversion, prompts, and
   pagers;
 - isolated Git revisions, targeted retryable lifecycle cleanup, and incrementally
-  bounded binary final patches relative to the captured baseline.
+  bounded binary final patches relative to the captured baseline;
+- cancellation-safe serialized destruction and bounded UTF-8 run/snapshot labels, with
+  only hashed run tokens entering paths and platform-generated commit labels.
 
 ### Sequence 7: checkpoints and rewind
 
@@ -197,7 +199,7 @@ Sequence 11 provides:
   `coding-default` reaches the secondary when the primary is unavailable.
 
 Client-side retry, stored-result idempotency, circuit breaking, and rate-limit policy
-remain Sequence 13.
+are supplied by Sequence 13.
 
 ### Sequence 12: typed gateway client and normalized streaming
 
@@ -217,8 +219,69 @@ Sequence 12 provides:
   cleanup that blocks model traffic after partial cleanup;
 - unit tests and a live streaming test through the Podman LiteLLM deployment.
 
-Sequence 12 does not claim durable request idempotency. Attaching to in-flight calls,
-returning stored results, and rejecting request-ID payload conflicts remain Sequence 13.
+### Sequence 13: gateway retry, fallback, and idempotency
+
+Sequence 13 provides:
+
+- tenant-scoped stable request claims with canonical payload hashes;
+- completed normalized-response replay without another provider request;
+- running, failed, and conflicting request-ID semantics that fail closed;
+- bounded exponential backoff and injected jitter only before any response event;
+- strict suppression of retries after partial streamed output;
+- per-tenant/per-route admission and closed/open/half-open circuit policies;
+- deterministic in-memory policies for tests plus shared PostgreSQL production
+  adapters;
+- durable terminal-event commit before terminal success reaches the agent;
+- cancellation-safe durable failure/release bookkeeping and close-after-terminal
+  replay safety;
+- compatible provider fallback retained inside LiteLLM with stable logical route and
+  request identity.
+
+### Sequence 14: PostgreSQL persistence and migrations
+
+Sequence 14 provides:
+
+- a SQLAlchemy 2.x async `platform-persistence` package using asyncpg;
+- explicit reversible Alembic migrations;
+- durable sessions, runs, messages, task plans, tool calls, approvals, checkpoints,
+  events, model-call accounting, gateway requests, rate windows, and circuits;
+- tenant IDs in every tenant-owned query and relational constraint;
+- database uniqueness for run/tool/model/request idempotency and ordered records;
+- compare-and-set run transitions using the core transition policy;
+- bounded connection pools, statement timeouts, UTC sessions, readiness, and explicit
+  cancellation-safe engine cleanup;
+- exact declarative/migration check-constraint parity tests and deterministic
+  transaction-boundary tests.
+
+### Sequence 15: FastAPI session and run APIs
+
+Sequence 15 provides:
+
+- dependency-injected FastAPI handlers for every Phase 5 HTTP control endpoint;
+- an authentication protocol and bounded local bearer-token implementation;
+- tenant-scoped session/run reads that do not reveal cross-tenant resource existence;
+- API run-creation idempotency keys with matching-result replay and payload-conflict
+  rejection;
+- durable cancellation, approval-decision, and rewind-selection operations;
+- live and PostgreSQL-backed readiness endpoints;
+- duplicate-key-safe local credential parsing and explicit WebSocket authentication,
+  tenant-absence, and internal-failure close codes;
+- closed domain errors and opaque unexpected failures.
+
+Run creation persists `QUEUED` work. PostgreSQL queue claiming begins in Sequence 17.
+
+### Sequence 16: durable event store and WebSocket replay
+
+Sequence 16 provides:
+
+- core `EventDraft`, `StoredEvent`, and bounded `EventPage` contracts;
+- discriminated event-payload validation before persistence;
+- atomic per-run sequence allocation and append in one PostgreSQL transaction;
+- the unique `(run_id, sequence)` database invariant;
+- ordered HTTP replay after an exclusive cursor with exact pagination;
+- authenticated WebSocket catch-up followed by live durable polling;
+- a shared 1,000-event page ceiling enforced by core, API, and persistence;
+- awaited sends for backpressure and disconnect handling that never cancels a run.
 
 ## Local setup
 
@@ -228,13 +291,16 @@ make bootstrap
 make check
 make compose-config
 make compose-up
+make migrate
 make compose-smoke
+make api
 ```
 
 `make compose-up` starts shared infrastructure only and invokes the locked
 `podman-compose` package with the native Podman CLI explicitly. `make compose-smoke`
 verifies every exposed dependency and routes requests through LiteLLM to both
-deterministic fake providers. Agent applications and workers are added in later
+deterministic fake providers. `make migrate` creates the durable control-plane schema;
+`make api` serves the authenticated API on `127.0.0.1:8000`. Workers are added in later
 implementation sequences. The fake LiteLLM routes are the default local configuration
 and do not need provider credentials.
 
@@ -247,6 +313,7 @@ For the opt-in runtime suites:
 make podman-images
 make sandbox-security
 make gateway-security ENV_FILE=.env
+make postgres-security
 ```
 
 `gateway-security` expects the local gateway services to be available and uses only the

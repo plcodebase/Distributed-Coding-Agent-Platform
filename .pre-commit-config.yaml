@@ -3,19 +3,19 @@ repos:
     hooks:
       - id: ruff-format
         name: ruff format check
-        entry: uv run ruff format --check packages scripts tests services/fake-llm/app.py
+        entry: uv run ruff format --check apps packages scripts tests services/fake-llm/app.py
         language: system
         types_or: [python, pyi]
         pass_filenames: false
       - id: ruff-check
         name: ruff lint
-        entry: uv run ruff check packages scripts tests services/fake-llm/app.py
+        entry: uv run ruff check apps packages scripts tests services/fake-llm/app.py
         language: system
         types_or: [python, pyi]
         pass_filenames: false
       - id: mypy
         name: mypy
-        entry: uv run mypy packages scripts tests
+        entry: uv run mypy apps packages scripts tests
         language: system
         types_or: [python, pyi]
         pass_filenames: false

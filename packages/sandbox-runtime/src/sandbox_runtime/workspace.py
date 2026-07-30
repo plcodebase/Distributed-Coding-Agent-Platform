@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -305,6 +306,9 @@ class RootedWorkspace:
         self._owns_search_runner = search_runner is None
         self._directory_scanner = directory_scanner
         self._mutation_lock = threading.Lock()
+        self._close_lock = asyncio.Lock()
+        self._root_fd_closed = False
+        self._search_runner_closed = not self._owns_search_runner
         self._closed = False
 
     @property
@@ -1114,12 +1118,16 @@ class RootedWorkspace:
             os.close(descriptor)
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        os.close(self._root_fd)
-        if self._owns_search_runner:
-            await self._search_runner.close()
+        async with self._close_lock:
+            if self._closed:
+                return
+            if not self._root_fd_closed:
+                os.close(self._root_fd)
+                self._root_fd_closed = True
+            if not self._search_runner_closed:
+                await self._search_runner.close()
+                self._search_runner_closed = True
+            self._closed = True
 
     async def __aenter__(self) -> RootedWorkspace:
         return self

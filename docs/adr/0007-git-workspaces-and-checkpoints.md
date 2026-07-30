@@ -76,6 +76,10 @@ and mutation boundary that Sequence 7 checkpoints can safely consume.
 - Construction failures close or remove resources created by that construction.
   Destruction becomes final only after both targeted Git administration and private
   filesystem cleanup succeed; failures return retryable `workspace_cleanup_failed`.
+  Concurrent destroy callers serialize, and caller cancellation waits for the shielded
+  cleanup attempt before propagating so no uncoordinated remover is left running.
+- Run IDs and snapshot labels must be bounded valid UTF-8. Only a SHA-256-derived run
+  token enters allocation paths and platform-generated baseline commit labels.
 - One platform owner mutates a worktree sequentially. Cross-process writer leases are
   deferred to Sequence 20, and containment from hostile concurrent host processes is a
   hardened Podman responsibility.

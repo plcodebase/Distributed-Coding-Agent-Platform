@@ -11,7 +11,7 @@ AUDIT_REQUIREMENTS ?= .cache/audit-requirements.txt
 export UV_CACHE_DIR ?= $(CURDIR)/.cache/uv
 export PRE_COMMIT_HOME ?= $(CURDIR)/.cache/pre-commit
 
-.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test podman-images sandbox-security gateway-security compose-config compose-up compose-smoke compose-down
+.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test podman-images sandbox-security gateway-security postgres-security migrate migration-check api compose-config compose-up compose-smoke compose-down
 
 bootstrap:
 	$(UV) python install 3.12
@@ -21,15 +21,15 @@ sync:
 	$(UV) sync --all-packages
 
 format:
-	$(UV) run ruff format packages scripts tests services/fake-llm/app.py
-	$(UV) run ruff check --fix packages scripts tests services/fake-llm/app.py
+	$(UV) run ruff format apps packages scripts tests services/fake-llm/app.py
+	$(UV) run ruff check --fix apps packages scripts tests services/fake-llm/app.py
 
 lint:
-	$(UV) run ruff format --check packages scripts tests services/fake-llm/app.py
-	$(UV) run ruff check packages scripts tests services/fake-llm/app.py
+	$(UV) run ruff format --check apps packages scripts tests services/fake-llm/app.py
+	$(UV) run ruff check apps packages scripts tests services/fake-llm/app.py
 
 typecheck:
-	$(UV) run mypy packages scripts tests
+	$(UV) run mypy apps packages scripts tests
 
 unit:
 	$(UV) run pytest tests/unit
@@ -57,6 +57,18 @@ sandbox-security:
 
 gateway-security:
 	AGENT_PLATFORM_RUN_PODMAN_GATEWAY=1 AGENT_PLATFORM_PODMAN_ENV_FILE=$(ENV_FILE) $(UV) run pytest tests/security/test_litellm_podman_deployment.py
+
+postgres-security:
+	AGENT_PLATFORM_RUN_POSTGRES_INTEGRATION=1 $(UV) run pytest tests/security/test_postgres_persistence.py
+
+migrate:
+	$(UV) run --env-file $(ENV_FILE) alembic upgrade head
+
+migration-check:
+	$(UV) run --env-file $(ENV_FILE) alembic check
+
+api:
+	$(UV) run --env-file $(ENV_FILE) uvicorn agent_api.factory:create_production_app --factory --host 127.0.0.1 --port 8000
 
 compose-config:
 	$(COMPOSE) --env-file $(ENV_FILE) config --quiet

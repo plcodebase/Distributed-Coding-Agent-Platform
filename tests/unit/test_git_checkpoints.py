@@ -334,12 +334,28 @@ def test_run_ids_are_bounded_and_only_hashed_tokens_reach_paths(tmp_path: Path) 
         manager.create(source, run_id="")
     with pytest.raises(ValueError):
         manager.create(source, run_id="x" * 1025)
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        manager.create(source, run_id="\ud800")
 
     workspace = manager.create(source, run_id="../../outside\nseparator")
     try:
         assert workspace.root.is_relative_to(tmp_path)
         assert ".." not in workspace.root.parent.name
         assert "outside" not in workspace.root.parent.name
+    finally:
+        asyncio.run(workspace.destroy())
+
+
+def test_snapshot_labels_reject_invalid_unicode(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="snapshot-label-validation",
+    )
+    try:
+        with pytest.raises(ValueError, match="valid UTF-8"):
+            workspace.commit_state(label="\ud800")
     finally:
         asyncio.run(workspace.destroy())
 
@@ -439,6 +455,73 @@ async def test_destroy_is_targeted_idempotent_and_retryable(
     assert workspace.root.exists()
 
     await workspace.destroy()
+    await workspace.destroy()
+    assert not workspace.root.parent.exists()
+
+
+async def test_destroy_is_cancellation_safe_and_serializes_concurrent_callers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="cancelled-cleanup",
+    )
+    original_destroy = workspace._destroy_sync
+    destroy_started = threading.Event()
+    allow_destroy = threading.Event()
+
+    def blocked_destroy() -> None:
+        destroy_started.set()
+        assert allow_destroy.wait(timeout=5)
+        original_destroy()
+
+    monkeypatch.setattr(workspace, "_destroy_sync", blocked_destroy)
+    cancelled = asyncio.create_task(workspace.destroy())
+    assert await asyncio.to_thread(destroy_started.wait, 2)
+    concurrent = asyncio.create_task(workspace.destroy())
+    cancelled.cancel()
+    await asyncio.sleep(0)
+    assert not cancelled.done()
+    assert not concurrent.done()
+
+    allow_destroy.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    await concurrent
+    await workspace.destroy()
+    assert not workspace.root.parent.exists()
+
+
+async def test_destroy_retries_owned_search_runner_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="runner-cleanup-retry",
+    )
+    original_close = workspace._search_runner.close
+    failures_remaining = 1
+
+    async def fail_first_close() -> None:
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise RuntimeError("simulated runner cleanup failure")
+        await original_close()
+
+    monkeypatch.setattr(workspace._search_runner, "close", fail_first_close)
+    with pytest.raises(DomainOperationError) as retryable:
+        await workspace.destroy()
+    assert retryable.value.code == "workspace_cleanup_failed"
+    assert retryable.value.details["retryable"] is True
+    assert workspace.root.exists()
+
     await workspace.destroy()
     assert not workspace.root.parent.exists()
 

@@ -17,7 +17,13 @@ from agent_core.gateway import (
     MessageRole,
 )
 from agent_core.settings import PlatformSettings
-from gateway_client import create_gateway_client
+from gateway_client import (
+    GatewayClientConfig,
+    InMemoryGatewayCircuitBreaker,
+    InMemoryGatewayRateLimiter,
+    InMemoryGatewayRequestStore,
+)
+from gateway_client.factory import create_gateway_client
 
 ROOT = Path(__file__).parents[2]
 COMPOSE = ROOT / ".venv" / "bin" / "podman-compose"
@@ -189,11 +195,22 @@ def test_primary_outage_uses_configured_secondary_fallback() -> None:
 
 async def test_typed_gateway_client_normalizes_live_litellm_stream() -> None:
     gateway_key = _gateway_key()
+    config = GatewayClientConfig()
     client = create_gateway_client(
         PlatformSettings(
             gateway_url="http://127.0.0.1:4000",
             gateway_api_key=gateway_key,
-        )
+        ),
+        config=config,
+        request_store=InMemoryGatewayRequestStore(),
+        rate_limiter=InMemoryGatewayRateLimiter(
+            requests_per_window=config.rate_limit_requests,
+            window_seconds=config.rate_limit_window_seconds,
+        ),
+        circuit_breaker=InMemoryGatewayCircuitBreaker(
+            failure_threshold=config.circuit_failure_threshold,
+            recovery_seconds=config.circuit_recovery_seconds,
+        ),
     )
     request = GatewayRequest(
         tenant_id=UUID("00000000-0000-0000-0000-000000000010"),

@@ -9,7 +9,16 @@ from gateway_client.client import (
     GatewayClient,
     GatewayClientConfig,
 )
-from gateway_client.factory import create_gateway_client
+from gateway_client.reliability import (
+    GatewayCircuitBreaker,
+    GatewayRateLimiter,
+    GatewayRequestClaim,
+    GatewayRequestClaimStatus,
+    GatewayRequestStore,
+    InMemoryGatewayCircuitBreaker,
+    InMemoryGatewayRateLimiter,
+    InMemoryGatewayRequestStore,
+)
 
 __all__ = [
     "DEFAULT_GATEWAY_REQUEST_BYTES",
@@ -17,7 +26,14 @@ __all__ = [
     "MAX_GATEWAY_REQUEST_BYTES",
     "MAX_GATEWAY_STREAM_BYTES",
     "MAX_GATEWAY_STREAM_EVENTS",
+    "GatewayCircuitBreaker",
     "GatewayClient",
     "GatewayClientConfig",
-    "create_gateway_client",
+    "GatewayRateLimiter",
+    "GatewayRequestClaim",
+    "GatewayRequestClaimStatus",
+    "GatewayRequestStore",
+    "InMemoryGatewayCircuitBreaker",
+    "InMemoryGatewayRateLimiter",
+    "InMemoryGatewayRequestStore",
 ]

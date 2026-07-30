@@ -5,8 +5,11 @@ description = "Distributed coding-agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
+  "agent-api",
   "agents-sdk-adapter",
+  "event-store",
   "gateway-client",
+  "platform-persistence",
   "platform-telemetry",
   "sandbox-runtime",
 ]
@@ -30,16 +33,22 @@ package = false
 
 [tool.uv.sources]
 agent-core = { workspace = true }
+agent-api = { workspace = true }
 agents-sdk-adapter = { workspace = true }
+event-store = { workspace = true }
 gateway-client = { workspace = true }
+platform-persistence = { workspace = true }
 platform-telemetry = { workspace = true }
 sandbox-runtime = { workspace = true }
 
 [tool.uv.workspace]
 members = [
+  "apps/agent-api",
   "packages/agent-core",
   "packages/agents-sdk-adapter",
+  "packages/event-store",
   "packages/gateway-client",
+  "packages/persistence",
   "packages/telemetry",
   "packages/sandbox-runtime",
 ]
@@ -61,12 +70,21 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = [
+  "agent_api",
   "agent_core",
   "agents_sdk_adapter",
+  "event_store",
   "gateway_client",
+  "platform_persistence",
   "platform_telemetry",
   "sandbox_runtime",
   "scripts",
+]
+
+[tool.coverage.paths]
+source = [
+  ".",
+  "/workspace",
 ]
 
 [tool.coverage.report]
@@ -79,8 +97,11 @@ line-length = 100
 target-version = "py312"
 src = [
   "packages/agent-core/src",
+  "apps/agent-api/src",
   "packages/agents-sdk-adapter/src",
+  "packages/event-store/src",
   "packages/gateway-client/src",
+  "packages/persistence/src",
   "packages/telemetry/src",
   "packages/sandbox-runtime/src",
   "scripts",
@@ -128,8 +149,11 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 mypy_path = [
   "packages/agent-core/src",
+  "apps/agent-api/src",
   "packages/agents-sdk-adapter/src",
+  "packages/event-store/src",
   "packages/gateway-client/src",
+  "packages/persistence/src",
   "packages/telemetry/src",
   "packages/sandbox-runtime/src",
 ]

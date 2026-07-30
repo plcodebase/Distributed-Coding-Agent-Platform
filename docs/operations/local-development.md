@@ -17,7 +17,9 @@
 5. Run `make compose-config`.
 6. On macOS, initialize and start the Podman machine if needed.
 7. Run `make compose-up`.
-8. Run `make compose-smoke`.
+8. Run `make migrate`.
+9. Run `make compose-smoke`.
+10. Run `make api` in a separate terminal.
 
 `make compose-up` stops waiting after 180 seconds by default. Override
 `COMPOSE_WAIT_TIMEOUT` when a slower machine needs more startup time. The smoke check
@@ -37,5 +39,14 @@ only into the gateway environment.
 - MinIO S3 API: `http://127.0.0.1:9000`
 - MinIO console: `http://127.0.0.1:9001`
 - LiteLLM: `http://127.0.0.1:4000`
+- Agent API: `http://127.0.0.1:8000`
 - Prometheus: `http://127.0.0.1:9090`
 - Grafana: `http://127.0.0.1:3000`
+
+All session, run, approval, event, and WebSocket routes require the bearer credential
+configured by `AGENT_PLATFORM_API_CREDENTIALS_JSON`. The local example contains one
+non-production token. Do not put a real identity-provider credential in source control.
+
+Use `make migration-check` after changing persistence models. Run
+`make postgres-security` for the opt-in real-PostgreSQL migration, idempotency,
+shared-policy, concurrent-sequence, and replay suite.

@@ -913,10 +913,13 @@ Implementation status through Sequences 11 and 12:
 * Every `GatewayRequest` requires tenant, session, run, turn, model-call, and stable
   request identifiers. The adapter sends this attribution as protected metadata and
   request headers.
-* Items 7, 9, 11, and 12 above—durable idempotency, client exponential backoff,
-  circuit-breaker state, and tenant/model rate limits—remain PR 13. LiteLLM's baseline
-  deployment fallback is implemented, but the worker client does not add a second
-  retry or fallback layer in PR 12.
+* Sequence 13 adds tenant-scoped durable request claims and completed-result replay,
+  pre-output-only exponential retry with jitter, and closed/open/half-open circuit plus
+  tenant/route admission policies. Production composition uses PostgreSQL-backed
+  shared state; deterministic local tests use in-memory adapters.
+* The client never retries after a normalized event has been emitted. Compatible
+  provider fallback remains centralized in LiteLLM so retries preserve the stable
+  logical route and request ID.
 
 ### Acceptance criteria
 
@@ -977,6 +980,22 @@ Server then continues with live events.
 
 8. Ensure WebSocket disconnect does not cancel the run.
 9. Add API-level idempotency keys to run creation.
+
+Implementation status through Sequences 14–16:
+
+* Sequence 14 adds SQLAlchemy 2.x async PostgreSQL records and an explicit Alembic
+  revision for sessions, runs, messages, task plans, tool calls, approvals,
+  checkpoints, events, model calls, gateway requests, rate windows, and circuit state.
+  Tenant-owned relationships and repository predicates include `tenant_id`.
+* Sequence 15 adds an injected FastAPI control plane with bearer authentication,
+  tenant-scoped session/run operations, database-enforced run creation idempotency,
+  cancellation, durable approval decisions, checkpoint rewind selection, and
+  live/ready health endpoints.
+* Sequence 16 allocates event sequences atomically from the run row, commits the event
+  in the same transaction, and exposes cursor-based HTTP replay plus authenticated
+  WebSocket catch-up/live polling. A socket disconnect never changes run state.
+* Run creation persists `QUEUED` work. Queue claiming, worker leases, and execution
+  begin in PRs 17 and 18.
 
 ### Acceptance criteria
 

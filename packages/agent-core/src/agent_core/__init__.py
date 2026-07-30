@@ -1,6 +1,16 @@
 """Provider-independent domain contracts for the agent platform."""
 
 from agent_core.checkpoints import CheckpointCoordinator, RewindState
+from agent_core.control import (
+    ApprovalDecision,
+    ApprovalStatus,
+    IdempotencyKey,
+    PersistedApproval,
+    PersistedMessage,
+    PersistedTaskPlan,
+    RunCreationResult,
+    run_creation_hash,
+)
 from agent_core.domain import (
     ApprovalMode,
     Checkpoint,
@@ -18,6 +28,7 @@ from agent_core.domain import (
     ToolCallStatus,
     transition_run,
 )
+from agent_core.event_store import EventDraft, EventPage, StoredEvent
 from agent_core.events import (
     MAX_EVENT_PAYLOAD_BYTES,
     AgentEvent,
@@ -40,6 +51,13 @@ from agent_core.gateway import (
     MessageRole,
     ModelGateway,
     parse_gateway_event,
+)
+from agent_core.gateway_reliability import (
+    GatewayCircuitBreaker,
+    GatewayRateLimiter,
+    GatewayRequestClaim,
+    GatewayRequestClaimStatus,
+    GatewayRequestStore,
 )
 from agent_core.loop import (
     MAX_GATEWAY_REQUEST_BYTES,
@@ -84,7 +102,9 @@ __all__ = [
     "AgentLoopConfig",
     "AgentLoopInput",
     "AnyAgentEvent",
+    "ApprovalDecision",
     "ApprovalMode",
+    "ApprovalStatus",
     "Checkpoint",
     "CheckpointCoordinator",
     "Clock",
@@ -94,34 +114,47 @@ __all__ = [
     "CommandSpec",
     "DomainOperationError",
     "ErrorDetail",
+    "EventDraft",
+    "EventPage",
     "EventType",
     "FrozenJsonObject",
+    "GatewayCircuitBreaker",
     "GatewayEvent",
     "GatewayEventKind",
     "GatewayFinishReason",
     "GatewayInvalidToolCallEvent",
     "GatewayMessage",
+    "GatewayRateLimiter",
     "GatewayRequest",
+    "GatewayRequestClaim",
+    "GatewayRequestClaimStatus",
+    "GatewayRequestStore",
     "GatewayResponseCompleted",
     "GatewayTextDelta",
     "GatewayToolCall",
     "GatewayToolCallEvent",
     "GatewayToolDefinition",
     "IdGenerator",
+    "IdempotencyKey",
     "InvalidRunTransitionError",
     "MessageRole",
     "ModelCall",
     "ModelCallStatus",
     "ModelGateway",
+    "PersistedApproval",
+    "PersistedMessage",
+    "PersistedTaskPlan",
     "PlatformSettings",
     "PreparedToolExecution",
     "RegisteredTool",
     "RewindState",
     "Run",
+    "RunCreationResult",
     "RunStatus",
     "Sandbox",
     "Session",
     "SessionStatus",
+    "StoredEvent",
     "ToolArguments",
     "ToolCall",
     "ToolCallStatus",
@@ -138,5 +171,6 @@ __all__ = [
     "WorkspaceSnapshot",
     "parse_agent_event",
     "parse_gateway_event",
+    "run_creation_hash",
     "transition_run",
 ]
