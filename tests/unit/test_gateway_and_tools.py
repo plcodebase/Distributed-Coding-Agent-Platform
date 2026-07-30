@@ -97,7 +97,10 @@ def test_gateway_message_roles_enforce_closed_transcript_shapes() -> None:
 def test_gateway_request_rejects_empty_messages_and_duplicate_tools() -> None:
     definition = read_registration().definition
     values = {
+        "tenant_id": "10000000-0000-0000-0000-000000000010",
+        "session_id": "10000000-0000-0000-0000-000000000020",
         "run_id": "10000000-0000-0000-0000-000000000001",
+        "turn_number": 1,
         "model_call_id": "model-call-1",
         "request_id": "request-1",
         "route_name": "coding-default",
@@ -110,6 +113,8 @@ def test_gateway_request_rejects_empty_messages_and_duplicate_tools() -> None:
         GatewayRequest.model_validate({**values, "messages": []})
     with pytest.raises(ValidationError, match="must be unique"):
         GatewayRequest.model_validate({**values, "tools": [definition, definition]})
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        GatewayRequest.model_validate({**values, "turn_number": 0})
 
 
 @pytest.mark.parametrize(

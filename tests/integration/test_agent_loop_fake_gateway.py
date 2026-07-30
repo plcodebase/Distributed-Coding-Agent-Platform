@@ -80,6 +80,8 @@ async def test_scripted_model_drives_complete_typed_agent_loop_without_network()
         id_generator=SequentialIdGenerator(),
     )
     loop_input = AgentLoopInput(
+        tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=UUID("00000000-0000-0000-0000-000000000020"),
         run_id=UUID("10000000-0000-0000-0000-000000000001"),
         attempt=1,
         worker_id="integration-worker",

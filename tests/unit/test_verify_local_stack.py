@@ -198,8 +198,15 @@ def test_gateway_check_sends_secret_without_logging_it(
         method: str = "GET",
         headers: dict[str, str] | None = None,
         body: bytes | None = None,
+        timeout_seconds: float = stack.HTTP_TIMEOUT_SECONDS,
     ) -> bytes:
-        captured.update(url=url, method=method, headers=headers, body=body)
+        captured.update(
+            url=url,
+            method=method,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
         return json.dumps(
             {"choices": [{"message": {"content": "deterministic fake-primary"}}]}
         ).encode()
@@ -208,6 +215,7 @@ def test_gateway_check_sends_secret_without_logging_it(
     stack._check_gateway_route("super-secret", "coding-default", "fake-primary")
 
     assert captured["method"] == "POST"
+    assert captured["timeout_seconds"] == stack.HTTP_TIMEOUT_SECONDS
     assert captured["headers"] == {
         "Authorization": "Bearer super-secret",
         "Content-Type": "application/json",
@@ -251,8 +259,11 @@ def test_build_checks_covers_every_dependency_and_fake_route() -> None:
         "redis",
         "minio",
         "litellm",
-        "fake-llm-primary",
-        "fake-llm-secondary",
+        "route:coding-default",
+        "route:coding-fast",
+        "route:coding-strong",
+        "route:summarization",
+        "route:code-review",
         "prometheus",
         "grafana",
     }
@@ -322,7 +333,7 @@ def test_main_uses_env_file_and_emits_completion(
     assert stack.main(["--env-file", str(env_file), "--timeout-seconds", "2"]) == 0
     assert captured["timeout_seconds"] == 2
     event = json.loads(capsys.readouterr().out)
-    assert event == {"event": "stack.verification.completed", "services": 8}
+    assert event == {"event": "stack.verification.completed", "services": 11}
 
 
 def test_main_requires_gateway_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

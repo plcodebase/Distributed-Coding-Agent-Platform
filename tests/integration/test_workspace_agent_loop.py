@@ -140,6 +140,8 @@ async def test_fake_model_executes_read_edit_and_command_in_isolated_workspace(
             event
             async for event in loop.run(
                 AgentLoopInput(
+                    tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    session_id=UUID("00000000-0000-0000-0000-000000000020"),
                     run_id=RUN_ID,
                     attempt=1,
                     worker_id="worker-1",

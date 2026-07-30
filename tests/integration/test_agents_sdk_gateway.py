@@ -25,6 +25,7 @@ from agent_core.tools import (
     ToolRegistry,
 )
 from agents_sdk_adapter import create_openai_compatible_agents_gateway
+from gateway_client import GatewayClient
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -218,12 +219,13 @@ async def test_agents_sdk_streams_fragmented_tool_round_trip_through_agent_loop(
     server = FakeOpenAIServer()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    gateway = create_openai_compatible_agents_gateway(
+    adapter = create_openai_compatible_agents_gateway(
         PlatformSettings(
             gateway_url=f"http://127.0.0.1:{server.server_port}",
             gateway_api_key="sk-sequence-4-test",
         )
     )
+    gateway = GatewayClient(adapter, close=adapter.aclose)
     echo_tool = EchoTool()
     registry = ToolRegistry(
         (
@@ -243,6 +245,8 @@ async def test_agents_sdk_streams_fragmented_tool_round_trip_through_agent_loop(
         id_generator=SequentialIdGenerator(),
     )
     loop_input = AgentLoopInput(
+        tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=UUID("00000000-0000-0000-0000-000000000020"),
         run_id=UUID("20000000-0000-0000-0000-000000000001"),
         attempt=1,
         worker_id="sdk-integration-worker",

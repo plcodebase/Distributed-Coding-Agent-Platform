@@ -76,6 +76,8 @@ class AgentLoopConfig(DomainModel):
 class AgentLoopInput(DomainModel):
     """Immutable input needed to run one already-leased execution attempt."""
 
+    tenant_id: uuid.UUID
+    session_id: uuid.UUID
     run_id: uuid.UUID
     attempt: int = Field(ge=1)
     worker_id: IdentifierString

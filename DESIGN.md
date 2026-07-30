@@ -753,9 +753,13 @@ Sequence 6 implements the edit/worktree portion with one locked descriptor-relat
 edit transaction, constant-size canonical patch identities, private detached worktrees,
 bounded no-follow untracked-file staging, source content fingerprints, deterministic
 Git execution, external-filter rejection, and bounded binary final patches. Sequence 7
-implements the checkpoint and rewind portion. The linked worktree may add objects and
-its own administration data to the repository's common Git directory, but neither
-sequence changes a source branch, source index, source checkout file, or source status.
+implements the checkpoint and rewind portion with serialized, bounded in-memory state;
+exact checkpoint and tool-call binding; fail-closed coordinator-contract validation;
+cancellation-safe rollback; and removal of later checkpoints when rewinding onto an
+earlier branch. The linked worktree may add objects and its own administration data to
+the repository's common Git directory, but neither sequence changes a source branch,
+source index, source checkout file, or source status. Durable retention and
+cross-worker checkpoint ownership remain later persistence responsibilities.
 
 ### Acceptance criteria
 
@@ -814,6 +818,25 @@ Move shell and filesystem execution into an isolated environment.
 Podman rootless mode, namespace isolation, and seccomp should be used where supported;
 the default seccomp profile must not be disabled.
 
+Sequence 8 implements only the provider-neutral contract and the explicitly unsafe
+local development adapter. Its process boundary serializes start/cancel/close,
+terminates children after timeout, output overflow, cancellation, or consumer failure,
+invalidates commands queued before cancellation, bounds its environment, concurrency,
+direct writes, and snapshot retention, and makes cleanup retryable. Snapshot restore
+accepts only exact snapshots owned by the adapter and truncates the abandoned future
+branch. These lifecycle guarantees prevent accidental local child leaks; they do not
+provide host filesystem, network, privilege, PID, CPU, or memory isolation.
+
+Sequences 9 and 10 now supply those production controls through a rootless
+`PodmanSandbox` and an executable hostile-workload suite. The adapter uses one
+disposable container per command, an offline network namespace, non-root keep-id
+mapping, a read-only root, a bounded tmpfs, all-capability drop,
+`no-new-privileges`, and explicit CPU, memory/swap, PID, open-file, duration, and
+output limits. Only the private Git worktree is mounted. Tests verify host-credential
+and symlink denial, root-write and network failure, unavailable Podman sockets,
+resource exhaustion, and destroy-time child cleanup. Production image configuration
+requires a SHA-256 digest; local runtime tests use explicit Podman-built tags.
+
 ### Acceptance criteria
 
 * Commands cannot access host credentials.
@@ -867,6 +890,28 @@ Route all model calls through LiteLLM Proxy.
 16. Ensure the agent worker contains no provider API keys.
 
 LiteLLM Proxy provides a centralized gateway interface with provider normalization, routing, retries and fallback, spend tracking, and rate-limiting hooks.
+
+Implementation status through Sequences 11 and 12:
+
+* LiteLLM is deployed by the Podman Compose stack with all five aliases and two
+  deterministic local deployments; the production configuration maps aliases across
+  OpenAI and Anthropic.
+* Provider credentials are present only on the LiteLLM service. Fake providers,
+  workers, the Agents SDK adapter, and the Podman sandbox do not receive them.
+* The local deployment has bounded retries and upstream timeouts plus explicit
+  compatible fallbacks. Runtime tests stop the primary and prove
+  `coding-default` reaches the secondary.
+* The `gateway-client` package composes the Agents SDK adapter, allowlists routes,
+  revalidates normalized events, enforces terminal-stream invariants, bounds cumulative
+  stream events/bytes, and owns cancellation-safe, retryable cleanup that blocks reuse
+  after partial cleanup.
+* Every `GatewayRequest` requires tenant, session, run, turn, model-call, and stable
+  request identifiers. The adapter sends this attribution as protected metadata and
+  request headers.
+* Items 7, 9, 11, and 12 above—durable idempotency, client exponential backoff,
+  circuit-breaker state, and tenant/model rate limits—remain PR 13. LiteLLM's baseline
+  deployment fallback is implemented, but the worker client does not add a second
+  retry or fallback layer in PR 12.
 
 ### Acceptance criteria
 

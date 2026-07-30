@@ -147,6 +147,8 @@ def read_tool(handler: ToolHandler[ReadArguments]) -> RegisteredTool[ReadArgumen
 
 def default_input() -> AgentLoopInput:
     return AgentLoopInput(
+        tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=UUID("00000000-0000-0000-0000-000000000020"),
         run_id=RUN_ID,
         attempt=1,
         worker_id="worker-1",
@@ -212,6 +214,10 @@ async def test_final_text_stream_emits_contiguous_typed_events() -> None:
     assert len(gateway.requests) == 1
     assert gateway.requests[0].messages == default_input().messages
     assert gateway.requests[0].tools == ()
+    assert gateway.requests[0].tenant_id == default_input().tenant_id
+    assert gateway.requests[0].session_id == default_input().session_id
+    assert gateway.requests[0].run_id == default_input().run_id
+    assert gateway.requests[0].turn_number == 1
 
 
 async def test_one_tool_call_is_validated_executed_and_returned_to_model() -> None:
@@ -254,6 +260,7 @@ async def test_one_tool_call_is_validated_executed_and_returned_to_model() -> No
     assert any(isinstance(event, ToolStdoutEvent) for event in events)
     assert any(isinstance(event, ToolStderrEvent) for event in events)
     assert len(gateway.requests) == 2
+    assert [request.turn_number for request in gateway.requests] == [1, 2]
     assert [message.role for message in gateway.requests[1].messages] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
@@ -1246,6 +1253,8 @@ def test_loop_configuration_and_input_reject_unbounded_values() -> None:
         AgentLoopConfig(model_timeout_seconds=float("inf"))
     with pytest.raises(ValueError, match="at least 1 item"):
         AgentLoopInput(
+            tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+            session_id=UUID("00000000-0000-0000-0000-000000000020"),
             run_id=RUN_ID,
             attempt=1,
             worker_id="worker-1",

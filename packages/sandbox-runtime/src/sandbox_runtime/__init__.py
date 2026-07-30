@@ -4,6 +4,7 @@ from sandbox_runtime.access import WorkspaceAccessPolicy
 from sandbox_runtime.checkpoints import InMemoryCheckpointCoordinator
 from sandbox_runtime.git_workspace import GitWorktreeManager, GitWorktreeWorkspace
 from sandbox_runtime.local import LocalSandbox
+from sandbox_runtime.podman import PodmanSandbox, PodmanSandboxConfig
 from sandbox_runtime.tools import (
     EditFileArguments,
     EditFileResult,
@@ -32,6 +33,8 @@ __all__ = [
     "ListFilesArguments",
     "ListFilesResult",
     "LocalSandbox",
+    "PodmanSandbox",
+    "PodmanSandboxConfig",
     "ReadFileArguments",
     "ReadResult",
     "RootedWorkspace",

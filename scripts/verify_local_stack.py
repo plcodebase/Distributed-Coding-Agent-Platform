@@ -74,6 +74,7 @@ def _local_http_request(
     method: str = "GET",
     headers: Mapping[str, str] | None = None,
     body: bytes | None = None,
+    timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
 ) -> bytes:
     parsed = urlsplit(url)
     if parsed.scheme != "http" or parsed.hostname not in LOCAL_HTTP_HOSTS:
@@ -85,7 +86,7 @@ def _local_http_request(
         headers=dict(headers or {}),
         method=method,
     )
-    with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310
+    with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
         payload = cast("bytes", response.read(MAX_RESPONSE_BYTES + 1))
         if len(payload) > MAX_RESPONSE_BYTES:
             raise ValueError("response exceeded the 1 MiB verification limit")
@@ -126,7 +127,13 @@ def _check_grafana() -> None:
         raise ValueError("Grafana database is not ready")
 
 
-def _check_gateway_route(gateway_key: str, route: str, expected_provider: str) -> None:
+def _check_gateway_route(
+    gateway_key: str,
+    route: str,
+    expected_provider: str,
+    *,
+    timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
+) -> None:
     payload = json.dumps(
         {
             "model": route,
@@ -145,6 +152,7 @@ def _check_gateway_route(gateway_key: str, route: str, expected_provider: str) -
                 "Content-Type": "application/json",
             },
             body=payload,
+            timeout_seconds=timeout_seconds,
         )
     )
 
@@ -159,18 +167,27 @@ def _check_gateway_route(gateway_key: str, route: str, expected_provider: str) -
 
 
 def build_checks(gateway_key: str) -> dict[str, Check]:
-    """Build deterministic checks for every sequence-1 dependency."""
+    """Build deterministic checks for every dependency and logical model route."""
 
     return {
         "postgres": lambda: _check_tcp("127.0.0.1", 5432),
         "redis": _check_redis,
         "minio": lambda: _check_text_endpoint("http://127.0.0.1:9000/minio/health/live", ""),
         "litellm": lambda: _check_text_endpoint("http://127.0.0.1:4000/health/liveliness", ""),
-        "fake-llm-primary": lambda: _check_gateway_route(
+        "route:coding-default": lambda: _check_gateway_route(
             gateway_key, "coding-default", "fake-primary"
         ),
-        "fake-llm-secondary": lambda: _check_gateway_route(
+        "route:coding-fast": lambda: _check_gateway_route(
+            gateway_key, "coding-fast", "fake-primary"
+        ),
+        "route:coding-strong": lambda: _check_gateway_route(
             gateway_key, "coding-strong", "fake-secondary"
+        ),
+        "route:summarization": lambda: _check_gateway_route(
+            gateway_key, "summarization", "fake-primary"
+        ),
+        "route:code-review": lambda: _check_gateway_route(
+            gateway_key, "code-review", "fake-secondary"
         ),
         "prometheus": lambda: _check_text_endpoint("http://127.0.0.1:9090/-/ready", "ready"),
         "grafana": _check_grafana,

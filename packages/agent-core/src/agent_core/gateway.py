@@ -78,7 +78,10 @@ class GatewayMessage(DomainModel):
 class GatewayRequest(DomainModel):
     """One logical reasoning request routed through the centralized gateway."""
 
+    tenant_id: uuid.UUID
+    session_id: uuid.UUID
     run_id: uuid.UUID
+    turn_number: int = Field(ge=1, le=100)
     model_call_id: IdentifierString
     request_id: IdentifierString
     route_name: IdentifierString

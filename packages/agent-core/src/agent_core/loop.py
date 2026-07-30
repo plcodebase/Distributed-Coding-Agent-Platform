@@ -133,7 +133,10 @@ class AgentLoop:
             model_call_id = self._id_generator.new_id("model-call")
             request_id = self._id_generator.new_id("request")
             request = GatewayRequest(
+                tenant_id=loop_input.tenant_id,
+                session_id=loop_input.session_id,
                 run_id=loop_input.run_id,
+                turn_number=turn_number,
                 model_call_id=model_call_id,
                 request_id=request_id,
                 route_name=loop_input.route_name,

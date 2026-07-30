@@ -110,9 +110,14 @@ Sequence 7 provides:
 - mandatory tool-effect declarations and checkpoints before every workspace mutation
   or command;
 - typed checkpoint events before execution and workspace revision metadata on success;
-- automatic Git restoration after failed side effects;
+- validation that coordinator-returned checkpoint state exactly matches the requested
+  run, transcript position, task plan, and context summary;
+- serialized, bounded, tool-call-bound in-memory checkpoint state with duplicate-ID
+  and forged-checkpoint rejection;
+- cancellation-safe Git restoration after failed, cancelled, or unsuccessfully
+  finalized side effects;
 - rewind of active commands, workspace revision, transcript, task plan, and context
-  summary;
+  summary, with later abandoned checkpoints invalidated;
 - same-run duplicate reuse without a second checkpoint or repeated mutation.
 
 The current checkpoint coordinator is intentionally in-memory. Durable checkpoint,
@@ -127,12 +132,86 @@ Sequence 8 provides:
 - an argv-only `run_command` tool with timeout, output, result, and non-zero-exit
   failures represented as structured errors;
 - concurrent bounded stdout/stderr streaming and process-group cancellation;
-- a minimal non-inherited process environment and contained working directory;
+- lifecycle serialization across process start, cancellation, and close, including
+  child termination when output consumers fail;
+- bounded concurrency with queued-command invalidation on cancellation;
+- a validated, bounded, minimal non-inherited process environment and contained working
+  directory;
+- bounded direct writes and sandbox-owned snapshots with branch truncation on restore;
+- cancellation-safe, retryable cleanup that blocks reuse after partial failure;
 - an explicitly unsafe `LocalSandbox` that is disabled by default, requires development
-  or test opt-in, and refuses enabled construction in production.
+  or test opt-in, rejects unknown runtime labels, and refuses enabled construction in
+  production.
 
-`LocalSandbox` is not a security boundary. Production command execution remains
-disabled until the later hardened Podman sandbox and its isolation tests are complete.
+`LocalSandbox` is not a security boundary. Production composition must use the
+`PodmanSandbox` described next.
+
+### Sequence 9: hardened Podman sandbox
+
+Sequence 9 provides:
+
+- a production `PodmanSandbox` backed by a verified rootless Podman engine;
+- one disposable, uniquely named container per argv-only command;
+- a non-root keep-id user namespace, all-capability drop, `no-new-privileges`, private
+  PID/cgroup/IPC/UTS namespaces, and an explicitly retained default seccomp policy;
+- a read-only root filesystem, bounded tmpfs, offline network mode, and exactly one
+  writable mount containing the owned Git worktree, with image volumes ignored;
+- cleared image defaults, disabled host-proxy propagation, fixed non-secret container
+  environment values, and a bounded Podman-control environment allowlist;
+- explicit CPU, memory/swap, PID, open-file, timeout, output, direct-write, and snapshot
+  ceilings;
+- cancellation-safe, single-owner targeted container removal before runner/worktree
+  cleanup, with retryable partial-cleanup failures;
+- mandatory digest-pinned images in production configuration.
+
+### Sequence 10: sandbox security verification
+
+Sequence 10 provides an opt-in executable security suite that verifies:
+
+- effective non-root identity and cgroup/open-file limits from inside the container;
+- denial of host credential reads, symlink escapes, root-filesystem writes, external
+  networking, and Podman service-socket access;
+- PID exhaustion, memory exhaustion, command timeouts, and bounded output;
+- removal of all platform command containers when a sandbox is destroyed mid-command.
+
+The suite uses only Podman and local test data. Run it with `make sandbox-security`
+after the sandbox image is built.
+
+### Sequence 11: LiteLLM Proxy deployment
+
+Sequence 11 provides:
+
+- a hardened, loopback-only LiteLLM service deployed through Podman Compose;
+- stable `coding-default`, `coding-fast`, `coding-strong`, `summarization`, and
+  `code-review` aliases;
+- production mappings across OpenAI and Anthropic deployments, with provider
+  credentials scoped only to LiteLLM;
+- deterministic local mappings across two private fake-provider services;
+- bounded retries, cooldown, upstream timeouts, and explicit compatible fallbacks;
+- deployment-contract tests plus a live suite that verifies all aliases and proves
+  `coding-default` reaches the secondary when the primary is unavailable.
+
+Client-side retry, stored-result idempotency, circuit breaking, and rate-limit policy
+remain Sequence 13.
+
+### Sequence 12: typed gateway client and normalized streaming
+
+Sequence 12 provides:
+
+- a separate `gateway-client` composition package wrapping the Agents SDK model adapter;
+- required tenant, session, run, turn, model-call, and stable request identifiers on
+  every typed gateway request;
+- immutable attribution metadata and headers applied to every upstream call;
+- a default allowlist containing exactly the five logical model routes;
+- revalidation of every normalized stream event, one-terminal-event enforcement, and
+  rejection of malformed, incomplete, or post-terminal streams;
+- cumulative UTF-8 byte and event-count limits with delegated stream cancellation;
+- opaque provider failures and idempotent, cancellation-safe, retryable async lifecycle
+  cleanup that blocks model traffic after partial cleanup;
+- unit tests and a live streaming test through the Podman LiteLLM deployment.
+
+Sequence 12 does not claim durable request idempotency. Attaching to in-flight calls,
+returning stored results, and rejecting request-ID payload conflicts remain Sequence 13.
 
 ## Local setup
 
@@ -154,3 +233,15 @@ and do not need provider credentials.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
 sandbox environments.
+
+For the opt-in runtime suites:
+
+```shell
+make podman-images
+make sandbox-security
+make gateway-security ENV_FILE=.env
+```
+
+`gateway-security` expects the local gateway services to be available and uses only the
+gateway key from the selected environment file. The test itself recreates and later
+stops its three targeted LiteLLM/fake-provider services.

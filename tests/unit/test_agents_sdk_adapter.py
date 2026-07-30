@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import TYPE_CHECKING, cast
 
@@ -101,13 +102,52 @@ class FakeOwnedClient:
         self.close_calls += 1
 
 
+class RetryableProvider(FakeSdkProvider):
+    def __init__(self, model: FakeSdkModel, known_value: str) -> None:
+        super().__init__(model)
+        self.known_value = known_value
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError(self.known_value)
+        await super().aclose()
+
+
+class RetryableOwnedClient(FakeOwnedClient):
+    def __init__(self, known_value: str) -> None:
+        super().__init__()
+        self.known_value = known_value
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError(self.known_value)
+
+
+class BlockingProvider(FakeSdkProvider):
+    def __init__(self, model: FakeSdkModel) -> None:
+        super().__init__(model)
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.close_started.set()
+        await self.close_release.wait()
+        await super().aclose()
+
+
 def gateway_request(
     *,
     messages: tuple[GatewayMessage, ...] | None = None,
     tools: tuple[GatewayToolDefinition, ...] = (),
 ) -> GatewayRequest:
     return GatewayRequest(
+        tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=uuid.UUID("00000000-0000-0000-0000-000000000020"),
         run_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        turn_number=1,
         model_call_id="model-call-1",
         request_id="request-1",
         route_name="coding-default",
@@ -341,6 +381,26 @@ async def test_gateway_normalizes_text_tool_calls_usage_and_route() -> None:
     assert provider.model_names == ["coding-default"]
     assert model.calls[0]["tracing"] is ModelTracing.DISABLED
     assert model.calls[0]["previous_response_id"] is None
+    request_settings = model.calls[0]["model_settings"]
+    assert isinstance(request_settings, ModelSettings)
+    assert request_settings.include_usage is True
+    assert request_settings.metadata == {
+        "tenant_id": "00000000-0000-0000-0000-000000000010",
+        "session_id": "00000000-0000-0000-0000-000000000020",
+        "run_id": "00000000-0000-0000-0000-000000000001",
+        "turn_number": "1",
+        "model_call_id": "model-call-1",
+        "request_id": "request-1",
+        "route_name": "coding-default",
+    }
+    assert request_settings.extra_headers == {
+        "X-Agent-Model-Call-ID": "model-call-1",
+        "X-Agent-Run-ID": "00000000-0000-0000-0000-000000000001",
+        "X-Agent-Session-ID": "00000000-0000-0000-0000-000000000020",
+        "X-Agent-Tenant-ID": "00000000-0000-0000-0000-000000000010",
+        "X-Agent-Turn": "1",
+        "X-Request-ID": "request-1",
+    }
     assert model.closed is True
 
 
@@ -614,6 +674,66 @@ async def test_gateway_closes_factory_owned_client_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_cleanup_is_opaque_retryable_and_resumes_partial_cleanup() -> None:
+    known_value = "provider-cleanup-secret"
+    model = FakeSdkModel([completed_event()])
+    provider = RetryableProvider(model, known_value)
+    client = FakeOwnedClient()
+    gateway = OpenAIAgentsGateway._with_owned_client(
+        cast("ModelProvider", provider),
+        cast("AsyncOpenAI", client),
+    )
+
+    with pytest.raises(DomainOperationError) as first:
+        await gateway.aclose()
+    assert first.value.code == "gateway_cleanup_failed"
+    assert first.value.retryable is True
+    assert known_value not in repr(first.value.as_dict())
+    assert client.close_calls == 0
+    with pytest.raises(DomainOperationError) as unavailable:
+        _ = [event async for event in gateway.stream(gateway_request())]
+    assert unavailable.value.code == "gateway_cleanup_required"
+
+    await gateway.aclose()
+    assert provider.close_calls == 2
+    assert client.close_calls == 1
+
+    client_value = "client-cleanup-secret"
+    second_provider = FakeSdkProvider(model)
+    retryable_client = RetryableOwnedClient(client_value)
+    second_gateway = OpenAIAgentsGateway._with_owned_client(
+        cast("ModelProvider", second_provider),
+        cast("AsyncOpenAI", retryable_client),
+    )
+    with pytest.raises(DomainOperationError) as client_failure:
+        await second_gateway.aclose()
+    assert client_failure.value.code == "gateway_cleanup_failed"
+    assert client_value not in repr(client_failure.value.as_dict())
+
+    await second_gateway.aclose()
+    assert second_provider.closed is True
+    assert retryable_client.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_gateway_cleanup_completes_before_propagating_cancellation() -> None:
+    provider = BlockingProvider(FakeSdkModel([completed_event()]))
+    gateway = OpenAIAgentsGateway(cast("ModelProvider", provider))
+    closing = asyncio.create_task(gateway.aclose())
+
+    await provider.close_started.wait()
+    closing.cancel()
+    provider.close_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert provider.closed is True
+    with pytest.raises(DomainOperationError) as closed:
+        _ = [event async for event in gateway.stream(gateway_request())]
+    assert closed.value.code == "gateway_closed"
+
+
+@pytest.mark.asyncio
 async def test_factory_uses_versioned_route_auth_and_no_hidden_retry() -> None:
     requests: list[httpx.Request] = []
 
@@ -641,9 +761,15 @@ async def test_factory_uses_versioned_route_auth_and_no_hidden_retry() -> None:
     assert len(requests) == 1
     assert requests[0].url == httpx.URL("http://gateway.test/v1/chat/completions")
     assert requests[0].headers["authorization"] == "Bearer sk-gateway-secret"
+    assert requests[0].headers["x-request-id"] == "request-1"
+    assert requests[0].headers["x-agent-tenant-id"] == ("00000000-0000-0000-0000-000000000010")
+    assert requests[0].headers["x-agent-session-id"] == ("00000000-0000-0000-0000-000000000020")
+    assert requests[0].headers["x-agent-run-id"] == ("00000000-0000-0000-0000-000000000001")
+    assert requests[0].headers["x-agent-turn"] == "1"
     request_body = requests[0].read().decode()
     assert '"model":"coding-default"' in request_body
     assert '"stream":true' in request_body
+    assert '"request_id":"request-1"' in request_body
     assert "provider detail" not in caught.value.as_dict().__repr__()
 
     await gateway.aclose()

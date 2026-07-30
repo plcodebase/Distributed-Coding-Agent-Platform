@@ -80,6 +80,32 @@ class _PreparedCall:
     validation_error: ErrorDetail | None = None
 
 
+def _checkpoint_matches_request(
+    checkpoint: Checkpoint,
+    *,
+    run_id: uuid.UUID,
+    message_sequence: int,
+    task_plan: FrozenJsonObject,
+    context_summary: str | None,
+) -> bool:
+    return (
+        isinstance(checkpoint, Checkpoint)
+        and checkpoint.run_id == run_id
+        and checkpoint.message_sequence == message_sequence
+        and checkpoint.task_plan == task_plan
+        and checkpoint.context_summary == context_summary
+    )
+
+
+def _valid_workspace_revision(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and "\x00" not in value
+        and 0 < len(value) <= _MAX_WORKSPACE_REVISION_CHARACTERS
+    )
+
+
 def _utf8_prefix(value: str, byte_limit: int) -> str:
     return value.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore")
 
@@ -273,6 +299,30 @@ class ToolTurnExecutor:
                     )
                     emitted.append(events.run_failed(error=error))
                     return ToolTurnReport(events=tuple(emitted), terminal=True)
+                if not _checkpoint_matches_request(
+                    checkpoint,
+                    run_id=run_id,
+                    message_sequence=len(transcript),
+                    task_plan=task_plan,
+                    context_summary=context_summary,
+                ):
+                    error = loop_error(
+                        "checkpoint_contract_invalid",
+                        "the checkpoint coordinator returned mismatched state",
+                        details={
+                            "tool_call_id": item.tool_call.id,
+                            "tool_name": item.tool_call.name,
+                        },
+                    )
+                    emitted.append(
+                        events.tool_completed(
+                            tool_call_id=item.tool_call.id,
+                            status=ToolCallStatus.FAILED,
+                            error=error,
+                        )
+                    )
+                    emitted.append(events.run_failed(error=error))
+                    return ToolTurnReport(events=tuple(emitted), terminal=True)
                 last_checkpoint_id = checkpoint.id
                 emitted.append(
                     events.checkpoint_created(
@@ -283,12 +333,33 @@ class ToolTurnExecutor:
                 )
 
             emitted.append(events.tool_started(tool_call=item.tool_call))
-            run_result = await self._run_tool(
-                item.prepared,
-                tool_call=item.tool_call,
-                run_id=run_id,
-                checkpoint=checkpoint,
-            )
+            try:
+                run_result = await self._run_tool(
+                    item.prepared,
+                    tool_call=item.tool_call,
+                    run_id=run_id,
+                    checkpoint=checkpoint,
+                )
+            except asyncio.CancelledError as cancelled:
+                if checkpoint is not None:
+                    coordinator = self._checkpoints
+                    if coordinator is None:
+                        raise RuntimeError("checkpoint requires a coordinator") from cancelled
+                    restore_task = asyncio.create_task(coordinator.rollback(checkpoint))
+                    try:
+                        await asyncio.shield(restore_task)
+                    except asyncio.CancelledError:
+                        await restore_task
+                    except Exception as cancellation_restore_error:
+                        raise DomainOperationError(
+                            code="checkpoint_restore_failed",
+                            message="workspace restoration failed after tool cancellation",
+                            details={
+                                "checkpoint_id": str(checkpoint.id),
+                                "tool_call_id": item.tool_call.id,
+                            },
+                        ) from cancellation_restore_error
+                raise
             emitted.extend(
                 events.tool_output(
                     tool_call_id=item.tool_call.id,
@@ -366,14 +437,9 @@ class ToolTurnExecutor:
                         terminal=True,
                         last_checkpoint_id=last_checkpoint_id,
                     )
-                result_value = run_result.result.to_json_object()
-                result_value["workspace_revision"] = workspace_revision
-                completed_result = FrozenJsonObject(result_value)
                 result_error: ErrorDetail | None = None
-                if (
-                    not workspace_revision.strip()
-                    or len(workspace_revision) > _MAX_WORKSPACE_REVISION_CHARACTERS
-                ):
+                completed_result: FrozenJsonObject | None = None
+                if not _valid_workspace_revision(workspace_revision):
                     result_error = loop_error(
                         "checkpoint_finalize_failed",
                         "the checkpoint coordinator returned an invalid workspace revision",
@@ -382,16 +448,20 @@ class ToolTurnExecutor:
                             "tool_call_id": item.tool_call.id,
                         },
                     )
-                elif json_size(completed_result) > self._config.max_tool_result_bytes:
-                    result_error = loop_error(
-                        "tool_result_limit",
-                        "the completed tool metadata exceeded the configured byte limit",
-                        details={
-                            "tool_call_id": item.tool_call.id,
-                            "tool_name": item.tool_call.name,
-                            "limit_bytes": self._config.max_tool_result_bytes,
-                        },
-                    )
+                else:
+                    result_value = run_result.result.to_json_object()
+                    result_value["workspace_revision"] = workspace_revision
+                    completed_result = FrozenJsonObject(result_value)
+                    if json_size(completed_result) > self._config.max_tool_result_bytes:
+                        result_error = loop_error(
+                            "tool_result_limit",
+                            "the completed tool metadata exceeded the configured byte limit",
+                            details={
+                                "tool_call_id": item.tool_call.id,
+                                "tool_name": item.tool_call.name,
+                                "limit_bytes": self._config.max_tool_result_bytes,
+                            },
+                        )
                 if result_error is not None:
                     try:
                         await coordinator.rollback(checkpoint)
@@ -417,6 +487,8 @@ class ToolTurnExecutor:
                         terminal=True,
                         last_checkpoint_id=last_checkpoint_id,
                     )
+                if completed_result is None:
+                    raise AssertionError("valid completion metadata must produce a result")
                 run_result = _ToolRunResult(
                     output=run_result.output,
                     result=completed_result,

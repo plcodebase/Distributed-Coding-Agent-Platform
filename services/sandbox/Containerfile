@@ -1,0 +1,8 @@
+FROM python:3.12.13-alpine3.22
+
+RUN addgroup -S sandbox -g 10001 \
+    && adduser -S -D -H -G sandbox -u 10001 sandbox
+
+WORKDIR /workspace
+USER 10001:10001
+ENTRYPOINT ["python"]

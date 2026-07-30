@@ -3,13 +3,15 @@ PODMAN ?= podman
 PODMAN_COMPOSE ?= $(CURDIR)/.venv/bin/podman-compose
 COMPOSE = $(PODMAN_COMPOSE) --podman-path $(PODMAN)
 COMPOSE_SERVICES = postgres redis minio fake-llm-primary fake-llm-secondary litellm prometheus grafana
+FAKE_LLM_IMAGE ?= localhost/agent-platform-fake-llm:local
+SANDBOX_IMAGE ?= localhost/agent-platform-sandbox:sequence-10
 ENV_FILE ?= .env
 COMPOSE_WAIT_TIMEOUT ?= 180
 AUDIT_REQUIREMENTS ?= .cache/audit-requirements.txt
 export UV_CACHE_DIR ?= $(CURDIR)/.cache/uv
 export PRE_COMMIT_HOME ?= $(CURDIR)/.cache/pre-commit
 
-.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test compose-config compose-up compose-smoke compose-down
+.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test podman-images sandbox-security gateway-security compose-config compose-up compose-smoke compose-down
 
 bootstrap:
 	$(UV) python install 3.12
@@ -46,10 +48,20 @@ check: lint typecheck coverage
 
 test: check integration
 
+podman-images:
+	$(PODMAN) build --tag $(FAKE_LLM_IMAGE) --file services/fake-llm/Containerfile services/fake-llm
+	$(PODMAN) build --tag $(SANDBOX_IMAGE) --file services/sandbox/Containerfile services/sandbox
+
+sandbox-security:
+	AGENT_PLATFORM_RUN_PODMAN_SECURITY=1 AGENT_PLATFORM_SANDBOX_IMAGE=$(SANDBOX_IMAGE) $(UV) run pytest -W error::pytest.PytestUnraisableExceptionWarning tests/security/test_podman_sandbox_security.py
+
+gateway-security:
+	AGENT_PLATFORM_RUN_PODMAN_GATEWAY=1 AGENT_PLATFORM_PODMAN_ENV_FILE=$(ENV_FILE) $(UV) run pytest tests/security/test_litellm_podman_deployment.py
+
 compose-config:
 	$(COMPOSE) --env-file $(ENV_FILE) config --quiet
 
-compose-up:
+compose-up: podman-images
 	$(COMPOSE) --env-file $(ENV_FILE) run --rm --no-deps -T prometheus-credentials
 	$(COMPOSE) --env-file $(ENV_FILE) up --detach --wait --wait-timeout $(COMPOSE_WAIT_TIMEOUT) $(COMPOSE_SERVICES)
 	$(COMPOSE) --env-file $(ENV_FILE) run --rm --no-deps -T minio-init

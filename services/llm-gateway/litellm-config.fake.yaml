@@ -4,26 +4,31 @@ model_list:
       model: openai/fake-primary
       api_base: http://fake-llm-primary:8080/v1
       api_key: fake-primary-key
+      timeout: 2
   - model_name: coding-fast
     litellm_params:
       model: openai/fake-primary
       api_base: http://fake-llm-primary:8080/v1
       api_key: fake-primary-key
+      timeout: 2
   - model_name: coding-strong
     litellm_params:
       model: openai/fake-secondary
       api_base: http://fake-llm-secondary:8080/v1
       api_key: fake-secondary-key
+      timeout: 2
   - model_name: summarization
     litellm_params:
       model: openai/fake-primary
       api_base: http://fake-llm-primary:8080/v1
       api_key: fake-primary-key
+      timeout: 2
   - model_name: code-review
     litellm_params:
       model: openai/fake-secondary
       api_base: http://fake-llm-secondary:8080/v1
       api_key: fake-secondary-key
+      timeout: 2
 
 router_settings:
   num_retries: 2

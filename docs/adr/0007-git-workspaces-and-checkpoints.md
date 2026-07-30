@@ -80,20 +80,30 @@ and mutation boundary that Sequence 7 checkpoints can safely consume.
   deferred to Sequence 20, and containment from hostile concurrent host processes is a
   hardened Podman responsibility.
 
-## Sequence 7 compatibility
+## Sequence 7 decision
 
 - Every registered tool declares its effect as read-only, workspace mutation, command,
   or interaction. The loop requires a `CheckpointCoordinator` before a mutation or
   command and emits `checkpoint.created` first.
 - A checkpoint contains run/session identity, transcript position, exact pre-tool Git
-  revision, task plan, context summary, and creation time. Success records the new
-  workspace revision; failure restores the pre-tool revision.
+  revision, task plan, context summary, and creation time. The loop validates the
+  returned run identity, transcript position, plan, and summary before it starts the
+  tool. A malformed coordinator response fails closed.
+- The in-memory coordinator serializes creation, completion, rollback, and rewind. It
+  binds each immutable checkpoint to one tool-call ID, rejects duplicate checkpoint
+  IDs, validates exact checkpoint identity on later operations, and bounds checkpoint
+  count, message count, and serialized state bytes.
+- Success commits and validates a bounded workspace revision before it enters tool
+  result metadata. Tool failure, finalization failure, and task cancellation restore
+  the pre-tool revision before the error or cancellation is propagated.
 - Rewind cancels active work, restores the Git revision, and returns the exact messages,
-  plan, summary, and revision stored at the checkpoint.
+  plan, summary, and revision stored at the checkpoint. Checkpoints created after the
+  rewind target are discarded so an abandoned future branch cannot be restored.
 - Same-run duplicate suppression reuses an identical terminal tool outcome without a
   second checkpoint or repeated mutation.
 - The current coordinator remains in-memory. Durable checkpoint, event, message, and
-  replay storage belongs to later persistence sequences.
+  replay storage, cross-worker ownership, and retention beyond one process belong to
+  later persistence sequences.
 
 ## Consequences
 

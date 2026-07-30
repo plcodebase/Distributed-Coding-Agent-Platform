@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Self
 
 from agents import ModelSettings
@@ -82,7 +84,12 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
         self._model_settings = model_settings or ModelSettings()
         self._tracing = tracing
         self._owned_client: AsyncOpenAI | None = None
+        self._provider_closed = False
+        self._owned_client_closed = False
+        self._closing = False
+        self._cleanup_required = False
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     @classmethod
     def _with_owned_client(
@@ -95,11 +102,7 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
         return gateway
 
     async def __aenter__(self) -> Self:
-        if self._closed:
-            raise DomainOperationError(
-                code="gateway_closed",
-                message="the model gateway is closed",
-            )
+        self._require_available()
         return self
 
     async def __aexit__(
@@ -112,26 +115,43 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Release the provider and any HTTP client created by the factory."""
+        """Release provider resources exactly once with cancellation-safe retries."""
 
-        if self._closed:
-            return
-        self._closed = True
+        task = asyncio.create_task(self._aclose())
         try:
-            await self._provider.aclose()
-        finally:
-            if self._owned_client is not None:
-                await self._owned_client.close()
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _aclose(self) -> None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                if not self._provider_closed:
+                    await self._provider.aclose()
+                    self._provider_closed = True
+                if self._owned_client is not None and not self._owned_client_closed:
+                    await self._owned_client.close()
+                    self._owned_client_closed = True
+            except Exception as error:
+                self._closing = False
+                self._cleanup_required = True
+                raise DomainOperationError(
+                    code="gateway_cleanup_failed",
+                    message="the model gateway could not be closed",
+                    retryable=True,
+                ) from error
+            self._closing = False
+            self._cleanup_required = False
+            self._closed = True
 
     async def stream(self, request: GatewayRequest) -> AsyncIterator[GatewayEvent]:
         """Stream one request through an SDK model selected by route name."""
 
-        if self._closed:
-            raise DomainOperationError(
-                code="gateway_closed",
-                message="the model gateway is closed",
-                details={"request_id": request.request_id},
-            )
+        self._require_available(request=request)
 
         try:
             model = self._provider.get_model(request.route_name)
@@ -140,7 +160,7 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
             sdk_stream = model.stream_response(
                 system_instructions=system_instructions,
                 input=input_items,
-                model_settings=self._model_settings,
+                model_settings=_request_model_settings(self._model_settings, request),
                 tools=sdk_tools,
                 output_schema=None,
                 handoffs=[],
@@ -170,6 +190,24 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
                     "request_id": request.request_id,
                 },
             ) from error
+
+    def _require_available(self, *, request: GatewayRequest | None = None) -> None:
+        details = (
+            FrozenJsonObject({"request_id": request.request_id}) if request is not None else None
+        )
+        if self._closed:
+            raise DomainOperationError(
+                code="gateway_closed",
+                message="the model gateway is closed",
+                details=details,
+            )
+        if self._closing or self._cleanup_required:
+            raise DomainOperationError(
+                code="gateway_cleanup_required",
+                message="the model gateway requires cleanup before reuse",
+                retryable=True,
+                details=details,
+            )
 
     async def _normalize_stream(  # noqa: PLR0912 - explicit SDK event allowlist
         self,
@@ -257,6 +295,37 @@ class OpenAIAgentsGateway(AbstractAsyncContextManager["OpenAIAgentsGateway"]):
                 retryable=True,
                 details={"request_id": request.request_id},
             )
+
+
+def _request_model_settings(
+    configured: ModelSettings,
+    request: GatewayRequest,
+) -> ModelSettings:
+    """Attach non-secret, immutable request attribution to the upstream call."""
+
+    attribution = {
+        "tenant_id": str(request.tenant_id),
+        "session_id": str(request.session_id),
+        "run_id": str(request.run_id),
+        "turn_number": str(request.turn_number),
+        "model_call_id": request.model_call_id,
+        "request_id": request.request_id,
+        "route_name": request.route_name,
+    }
+    headers = {
+        "X-Agent-Model-Call-ID": request.model_call_id,
+        "X-Agent-Run-ID": str(request.run_id),
+        "X-Agent-Session-ID": str(request.session_id),
+        "X-Agent-Tenant-ID": str(request.tenant_id),
+        "X-Agent-Turn": str(request.turn_number),
+        "X-Request-ID": request.request_id,
+    }
+    return replace(
+        configured,
+        metadata={**(configured.metadata or {}), **attribution},
+        extra_headers={**(configured.extra_headers or {}), **headers},
+        include_usage=True,
+    )
 
 
 def _normalize_tool_call(

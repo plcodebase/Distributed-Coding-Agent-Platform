@@ -33,8 +33,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from agent_core.domain.base import JsonObject
+    from agent_core.sandbox import Sandbox
     from agent_core.tools import ToolRegistration
-    from sandbox_runtime.local import LocalSandbox
 
 type WorkspacePath = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 type BoundedText = Annotated[str, StringConstraints(max_length=4 * 1024 * 1024)]
@@ -210,7 +210,7 @@ class WorkspaceToolset:
         self,
         workspace: RootedWorkspace,
         *,
-        sandbox: LocalSandbox | None = None,
+        sandbox: Sandbox | None = None,
         search_timeout_seconds: float = 10,
         default_command_timeout_seconds: float = 30,
         max_edit_bytes: int = 4 * 1024 * 1024,

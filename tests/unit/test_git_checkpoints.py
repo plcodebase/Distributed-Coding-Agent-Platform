@@ -3,17 +3,23 @@ import os
 import shutil
 import stat
 import subprocess
+import threading
 from collections.abc import Sequence, Set
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
 
-from agent_core.domain import DomainOperationError, FrozenJsonObject
+from agent_core.domain import Checkpoint, DomainOperationError, FrozenJsonObject
 from agent_core.fakes import SteppingClock
 from agent_core.gateway import GatewayMessage, MessageRole
+from agent_core.sandbox import WorkspaceSnapshot
 from sandbox_runtime import GitWorktreeManager, InMemoryCheckpointCoordinator
+
+if TYPE_CHECKING:
+    from sandbox_runtime.git_workspace import GitWorktreeWorkspace
 
 GIT = shutil.which("git") or "/usr/bin/git"
 RUN_ID = UUID("10000000-0000-0000-0000-000000000001")
@@ -519,3 +525,274 @@ async def test_checkpoint_rejects_a_different_run(tmp_path: Path) -> None:
         assert mismatch.value.code == "checkpoint_run_mismatch"
     finally:
         await workspace.destroy()
+
+
+async def test_checkpoint_identity_and_tool_call_are_bound_to_stored_state(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="checkpoint-identity",
+    )
+    coordinator = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=workspace,
+        clock=SteppingClock(NOW),
+    )
+    try:
+        checkpoint = await coordinator.create_before_tool(
+            run_id=RUN_ID,
+            tool_call_id="edit-1",
+            messages=(),
+            task_plan=FrozenJsonObject({}),
+            context_summary=None,
+        )
+        forged = checkpoint.model_copy(update={"workspace_revision": "forged"})
+
+        with pytest.raises(DomainOperationError) as identity:
+            await coordinator.rollback(forged)
+        assert identity.value.code == "checkpoint_identity_mismatch"
+
+        with pytest.raises(DomainOperationError) as tool_call:
+            await coordinator.complete_tool(
+                checkpoint,
+                tool_call_id="edit-2",
+            )
+        assert tool_call.value.code == "checkpoint_tool_call_mismatch"
+    finally:
+        await workspace.destroy()
+
+
+async def test_checkpoint_ids_are_unique_and_state_is_bounded(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="checkpoint-bounds",
+    )
+    fixed_id = UUID("30000000-0000-0000-0000-000000000003")
+    coordinator = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=workspace,
+        clock=SteppingClock(NOW),
+        id_factory=lambda: fixed_id,
+        max_checkpoints=2,
+        max_messages=1,
+        max_state_bytes=512,
+    )
+    try:
+        await coordinator.create_before_tool(
+            run_id=RUN_ID,
+            tool_call_id="edit-1",
+            messages=(),
+            task_plan=FrozenJsonObject({}),
+            context_summary=None,
+        )
+        with pytest.raises(DomainOperationError) as duplicate:
+            await coordinator.create_before_tool(
+                run_id=RUN_ID,
+                tool_call_id="edit-2",
+                messages=(),
+                task_plan=FrozenJsonObject({}),
+                context_summary=None,
+            )
+        assert duplicate.value.code == "checkpoint_id_conflict"
+
+        messages = (
+            GatewayMessage(role=MessageRole.USER, content="one"),
+            GatewayMessage(role=MessageRole.USER, content="two"),
+        )
+        with pytest.raises(DomainOperationError) as message_limit:
+            await coordinator.create_before_tool(
+                run_id=RUN_ID,
+                tool_call_id="edit-3",
+                messages=messages,
+                task_plan=FrozenJsonObject({}),
+                context_summary=None,
+            )
+        assert message_limit.value.code == "checkpoint_state_limit"
+
+        with pytest.raises(DomainOperationError) as byte_limit:
+            await coordinator.create_before_tool(
+                run_id=RUN_ID,
+                tool_call_id="edit-4",
+                messages=(),
+                task_plan=FrozenJsonObject({}),
+                context_summary="x" * 1024,
+            )
+        assert byte_limit.value.code == "checkpoint_state_limit"
+    finally:
+        await workspace.destroy()
+
+
+async def test_rewind_truncates_the_later_checkpoint_branch(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="checkpoint-branch",
+    )
+    checkpoint_ids = iter(
+        (
+            UUID("30000000-0000-0000-0000-000000000003"),
+            UUID("40000000-0000-0000-0000-000000000004"),
+        )
+    )
+    coordinator = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=workspace,
+        clock=SteppingClock(NOW),
+        id_factory=lambda: next(checkpoint_ids),
+    )
+    try:
+        first = await coordinator.create_before_tool(
+            run_id=RUN_ID,
+            tool_call_id="edit-1",
+            messages=(),
+            task_plan=FrozenJsonObject({}),
+            context_summary=None,
+        )
+        workspace.write_file_atomic("tracked.txt", b"first\n")
+        await coordinator.complete_tool(first, tool_call_id="edit-1")
+        second = await coordinator.create_before_tool(
+            run_id=RUN_ID,
+            tool_call_id="edit-2",
+            messages=(),
+            task_plan=FrozenJsonObject({}),
+            context_summary=None,
+        )
+        workspace.write_file_atomic("tracked.txt", b"second\n")
+        await coordinator.complete_tool(second, tool_call_id="edit-2")
+
+        await coordinator.rewind(first.id)
+        assert workspace.file_bytes("tracked.txt") == b"base\n"
+        with pytest.raises(DomainOperationError) as removed:
+            await coordinator.rewind(second.id)
+        assert removed.value.code == "checkpoint_not_found"
+    finally:
+        await workspace.destroy()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("max_checkpoints", 0),
+        ("max_messages", -1),
+        ("max_state_bytes", 0),
+    ],
+)
+def test_checkpoint_coordinator_rejects_invalid_limits(
+    tmp_path: Path,
+    name: str,
+    value: int,
+) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="checkpoint-invalid-limits",
+    )
+    try:
+        with pytest.raises(ValueError):
+            InMemoryCheckpointCoordinator(
+                run_id=RUN_ID,
+                session_id=SESSION_ID,
+                workspace=workspace,
+                clock=SteppingClock(NOW),
+                **{name: value},  # type: ignore[arg-type]
+            )
+    finally:
+        asyncio.run(workspace.destroy())
+
+
+class _BlockingCheckpointWorkspace:
+    def __init__(self) -> None:
+        self.commit_started = threading.Event()
+        self.release_commit = threading.Event()
+        self.restored: list[str] = []
+        self.snapshot_calls = 0
+
+    def create_snapshot(self, *, label: str) -> WorkspaceSnapshot:
+        assert label
+        self.snapshot_calls += 1
+        return WorkspaceSnapshot(
+            id="snapshot-before",
+            uri="git-worktree://local/before",
+            revision="revision-before",
+        )
+
+    def commit_state(self, *, label: str) -> str:
+        assert label
+        self.commit_started.set()
+        if not self.release_commit.wait(timeout=5):
+            raise RuntimeError("test did not release checkpoint commit")
+        return "revision-after"
+
+    def restore_revision(self, revision: str) -> None:
+        self.restored.append(revision)
+
+
+async def _fake_checkpoint(
+    coordinator: InMemoryCheckpointCoordinator,
+    *,
+    tool_call_id: str = "edit-1",
+) -> Checkpoint:
+    return await coordinator.create_before_tool(
+        run_id=RUN_ID,
+        tool_call_id=tool_call_id,
+        messages=(),
+        task_plan=FrozenJsonObject({}),
+        context_summary=None,
+    )
+
+
+async def test_checkpoint_finalization_cancellation_restores_before_propagating() -> None:
+    workspace = _BlockingCheckpointWorkspace()
+    coordinator = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=cast("GitWorktreeWorkspace", workspace),
+        clock=SteppingClock(NOW),
+    )
+    checkpoint = await _fake_checkpoint(coordinator)
+    completion = asyncio.create_task(coordinator.complete_tool(checkpoint, tool_call_id="edit-1"))
+    assert await asyncio.to_thread(workspace.commit_started.wait, 2)
+
+    completion.cancel()
+    workspace.release_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await completion
+
+    assert workspace.restored == ["revision-before"]
+    with pytest.raises(DomainOperationError) as rolled_back:
+        await coordinator.complete_tool(checkpoint, tool_call_id="edit-1")
+    assert rolled_back.value.code == "checkpoint_state_conflict"
+
+
+async def test_concurrent_checkpoint_creation_cannot_overwrite_duplicate_ids() -> None:
+    workspace = _BlockingCheckpointWorkspace()
+    fixed_id = UUID("30000000-0000-0000-0000-000000000003")
+    coordinator = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=cast("GitWorktreeWorkspace", workspace),
+        clock=SteppingClock(NOW),
+        id_factory=lambda: fixed_id,
+    )
+
+    results = await asyncio.gather(
+        _fake_checkpoint(coordinator, tool_call_id="edit-1"),
+        _fake_checkpoint(coordinator, tool_call_id="edit-2"),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, Checkpoint) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, DomainOperationError)]
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "checkpoint_id_conflict"
+    assert workspace.snapshot_calls == 1

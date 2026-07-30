@@ -1,6 +1,10 @@
+import asyncio
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
+
+import pytest
 
 from agent_core.checkpoints import RewindState
 from agent_core.domain import (
@@ -32,6 +36,8 @@ from agent_core.tools import (
     ToolExecutionCompleted,
     ToolExecutionContext,
     ToolExecutionEvent,
+    ToolOutputChannel,
+    ToolOutputChunk,
     ToolRegistry,
 )
 
@@ -64,6 +70,27 @@ class EditHandler:
         yield ToolExecutionCompleted(
             result={"path": arguments.path, "bytes_written": len(arguments.content)}
         )
+
+
+class BlockingEditHandler(EditHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def __call__(
+        self,
+        arguments: EditArguments,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        del arguments
+        self.calls += 1
+        self.contexts.append(context)
+        self.started.set()
+        yield ToolOutputChunk(
+            channel=ToolOutputChannel.STDOUT,
+            chunk="started",
+        )
+        await asyncio.Event().wait()
 
 
 class RecordingCheckpointCoordinator:
@@ -115,6 +142,8 @@ class RecordingCheckpointCoordinator:
 
 def loop_input() -> AgentLoopInput:
     return AgentLoopInput(
+        tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=UUID("00000000-0000-0000-0000-000000000020"),
         run_id=RUN_ID,
         attempt=1,
         worker_id="worker-1",
@@ -308,3 +337,100 @@ async def test_invalid_completed_revision_rolls_back_and_fails_closed() -> None:
     failure = events[-1]
     assert isinstance(failure, RunFailedEvent)
     assert failure.payload.error.code == "checkpoint_finalize_failed"
+
+
+async def test_runtime_invalid_completed_revision_is_structured_and_rolled_back() -> None:
+    handler = EditHandler()
+    checkpoints = RecordingCheckpointCoordinator(completed_revision=cast("str", 42))
+    tool_call = GatewayToolCall(
+        id="edit-1",
+        name="edit_file",
+        arguments={"path": "main.py", "content": "changed"},
+    )
+
+    events = await collect(
+        build_loop(
+            handler,
+            checkpoints=checkpoints,
+            turns=[ScriptedGatewayTurn.tool_calls(tool_call)],
+        )
+    )
+
+    assert len(checkpoints.rolled_back) == 1
+    failure = events[-1]
+    assert isinstance(failure, RunFailedEvent)
+    assert failure.payload.error.code == "checkpoint_finalize_failed"
+
+
+async def test_mismatched_checkpoint_contract_prevents_tool_execution() -> None:
+    class MismatchedCoordinator(RecordingCheckpointCoordinator):
+        async def create_before_tool(
+            self,
+            *,
+            run_id: UUID,
+            tool_call_id: str,
+            messages: Sequence[GatewayMessage],
+            task_plan: FrozenJsonObject,
+            context_summary: str | None,
+        ) -> Checkpoint:
+            checkpoint = await super().create_before_tool(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                messages=messages,
+                task_plan=task_plan,
+                context_summary=context_summary,
+            )
+            return checkpoint.model_copy(
+                update={"message_sequence": checkpoint.message_sequence + 1}
+            )
+
+    handler = EditHandler()
+    checkpoints = MismatchedCoordinator()
+    tool_call = GatewayToolCall(
+        id="edit-1",
+        name="edit_file",
+        arguments={"path": "main.py", "content": "changed"},
+    )
+
+    events = await collect(
+        build_loop(
+            handler,
+            checkpoints=checkpoints,
+            turns=[ScriptedGatewayTurn.tool_calls(tool_call)],
+        )
+    )
+
+    assert handler.calls == 0
+    assert checkpoints.completed == []
+    assert checkpoints.rolled_back == []
+    failure = events[-1]
+    assert isinstance(failure, RunFailedEvent)
+    assert failure.payload.error.code == "checkpoint_contract_invalid"
+
+
+async def test_cancelling_a_mutation_waits_for_checkpoint_rollback() -> None:
+    handler = BlockingEditHandler()
+    checkpoints = RecordingCheckpointCoordinator()
+    tool_call = GatewayToolCall(
+        id="edit-1",
+        name="edit_file",
+        arguments={"path": "main.py", "content": "changed"},
+    )
+    task = asyncio.create_task(
+        collect(
+            build_loop(
+                handler,
+                checkpoints=checkpoints,
+                turns=[ScriptedGatewayTurn.tool_calls(tool_call)],
+            )
+        )
+    )
+
+    await handler.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert handler.calls == 1
+    assert len(checkpoints.rolled_back) == 1
+    assert checkpoints.completed == []

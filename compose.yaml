@@ -74,11 +74,14 @@ services:
     restart: "no"
 
   fake-llm-primary:
-    build:
-      context: services/fake-llm
-      dockerfile: Containerfile
+    image: localhost/agent-platform-fake-llm:local
     environment:
       FAKE_PROVIDER: fake-primary
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges"]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
     expose:
       - "8080"
     healthcheck:
@@ -95,11 +98,14 @@ services:
     restart: unless-stopped
 
   fake-llm-secondary:
-    build:
-      context: services/fake-llm
-      dockerfile: Containerfile
+    image: localhost/agent-platform-fake-llm:local
     environment:
       FAKE_PROVIDER: fake-secondary
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges"]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=16m
     expose:
       - "8080"
     healthcheck:
@@ -132,6 +138,11 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
     ports:
       - "127.0.0.1:4000:4000"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges"]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
     volumes:
       - ./services/llm-gateway:/config:ro
     depends_on:
