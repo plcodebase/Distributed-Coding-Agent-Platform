@@ -63,9 +63,18 @@ Sequence 4 provides:
 Sequence 5 provides:
 
 - closed, typed `list_files`, `read_file`, and `search_files` argument schemas;
-- canonical workspace-root containment with traversal, `.git`, and symlink-escape
-  rejection;
-- deterministic listings and normalized ripgrep matches;
+- immutable, closed result schemas and a read-only-by-default tool registry;
+- descriptor-relative workspace containment with traversal, case-insensitive `.git`,
+  external-symlink, and symlink-swap rejection;
+- conservative protected-path filtering with exact composition-time allowlists and
+  permanent repository-metadata denial;
+- deterministic listings with a 20,000-entry scan ceiling and independently bounded
+  returned entries;
+- complete-line UTF-8 reads with lossless `next_start_line` continuation and linear
+  JSON-size accounting off the event loop;
+- an absolute, configuration-independent ripgrep invocation with no symlink following,
+  strict JSON protocol validation, exact match truncation, and Unicode character
+  columns;
 - bounded recursion, entries, files, line ranges, search time, process output, result
   counts, match text, and serialized UTF-8 result payloads;
 - binary, invalid-UTF-8, oversized-file, and oversized-result failures as structured
@@ -75,13 +84,24 @@ Sequence 5 provides:
 
 Sequence 6 provides:
 
-- per-run detached Git worktrees that safely capture staged, unstaged, and bounded
-  regular untracked source state without changing the user's checkout;
-- hash-checked exact or explicitly repeated text replacement;
-- same-directory atomic writes with data and directory flushing;
-- pre/post file hashes, patch hashes, and byte/replacement metadata;
-- isolated Git revisions and incrementally bounded binary final patches relative to the
-  captured baseline.
+- private `0700`, per-run detached Git worktrees that capture staged, unstaged, and
+  bounded regular untracked source state without changing the user's checkout;
+- tracked-tree and untracked path/mode/size/content fingerprints that reject a source
+  repository changing during capture;
+- hash-checked exact or explicitly repeated text replacement in one per-workspace,
+  descriptor-relative transaction, including a final target identity/hash check;
+- same-directory atomic staging with mode application and file/directory durability
+  barriers;
+- closed edit results with canonical paths, pre/post hashes, constant-size canonical
+  patch identities, and byte/replacement metadata;
+- Git resolved once to an absolute executable and run with bounded stdout/stderr,
+  timeouts, process-group termination, a minimal environment, and isolated
+  global/system configuration;
+- fail-closed rejection of Git clean/smudge/process filters and explicit suppression of
+  hooks, signing, filesystem monitors, external diffs, text conversion, prompts, and
+  pagers;
+- isolated Git revisions, targeted retryable lifecycle cleanup, and incrementally
+  bounded binary final patches relative to the captured baseline.
 
 ### Sequence 7: checkpoints and rewind
 

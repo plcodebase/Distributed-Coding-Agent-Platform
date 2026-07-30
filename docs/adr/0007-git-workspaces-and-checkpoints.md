@@ -1,53 +1,110 @@
-# ADR 0007: Git workspaces and pre-mutation checkpoints
+# ADR 0007: Reliable Git workspaces and checkpoint compatibility
 
 - Status: Accepted
 - Date: 2026-07-28
+- Hardened: 2026-07-29
 
 ## Context
 
 Sequences 6 and 7 require the agent to work from the user's current repository state,
 including staged, unstaged, and untracked files, without mutating the source checkout.
-Every side effect must be recoverable, duplicate tool delivery must not repeat a
-mutation, and rewind must restore repository and conversational state together.
+Repository data may be private, source state may change during capture, and repository
+Git configuration is untrusted input. File edits must not lose another platform-owned
+write between optimistic validation and replacement.
 
-Git commands and final patches can themselves produce large output, so checkpointing
-must not weaken the resource bounds established by the core loop.
+Git commands, edit diffs, and final patches can also amplify bounded inputs into
+unbounded CPU, memory, or output. Sequence 6 therefore establishes a deterministic Git
+and mutation boundary that Sequence 7 checkpoints can safely consume.
 
-## Decision
+## Sequence 6 decision
 
-- Create one detached linked Git worktree per run. Use `git stash create` to capture the
-  tracked index/worktree state without changing the source checkout, then copy only
-  bounded, non-ignored, regular untracked files.
-- Commit the captured state as an isolated baseline. Verify the source HEAD and exact
-  porcelain status before returning the workspace; fail and clean up if either changed.
-- Bound every Git subprocess by an absolute executable path, fixed argv construction,
-  timeout, process-group cleanup, and incrementally read output ceiling.
-- Keep all agent commits on the detached worktree. Generate a binary full-index final
-  patch relative to the captured baseline and terminate generation at its byte ceiling.
-- Declare every registered tool's effect as read-only, workspace mutation, command, or
-  interaction. The agent loop requires a `CheckpointCoordinator` before executing a
-  mutation or command and emits `checkpoint.created` first.
+### Edit transactions
+
+- `edit_file` creates a missing file explicitly or replaces text in an existing file
+  only when supplied the SHA-256 returned by `read_file`. Creation rejects
+  `replace_all`; existing edits reject absent, ambiguous, stale, or oversized changes.
+- Read, expected-hash validation, replacement, size validation, canonical patch
+  identity, staging, final identity/hash validation, and replacement execute in one
+  synchronous per-workspace mutation transaction off the event loop.
+- Parent traversal, target access, temporary creation, final replacement, and cleanup
+  are descriptor-relative and no-follow. The staged file receives its final mode before
+  its file durability barrier; the containing directory is flushed after installation.
+- The edit result is a closed immutable model using the canonical workspace path. It
+  contains pre/post hashes, replacement count, bytes written, and the constant-size
+  identity:
+
+  `SHA256(length-framed("agent-edit-v1", path, previous-hash-or-create, new-hash))`
+
+  It never materializes or returns an unbounded unified diff. The tool-call ID remains
+  in the typed tool event envelope rather than being duplicated in the result.
+
+### Private source capture
+
+- Each run receives a hashed filesystem/commit token and a private `0700` allocation
+  directory. Git creates the detached worktree as a child of that reservation; the
+  reservation is never deleted and reclaimed by pathname before worktree creation.
+- `git stash create` captures the tracked worktree and index trees without resetting
+  the source. Untracked paths are NUL-parsed with count and output limits, then copied
+  through descriptor-relative no-follow reads into a private staging tree.
+- Untracked capture accepts regular files only, streams bytes through per-file and
+  aggregate limits, and records a sorted manifest of canonical path, mode, actual size,
+  and SHA-256. The tracked trees and untracked manifest are recomputed before return.
+  Any mismatch fails with `source_repository_changed` and triggers targeted cleanup.
+- The baseline revision is immutable at workspace construction. Linked worktrees may
+  create Git objects and their own administration metadata in the common Git directory,
+  but must not modify source branches, index state, checkout files, or status.
+
+### Deterministic Git boundary
+
+- Git is resolved once at manager construction to an absolute regular executable.
+  Every invocation uses fixed argv with no shell, bounded stdout and stderr, a validated
+  timeout, process-group termination, and a minimal locale environment.
+- System/global configuration, prompts, pagers, hooks, signing, and filesystem monitors
+  are disabled. Final patches additionally use `--no-ext-diff` and `--no-textconv`.
+- Effective `filter.*.clean`, `filter.*.smudge`, and `filter.*.process` configuration
+  is rejected with `workspace_external_filter_unsupported` before snapshot or staging
+  operations. Trusted filter execution remains deferred to the hardened Podman
+  boundary.
+- Final patches remain binary, full-index, baseline-relative bytes. Output is consumed
+  incrementally and fails at its byte ceiling. A zero-byte patch for differing
+  revisions is a protocol error.
+
+### Lifecycle
+
+- Cleanup removes only the current linked worktree and its exact private allocation
+  root. It never performs repository-wide `git worktree prune`.
+- Construction failures close or remove resources created by that construction.
+  Destruction becomes final only after both targeted Git administration and private
+  filesystem cleanup succeed; failures return retryable `workspace_cleanup_failed`.
+- One platform owner mutates a worktree sequentially. Cross-process writer leases are
+  deferred to Sequence 20, and containment from hostile concurrent host processes is a
+  hardened Podman responsibility.
+
+## Sequence 7 compatibility
+
+- Every registered tool declares its effect as read-only, workspace mutation, command,
+  or interaction. The loop requires a `CheckpointCoordinator` before a mutation or
+  command and emits `checkpoint.created` first.
 - A checkpoint contains run/session identity, transcript position, exact pre-tool Git
-  revision, task plan, context summary, and creation time. Successful operations commit
-  a new workspace revision into their result; failed operations restore the pre-tool
-  revision.
-- Rewind first cancels active work, restores the Git revision, and returns the exact
-  messages, plan, summary, and revision stored at the checkpoint.
-- Retain same-run duplicate suppression in the core loop. An identical repeated tool
-  call reuses its terminal outcome and creates neither a second checkpoint nor a second
-  mutation.
-- Use an in-memory checkpoint coordinator only for the current single-process sequence.
-  Durable checkpoint/event/message persistence remains a later sequence.
+  revision, task plan, context summary, and creation time. Success records the new
+  workspace revision; failure restores the pre-tool revision.
+- Rewind cancels active work, restores the Git revision, and returns the exact messages,
+  plan, summary, and revision stored at the checkpoint.
+- Same-run duplicate suppression reuses an identical terminal tool outcome without a
+  second checkpoint or repeated mutation.
+- The current coordinator remains in-memory. Durable checkpoint, event, message, and
+  replay storage belongs to later persistence sequences.
 
 ## Consequences
 
 - The user's checkout remains unchanged until a future explicit patch-application
-  workflow is invoked.
-- Staged, unstaged, and bounded untracked starting state is visible to the agent without
-  stashing or resetting the user's checkout.
-- Every mutation and command is associated with a pre-operation recovery point, and a
-  failed tool cannot leave its workspace changes behind when restoration succeeds.
-- Git object creation occurs in the repository object database, but no source branch,
-  index, working-tree file, or status entry is changed.
-- Checkpoint records are not yet durable across worker or process loss.
-
+  workflow.
+- Bounded staged, unstaged, and untracked starting content is visible in a private
+  worktree, and source changes during capture fail closed.
+- Repository configuration cannot invoke host diff, text-conversion, filter, hook,
+  filesystem-monitor, pager, prompt, or signing commands through this adapter.
+- Patch identity calculation is constant-size, while final patch bytes remain bounded
+  and suitable for user review.
+- Descriptor safety and the platform mutation lock close platform-owned races. A
+  hardened Podman sandbox and distributed writer leases remain required for hostile
+  host concurrency and multi-worker ownership.

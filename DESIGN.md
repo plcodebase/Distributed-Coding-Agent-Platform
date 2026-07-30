@@ -675,6 +675,12 @@ Implement a local coding agent before adding distribution.
    * `run_command`
    * `ask_user`
    * `update_task_plan`
+
+   Sequence 5 implements the read-only subset with closed argument/result contracts,
+   descriptor-relative no-follow filesystem access, conservative protected-path
+   filtering, bounded enumeration and complete-line reads, and strict bounded ripgrep
+   normalization. Sequence 6 adds the separately enabled transactional `edit_file`;
+   Sequence 8 owns the separately enabled local command capability.
 3. Implement streamed execution.
 4. Emit typed agent events instead of calling `print()` from core code.
 5. Add a CLI renderer that consumes events.
@@ -742,6 +748,14 @@ Make repository mutation safe, reviewable, and reversible.
     * symlink escape
     * rollback after failure
     * duplicate tool-call delivery
+
+Sequence 6 implements the edit/worktree portion with one locked descriptor-relative
+edit transaction, constant-size canonical patch identities, private detached worktrees,
+bounded no-follow untracked-file staging, source content fingerprints, deterministic
+Git execution, external-filter rejection, and bounded binary final patches. Sequence 7
+implements the checkpoint and rewind portion. The linked worktree may add objects and
+its own administration data to the repository's common Git directory, but neither
+sequence changes a source branch, source index, source checkout file, or source status.
 
 ### Acceptance criteria
 

@@ -81,7 +81,10 @@ async def test_fake_model_executes_read_edit_and_command_in_isolated_workspace(
         clock=SteppingClock(NOW),
         cancel_active=sandbox.cancel_active,
     )
-    tools = WorkspaceToolset(workspace, sandbox=sandbox).registry(include_command=True)
+    tools = WorkspaceToolset(workspace, sandbox=sandbox).registry(
+        include_edit=True,
+        include_command=True,
+    )
     gateway = ScriptedModelGateway(
         [
             ScriptedGatewayTurn.tool_calls(

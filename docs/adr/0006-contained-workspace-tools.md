@@ -10,42 +10,47 @@ paths, patterns, ranges, and result sizes are untrusted. A normal path join or a
 post-materialization size check would allow traversal, symlink escape, repository
 metadata access, excessive memory use, or oversized model context.
 
-Sequence 6 adds file mutation. An edit based only on model-supplied text can silently
-overwrite a concurrently changed file or replace an unintended repeated match.
-
 ## Decision
 
 - Put concrete repository tools in the separate `sandbox-runtime` adapter package.
   `agent-core` retains only provider-neutral tool and sandbox contracts.
 - Expose `list_files`, `read_file`, and `search_files` through closed Pydantic argument
-  models and the existing `ToolRegistry`. All model arguments are validated before a
-  filesystem operation starts.
+  models and closed immutable result models. Validate arguments before filesystem work
+  and validate normalized results before they enter an agent event.
+- Make the registry read-only by default. Mutation and command registrations require
+  independent composition-time capability flags.
 - Resolve paths relative to one canonical workspace root. Reject absolute paths, parent
-  traversal, NUL bytes, `.git` access, external symlink targets, and any write traversing
-  a symlink. Listings skip repository metadata and external symlinks.
-- Return only regular UTF-8 text files. Bound source file reads, line ranges, listing
-  entry counts, recursion depth, search time, search process output, match count, match
-  text, and the final serialized result. Measure limits in UTF-8 bytes.
-- Invoke a configured `rg` executable with an argv sequence, a contained working
-  directory, fixed safe flags, and no shell. Parse its JSON event stream into normalized
-  path, line, column, and text results.
-- Require `edit_file` to operate in one of two explicit modes:
-  - create a missing file without an expected hash or old text;
-  - replace text in an existing file only with the SHA-256 returned by `read_file`.
-- Reject stale hashes, missing old text, absent matches, and ambiguous repeated matches
-  unless `replace_all` is explicit. Limit both input and resulting file bytes.
-- Write through a same-directory temporary file, flush file data, preserve existing
-  mode bits, atomically replace the destination, and flush the parent directory.
-- Return pre/post content hashes, patch hash, replacement count, and bytes written
-  without returning an unbounded patch body.
+  traversal, NUL bytes, external symlink targets, and `.git` components using
+  case-insensitive matching. Repository metadata can never be allowlisted.
+- Apply one injected access policy to listing, reads, and search. Deny conservative
+  credential paths by default; permit only exact file or directory exceptions selected
+  by the composition root. Omit protected entries and report policy filtering.
+- Use descriptor-relative, `O_NOFOLLOW` opens for direct reads and directory traversal.
+  Construction fails when the required POSIX primitives are unavailable.
+- Bound directory enumeration independently of returned entries. Scan no more than
+  20,000 entries, then sort the bounded set and return at most 2,000 entries at depth 20.
+- Return only regular UTF-8 text files. Scan bounded decoded text without materializing
+  a Python object for every line. Return complete lines only and provide a lossless
+  `next_start_line`; reject an individually oversized line.
+- Fit serialized JSON with linear string/item accounting off the event loop. Bound
+  source files, line numbers, search time, process output, match count, match preview,
+  and final UTF-8 result bytes independently.
+- Resolve `rg` once to an absolute regular executable. Invoke it without a shell or
+  ambient configuration, without following symlinks, with explicit file/preview limits,
+  final protected-path exclusions, and a minimal locale environment.
+- Treat the ripgrep JSON stream as a strict adapter protocol. Validate paths, line
+  numbers, UTF-8 byte offsets, and event shapes; convert offsets into one-based Unicode
+  character columns; fail closed on malformed output.
 
 ## Consequences
 
-- Repository reads and writes are contained by construction and remain independently
-  testable without the model SDK or agent loop.
-- A successful edit cannot silently apply to a file version different from the one the
-  agent read.
-- The tool layer does not claim protection from a hostile host process. Command
-  isolation is a separate sandbox responsibility.
-- Search depends on a trusted ripgrep executable supplied by the composition root.
-
+- Repository inspection is contained and independently testable without the model SDK
+  or agent loop.
+- Protected-path filtering is defense in depth, not a claim that arbitrary secret text
+  can always be detected. Result redaction remains a second boundary.
+- Descriptor-relative direct operations prevent symlink-swap traversal. External search
+  assumes the platform exclusively owns the per-run worktree while `rg` executes.
+- Search depends on a trusted absolute ripgrep executable supplied by the composition
+  root.
+- File mutation, atomic edit semantics, and Git worktree behavior are Sequence 6
+  decisions recorded by ADR 0007.
