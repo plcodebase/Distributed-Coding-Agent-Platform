@@ -20,11 +20,17 @@ verifiable without paid provider access.
   Provider credentials exist only in the LiteLLM service environment.
 - Map local routes across two deterministic OpenAI-compatible fake deployments so route
   and fallback behavior can be tested without provider credentials.
+- Put fake deployments exclusively on an internal `llm-upstreams` network. LiteLLM
+  joins that network and a dedicated `llm-egress` network; neither gateway component
+  shares PostgreSQL/Redis/MinIO's default network, and fake providers cannot reach
+  external networks.
 - Configure bounded router retries, cooldown, and explicit compatible fallbacks.
   Fake upstream calls use a two-second timeout so an unavailable primary reaches the
   configured secondary within the verification bound.
 - Build local fake-provider images with Podman before composition. Do not expose fake
   providers on host ports.
+- Permit `LITELLM_IMAGE` injection for release composition. The local default remains a
+  versioned tag; release values must be immutable digest references.
 - Validate deployment YAML as a closed architectural contract and run an opt-in live
   suite that checks all five routes, disables the primary, proves secondary fallback,
   restores the primary, and cleans up the targeted services.

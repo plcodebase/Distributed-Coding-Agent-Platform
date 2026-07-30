@@ -24,6 +24,8 @@ IMAGE = os.getenv(
     "AGENT_PLATFORM_SANDBOX_IMAGE",
     "localhost/agent-platform-sandbox:sequence-10",
 )
+CONTROL_PROXY_SECRET = "http://sandbox-proxy-user:sandbox-proxy-secret@example.invalid:8080"  # noqa: S105
+CONTROL_PROVIDER_SECRET = "sandbox-provider-secret-value"  # noqa: S105 - inert test sentinel
 
 
 def _git(repository: Path, *arguments: str) -> None:
@@ -61,6 +63,12 @@ async def podman_sandbox(tmp_path: Path) -> AsyncIterator[PodmanSandbox]:
             open_files_limit=128,
             tmpfs_limit_bytes=8 * 1024 * 1024,
         ),
+        control_environment={
+            **os.environ,
+            "HTTP_PROXY": CONTROL_PROXY_SECRET,
+            "HTTPS_PROXY": CONTROL_PROXY_SECRET,
+            "PROVIDER_API_KEY": CONTROL_PROVIDER_SECRET,
+        },
     )
     try:
         yield sandbox
@@ -101,6 +109,11 @@ import json, os, resource
 def read(path):
     with open(path, encoding="utf-8") as stream:
         return stream.read().strip()
+status = {}
+for line in read("/proc/self/status").splitlines():
+    if ":" in line:
+        name, value = line.split(":", 1)
+        status[name] = value.strip()
 print(json.dumps({
     "uid": os.getuid(),
     "gid": os.getgid(),
@@ -108,6 +121,11 @@ print(json.dumps({
     "cpu": read("/sys/fs/cgroup/cpu.max"),
     "memory": read("/sys/fs/cgroup/memory.max"),
     "pids": read("/sys/fs/cgroup/pids.max"),
+    "cap_eff": int(status["CapEff"], 16),
+    "cap_bnd": int(status["CapBnd"], 16),
+    "no_new_privs": int(status["NoNewPrivs"]),
+    "seccomp": int(status["Seccomp"]),
+    "environment": dict(os.environ),
 }))
 """,
     )
@@ -120,6 +138,22 @@ print(json.dumps({
     assert quota / period <= 0.5
     assert int(limits["memory"]) == 64 * 1024 * 1024
     assert int(limits["pids"]) == 64
+    assert limits["cap_eff"] == 0
+    assert limits["cap_bnd"] == 0
+    assert limits["no_new_privs"] == 1
+    assert limits["seccomp"] == 2
+    environment = limits["environment"]
+    assert environment["HOME"] == "/tmp"  # noqa: S108 - isolated container path
+    assert environment["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert environment["LANG"] == "C.UTF-8"
+    assert environment["LC_ALL"] == "C.UTF-8"
+    assert not any(
+        fragment in name.upper()
+        for name in environment
+        for fragment in ("PROXY", "TOKEN", "SECRET", "API_KEY", "CREDENTIAL")
+    )
+    assert CONTROL_PROXY_SECRET not in output
+    assert CONTROL_PROVIDER_SECRET not in output
 
 
 async def test_host_credentials_and_symlink_escape_are_inaccessible(

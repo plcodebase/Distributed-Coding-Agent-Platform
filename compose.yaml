@@ -84,6 +84,8 @@ services:
       - /tmp:rw,nosuid,nodev,size=16m
     expose:
       - "8080"
+    networks:
+      - llm-upstreams
     healthcheck:
       test:
         [
@@ -108,6 +110,8 @@ services:
       - /tmp:rw,nosuid,nodev,size=16m
     expose:
       - "8080"
+    networks:
+      - llm-upstreams
     healthcheck:
       test:
         [
@@ -122,7 +126,7 @@ services:
     restart: unless-stopped
 
   litellm:
-    image: ghcr.io/berriai/litellm:v1.89.4
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.89.4}
     command:
       [
         "--config",
@@ -138,6 +142,9 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
     ports:
       - "127.0.0.1:4000:4000"
+    networks:
+      - llm-egress
+      - llm-upstreams
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges"]
@@ -233,6 +240,12 @@ services:
       timeout: 5s
       retries: 30
     restart: unless-stopped
+
+networks:
+  default: {}
+  llm-egress: {}
+  llm-upstreams:
+    internal: true
 
 volumes:
   postgres-data:

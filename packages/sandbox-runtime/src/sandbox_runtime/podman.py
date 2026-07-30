@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -585,13 +586,14 @@ class PodmanSandbox:
         container_cwd = PurePosixPath("/workspace", *relative_cwd.parts).as_posix()
         user = f"{self._config.container_uid}:{self._config.container_gid}"
         keep_id = f"keep-id:uid={self._config.container_uid},gid={self._config.container_gid}"
-        mount = f"type=bind,source={self._workspace.root},destination=/workspace,rw"
+        mount = f"type=bind,source={self._workspace.root},destination=/workspace,rw,nodev,nosuid"
         return (
             self._podman,
             "run",
             "--name",
             container_name,
             "--rm",
+            "--restart=no",
             "--pull=never",
             "--read-only",
             "--network",
@@ -639,9 +641,12 @@ class PodmanSandbox:
             "--init",
             "--no-healthcheck",
             "--systemd=false",
+            "--log-driver=none",
             "--ipc=private",
             "--uts=private",
             "--no-hosts",
+            "--timeout",
+            str(math.ceil(command.timeout_seconds)),
             "--stop-timeout=1",
             "--label",
             f"io.agent-platform.sandbox={self._sandbox_token}",

@@ -160,6 +160,8 @@ Sequence 9 provides:
   environment values, and a bounded Podman-control environment allowlist;
 - explicit CPU, memory/swap, PID, open-file, timeout, output, direct-write, and snapshot
   ceilings;
+- a Podman-native watchdog, disabled runtime logging/restarts, and a `nodev,nosuid`
+  workspace bind in addition to worker-side cancellation;
 - cancellation-safe, single-owner targeted container removal before runner/worktree
   cleanup, with retryable partial-cleanup failures;
 - mandatory digest-pinned images in production configuration.
@@ -169,6 +171,8 @@ Sequence 9 provides:
 Sequence 10 provides an opt-in executable security suite that verifies:
 
 - effective non-root identity and cgroup/open-file limits from inside the container;
+- effective zero capabilities, `no-new-privileges`, seccomp filtering, and a
+  credential/proxy-free command environment;
 - denial of host credential reads, symlink escapes, root-filesystem writes, external
   networking, and Podman service-socket access;
 - PID exhaustion, memory exhaustion, command timeouts, and bounded output;
@@ -187,6 +191,7 @@ Sequence 11 provides:
 - production mappings across OpenAI and Anthropic deployments, with provider
   credentials scoped only to LiteLLM;
 - deterministic local mappings across two private fake-provider services;
+- an internal-only fake-provider network and digest-injectable LiteLLM release image;
 - bounded retries, cooldown, upstream timeouts, and explicit compatible fallbacks;
 - deployment-contract tests plus a live suite that verifies all aliases and proves
   `coding-default` reaches the secondary when the primary is unavailable.
@@ -203,6 +208,8 @@ Sequence 12 provides:
   every typed gateway request;
 - immutable attribution metadata and headers applied to every upstream call;
 - a default allowlist containing exactly the five logical model routes;
+- header-safe attribution IDs, hard request collection limits, and a serialized
+  request-byte ceiling enforced before delegate invocation;
 - revalidation of every normalized stream event, one-terminal-event enforcement, and
   rejection of malformed, incomplete, or post-terminal streams;
 - cumulative UTF-8 byte and event-count limits with delegated stream cancellation;

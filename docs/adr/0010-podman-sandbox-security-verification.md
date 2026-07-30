@@ -17,7 +17,10 @@ without requiring external credentials or infrastructure.
   `AGENT_PLATFORM_RUN_PODMAN_SECURITY=1`; ordinary unit and integration runs remain
   deterministic on hosts without Podman.
 - Verify the effective container UID/GID, cgroup CPU/memory/PID values, and open-file
-  limit from inside the sandbox.
+  limit from inside the sandbox. Inspect `/proc/self/status` to require zero effective
+  and bounding capabilities, `NoNewPrivs=1`, and seccomp filter mode.
+- Inspect the real command environment and prove that host proxy, provider-key, token,
+  credential, and secret variables are absent.
 - Attempt direct host credential reads and workspace symlink escapes and require both
   to fail without returning the protected value.
 - Attempt root-filesystem writes, external network connections, and Podman socket

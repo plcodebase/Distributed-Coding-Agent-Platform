@@ -7,14 +7,18 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from agent_core.domain import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError
 from agent_core.gateway import (
+    MAX_GATEWAY_MESSAGES,
+    MAX_GATEWAY_TOOLS,
     GatewayEvent,
     GatewayFinishReason,
     GatewayMessage,
     GatewayRequest,
     GatewayResponseCompleted,
     GatewayTextDelta,
+    GatewayToolDefinition,
     MessageRole,
 )
 from gateway_client import GatewayClient, GatewayClientConfig
@@ -73,7 +77,11 @@ class BlockingClose:
         await self.release.wait()
 
 
-def request(*, route_name: str = "coding-default") -> GatewayRequest:
+def request(
+    *,
+    route_name: str = "coding-default",
+    content: str = "hello",
+) -> GatewayRequest:
     return GatewayRequest(
         tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
         session_id=UUID("00000000-0000-0000-0000-000000000020"),
@@ -82,7 +90,7 @@ def request(*, route_name: str = "coding-default") -> GatewayRequest:
         model_call_id="model-call-2",
         request_id="request-2",
         route_name=route_name,
-        messages=(GatewayMessage(role=MessageRole.USER, content="hello"),),
+        messages=(GatewayMessage(role=MessageRole.USER, content=content),),
     )
 
 
@@ -127,6 +135,35 @@ async def test_client_rejects_unknown_route_before_gateway_call() -> None:
 
     assert caught.value.code == "gateway_route_not_allowed"
     assert delegate.requests == []
+
+
+@pytest.mark.asyncio
+async def test_client_bounds_multibyte_requests_before_delegate_invocation() -> None:
+    bounded_request = request(content="🙂")
+    request_bytes = len(bounded_request.model_dump_json().encode("utf-8"))
+    accepted_delegate = ScriptedGateway(
+        [GatewayResponseCompleted(finish_reason=GatewayFinishReason.STOP)]
+    )
+    accepted = GatewayClient(
+        accepted_delegate,
+        config=GatewayClientConfig(max_request_bytes=request_bytes),
+    )
+
+    events = [event async for event in accepted.stream(bounded_request)]
+
+    assert len(events) == 1
+    assert accepted_delegate.requests == [bounded_request]
+
+    rejected_delegate = ScriptedGateway([])
+    rejected = GatewayClient(
+        rejected_delegate,
+        config=GatewayClientConfig(max_request_bytes=request_bytes - 1),
+    )
+    with pytest.raises(DomainOperationError) as caught:
+        _ = [event async for event in rejected.stream(bounded_request)]
+    assert caught.value.code == "gateway_request_limit"
+    assert caught.value.details["request_bytes"] == request_bytes
+    assert rejected_delegate.requests == []
 
 
 @pytest.mark.asyncio
@@ -239,7 +276,48 @@ def test_client_configuration_is_closed_and_validated() -> None:
     with pytest.raises(ValidationError):
         GatewayClientConfig(max_stream_events=0)
     with pytest.raises(ValidationError):
+        GatewayClientConfig(max_request_bytes=0)
+    with pytest.raises(ValidationError):
+        GatewayClientConfig(max_request_bytes=8 * 1024 * 1024 + 1)
+    with pytest.raises(ValidationError):
         GatewayClientConfig.model_validate({"extra": True})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_call_id", "model\r\ncall"),
+        ("request_id", "request\x00id"),
+        ("request_id", "request id"),
+    ],
+)
+def test_gateway_request_rejects_http_unsafe_attribution_ids(
+    field: str,
+    value: str,
+) -> None:
+    data = request().model_dump(mode="python")
+    data[field] = value
+
+    with pytest.raises(ValidationError):
+        GatewayRequest.model_validate(data)
+
+
+def test_gateway_request_collection_hard_limits() -> None:
+    message = GatewayMessage(role=MessageRole.USER, content="bounded")
+    data = request().model_dump(mode="python")
+    data["messages"] = (message,) * (MAX_GATEWAY_MESSAGES + 1)
+    with pytest.raises(ValidationError):
+        GatewayRequest.model_validate(data)
+
+    tool = GatewayToolDefinition(
+        name="bounded_tool",
+        description="Bounded tool",
+        input_schema=FrozenJsonObject({"type": "object"}),
+    )
+    data = request().model_dump(mode="python")
+    data["tools"] = (tool,) * (MAX_GATEWAY_TOOLS + 1)
+    with pytest.raises(ValidationError):
+        GatewayRequest.model_validate(data)
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,31 @@ def _remove_test_containers() -> None:
             raise AssertionError("Podman could not remove gateway security-test containers")
 
 
+def _remove_test_network() -> None:
+    for network_name in (
+        "agent-platform_llm-upstreams",
+        "agent-platform_llm-egress",
+    ):
+        exists = subprocess.run(  # noqa: S603 - exact platform-owned test network
+            (PODMAN, "network", "exists", network_name),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        if exists.returncode == 1:
+            continue
+        if exists.returncode != 0:
+            raise AssertionError("Podman could not inspect a gateway security-test network")
+        removed = subprocess.run(  # noqa: S603 - exact platform-owned test network
+            (PODMAN, "network", "rm", network_name),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        if removed.returncode != 0:
+            raise AssertionError("Podman could not remove a gateway security-test network")
+
+
 @pytest.fixture(scope="module", autouse=True)
 def gateway_stack() -> Iterator[None]:
     assert ENV_FILE.is_file()
@@ -129,7 +154,10 @@ def gateway_stack() -> Iterator[None]:
         try:
             _compose("stop", "litellm", "fake-llm-primary", "fake-llm-secondary")
         finally:
-            _remove_test_containers()
+            try:
+                _remove_test_containers()
+            finally:
+                _remove_test_network()
 
 
 def test_all_logical_routes_reach_the_expected_deployments() -> None:

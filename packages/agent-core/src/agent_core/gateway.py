@@ -19,6 +19,17 @@ from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves these 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+MAX_GATEWAY_MESSAGES = 4096
+MAX_GATEWAY_TOOLS = 1000
+type GatewayRequestIdentifier = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+
 
 class MessageRole(StrEnum):
     """Normalized conversation roles accepted by every gateway adapter."""
@@ -82,11 +93,17 @@ class GatewayRequest(DomainModel):
     session_id: uuid.UUID
     run_id: uuid.UUID
     turn_number: int = Field(ge=1, le=100)
-    model_call_id: IdentifierString
-    request_id: IdentifierString
+    model_call_id: GatewayRequestIdentifier
+    request_id: GatewayRequestIdentifier
     route_name: IdentifierString
-    messages: tuple[GatewayMessage, ...] = Field(min_length=1)
-    tools: tuple[GatewayToolDefinition, ...] = ()
+    messages: tuple[GatewayMessage, ...] = Field(
+        min_length=1,
+        max_length=MAX_GATEWAY_MESSAGES,
+    )
+    tools: tuple[GatewayToolDefinition, ...] = Field(
+        default=(),
+        max_length=MAX_GATEWAY_TOOLS,
+    )
 
     @model_validator(mode="after")
     def validate_unique_tools(self) -> Self:
@@ -174,12 +191,15 @@ class ModelGateway(Protocol):
 
 
 __all__ = [
+    "MAX_GATEWAY_MESSAGES",
+    "MAX_GATEWAY_TOOLS",
     "GatewayEvent",
     "GatewayEventKind",
     "GatewayFinishReason",
     "GatewayInvalidToolCallEvent",
     "GatewayMessage",
     "GatewayRequest",
+    "GatewayRequestIdentifier",
     "GatewayResponseCompleted",
     "GatewayTextDelta",
     "GatewayToolCall",

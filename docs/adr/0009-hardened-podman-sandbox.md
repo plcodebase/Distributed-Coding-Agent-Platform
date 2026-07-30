@@ -28,6 +28,9 @@ leaking child processes, credentials, host paths, or runtime administration acce
   namespaces, and no generated hosts file. Ignore image-declared volumes.
 - Apply explicit CPU, memory/swap, PID, open-file, timeout, output, control-output,
   direct-write, and snapshot-retention limits.
+- Add a rounded-up Podman-native timeout in addition to the worker-side deadline, set
+  restart policy to `no`, and disable runtime log retention. Mark the sole workspace
+  bind `nodev,nosuid`.
 - Clear image-default environment values, disable host proxy propagation, and give the
   container a fixed minimal environment. The Podman control process receives
   only a bounded allowlist needed to reach the rootless engine; provider credentials and

@@ -23,6 +23,9 @@ fields supplied by callers.
   adapter. Durable duplicate suppression is not claimed in this sequence.
 - Allowlist the five logical routes by default. Reject unknown routes before contacting
   LiteLLM.
+- Require header-safe model-call and request identifiers. Apply hard message/tool
+  collection ceilings and a configurable serialized request-byte ceiling before
+  creating the delegated network stream.
 - Revalidate every delegated event against the provider-neutral discriminated union.
   Require exactly one terminal event, reject post-terminal data, and reject streams
   ending without a terminal event.

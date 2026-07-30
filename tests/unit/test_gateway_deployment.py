@@ -42,13 +42,21 @@ def test_podman_compose_gateway_is_local_hardened_and_secret_scoped() -> None:
         assert service["read_only"] is True
         assert service["cap_drop"] == ["ALL"]
         assert service["security_opt"] == ["no-new-privileges"]
+        assert service["networks"] == ["llm-upstreams"]
 
     gateway = services["litellm"]
+    assert gateway["image"] == "${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.89.4}"
     assert gateway["ports"] == ["127.0.0.1:4000:4000"]
+    assert gateway["networks"] == ["llm-egress", "llm-upstreams"]
     assert gateway["read_only"] is True
     assert gateway["cap_drop"] == ["ALL"]
     assert gateway["security_opt"] == ["no-new-privileges"]
     assert "./services/llm-gateway:/config:ro" in gateway["volumes"]
+    assert compose["networks"] == {
+        "default": {},
+        "llm-egress": {},
+        "llm-upstreams": {"internal": True},
+    }
 
     provider_keys = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
     for name, service in services.items():

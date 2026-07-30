@@ -213,7 +213,7 @@ async def test_podman_sandbox_builds_a_fail_closed_command_boundary(
             CommandSpec(
                 argv=("python", "-c", "print('bounded')"),
                 cwd=".",
-                timeout_seconds=5,
+                timeout_seconds=5.1,
                 max_output_bytes=1024,
             ),
         )
@@ -244,9 +244,12 @@ async def test_podman_sandbox_builds_a_fail_closed_command_boundary(
     assert "--privileged" not in run
     assert "--no-healthcheck" in run
     assert "--systemd=false" in run
+    assert "--log-driver=none" in run
+    assert "--restart=no" in run
+    assert run[run.index("--timeout") + 1] == "6"
     assert all("seccomp=unconfined" not in argument for argument in run)
     mounts = [run[index + 1] for index, value in enumerate(run) if value == "--mount"]
-    assert mounts == [f"type=bind,source={tmp_path},destination=/workspace,rw"]
+    assert mounts == [f"type=bind,source={tmp_path},destination=/workspace,rw,nodev,nosuid"]
     container_environment = [run[index + 1] for index, value in enumerate(run) if value == "--env"]
     assert set(container_environment) == {
         "HOME=/tmp",

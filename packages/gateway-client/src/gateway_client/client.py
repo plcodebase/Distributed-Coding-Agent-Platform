@@ -31,6 +31,8 @@ DEFAULT_MODEL_ROUTES = (
     "summarization",
     "code-review",
 )
+DEFAULT_GATEWAY_REQUEST_BYTES = 1024 * 1024
+MAX_GATEWAY_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_GATEWAY_STREAM_BYTES = 64 * 1024 * 1024
 MAX_GATEWAY_STREAM_EVENTS = 1_000_000
 type RouteName = Annotated[
@@ -50,6 +52,11 @@ class GatewayClientConfig(DomainModel):
         default=DEFAULT_MODEL_ROUTES,
         min_length=1,
         max_length=100,
+    )
+    max_request_bytes: int = Field(
+        default=DEFAULT_GATEWAY_REQUEST_BYTES,
+        ge=1,
+        le=MAX_GATEWAY_REQUEST_BYTES,
     )
     max_stream_events: int = Field(default=100_000, ge=1, le=MAX_GATEWAY_STREAM_EVENTS)
     max_stream_bytes: int = Field(
@@ -140,6 +147,17 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                     "route_name": request.route_name,
                 },
             )
+        request_bytes = _request_size(request)
+        if request_bytes > self._config.max_request_bytes:
+            raise DomainOperationError(
+                code="gateway_request_limit",
+                message="the gateway request exceeded its configured byte limit",
+                details={
+                    "limit_bytes": self._config.max_request_bytes,
+                    "request_bytes": request_bytes,
+                    "request_id": request.request_id,
+                },
+            )
 
         event_count = 0
         stream_bytes = 0
@@ -209,6 +227,10 @@ def _event_size(event: GatewayEvent) -> int:
         sort_keys=True,
     )
     return len(payload.encode("utf-8"))
+
+
+def _request_size(request: GatewayRequest) -> int:
+    return len(request.model_dump_json().encode("utf-8"))
 
 
 async def _close_stream(
@@ -295,7 +317,9 @@ def _enforce_stream_limits(
 
 
 __all__ = [
+    "DEFAULT_GATEWAY_REQUEST_BYTES",
     "DEFAULT_MODEL_ROUTES",
+    "MAX_GATEWAY_REQUEST_BYTES",
     "MAX_GATEWAY_STREAM_BYTES",
     "MAX_GATEWAY_STREAM_EVENTS",
     "GatewayClient",

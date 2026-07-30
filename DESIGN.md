@@ -832,10 +832,14 @@ Sequences 9 and 10 now supply those production controls through a rootless
 disposable container per command, an offline network namespace, non-root keep-id
 mapping, a read-only root, a bounded tmpfs, all-capability drop,
 `no-new-privileges`, and explicit CPU, memory/swap, PID, open-file, duration, and
-output limits. Only the private Git worktree is mounted. Tests verify host-credential
+output limits. A runtime-native watchdog backs up the worker deadline; runtime logging
+and restart are disabled, and the private Git worktree is the sole `nodev,nosuid`
+bind. Tests verify host-credential
 and symlink denial, root-write and network failure, unavailable Podman sockets,
-resource exhaustion, and destroy-time child cleanup. Production image configuration
-requires a SHA-256 digest; local runtime tests use explicit Podman-built tags.
+resource exhaustion, effective capability/`no-new-privileges`/seccomp state, a
+credential-free environment, and destroy-time child cleanup. Production image
+configuration requires a SHA-256 digest; local runtime tests use explicit Podman-built
+tags.
 
 ### Acceptance criteria
 
@@ -895,7 +899,8 @@ Implementation status through Sequences 11 and 12:
 
 * LiteLLM is deployed by the Podman Compose stack with all five aliases and two
   deterministic local deployments; the production configuration maps aliases across
-  OpenAI and Anthropic.
+  OpenAI and Anthropic. Fake deployments are confined to an internal gateway network,
+  and release composition can inject a digest-pinned LiteLLM image.
 * Provider credentials are present only on the LiteLLM service. Fake providers,
   workers, the Agents SDK adapter, and the Podman sandbox do not receive them.
 * The local deployment has bounded retries and upstream timeouts plus explicit
@@ -903,8 +908,8 @@ Implementation status through Sequences 11 and 12:
   `coding-default` reaches the secondary.
 * The `gateway-client` package composes the Agents SDK adapter, allowlists routes,
   revalidates normalized events, enforces terminal-stream invariants, bounds cumulative
-  stream events/bytes, and owns cancellation-safe, retryable cleanup that blocks reuse
-  after partial cleanup.
+  request and stream events/bytes, rejects HTTP-unsafe attribution IDs, and owns
+  cancellation-safe, retryable cleanup that blocks reuse after partial cleanup.
 * Every `GatewayRequest` requires tenant, session, run, turn, model-call, and stable
   request identifiers. The adapter sends this attribution as protected metadata and
   request headers.
