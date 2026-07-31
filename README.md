@@ -293,6 +293,18 @@ Sequence 16 provides:
 - fail-closed durable sequence-gap detection;
 - awaited sends for backpressure and disconnect handling that never cancels a run.
 
+### Sequence 17: PostgreSQL task queue
+
+Sequence 17 provides:
+
+- durable queued work using the existing run row as the system of record;
+- atomic worker-capacity, run-lease, and workspace-writer reservation;
+- `FOR UPDATE SKIP LOCKED` claims ordered by priority, age, and stable run ID;
+- SQL exclusion of cancelled runs and actively owned workspaces;
+- random lease tokens plus monotonic generations for stale-owner fencing;
+- transactionally returned capacity and ownership on completion or recovery;
+- real PostgreSQL concurrency coverage with three independent worker identities.
+
 ## Local setup
 
 ```shell

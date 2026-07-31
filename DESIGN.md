@@ -557,20 +557,48 @@ class RunRepository(Protocol):
 
 ```python
 class RunQueue(Protocol):
-    async def enqueue(self, run_id: UUID, priority: int) -> None:
+    async def register_worker(
+        self,
+        registration: WorkerRegistration,
+    ) -> WorkerRegistration:
         ...
 
     async def claim(
         self,
         worker_id: str,
-        lease_duration_seconds: int,
-    ) -> ClaimedRun | None:
+        *,
+        occurred_at: datetime,
+        lease_duration: timedelta,
+    ) -> RunLease | None:
         ...
 
-    async def acknowledge(self, run_id: UUID) -> None:
+    async def start(self, lease: RunLease, *, occurred_at: datetime) -> RunLease:
         ...
 
-    async def release(self, run_id: UUID) -> None:
+    async def heartbeat(
+        self,
+        lease: RunLease,
+        *,
+        occurred_at: datetime,
+        lease_duration: timedelta,
+    ) -> RunLeaseHeartbeat:
+        ...
+
+    async def finish(
+        self,
+        lease: RunLease,
+        result: RunExecutionResult,
+        *,
+        occurred_at: datetime,
+    ) -> Run:
+        ...
+
+    async def recover_expired(
+        self,
+        *,
+        occurred_at: datetime,
+        limit: int,
+    ) -> tuple[Run, ...]:
         ...
 ```
 
@@ -1001,8 +1029,8 @@ Implementation status through Sequences 14–16:
   WebSocket catch-up/live polling. Replay pages are bounded by both 1,000 events and
   4 MiB of serialized JSON, and sequence gaps fail closed. A socket disconnect never
   changes run state.
-* Run creation persists `QUEUED` work. Queue claiming, worker leases, and execution
-  begin in PRs 17 and 18.
+* Run creation persists `QUEUED` work. Sequence 17 queue claiming and Sequence 18
+  worker execution consume it outside the API process.
 
 ### Acceptance criteria
 
@@ -1055,6 +1083,13 @@ Worker B reclaims task.
 Worker B restores checkpoint.
 Task completes without duplicated patch.
 ```
+
+Implementation status through Sequences 17–20:
+
+* Sequence 17 uses the run row as the PostgreSQL queue and atomically claims with
+  `FOR UPDATE SKIP LOCKED`. Claim also reserves worker capacity, a token/generation
+  fenced run lease, and the workspace writer; cancelled and already-owned workspaces
+  are excluded before selection.
 
 ### Acceptance criteria
 
