@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "Distributed coding-agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-  "agent-core",
   "agent-api",
+  "agent-core",
+  "agent-scheduler",
+  "agent-worker",
   "agents-sdk-adapter",
   "event-store",
   "gateway-client",
@@ -32,8 +34,10 @@ dev = [
 package = false
 
 [tool.uv.sources]
-agent-core = { workspace = true }
 agent-api = { workspace = true }
+agent-core = { workspace = true }
+agent-scheduler = { workspace = true }
+agent-worker = { workspace = true }
 agents-sdk-adapter = { workspace = true }
 event-store = { workspace = true }
 gateway-client = { workspace = true }
@@ -44,6 +48,8 @@ sandbox-runtime = { workspace = true }
 [tool.uv.workspace]
 members = [
   "apps/agent-api",
+  "apps/agent-worker",
+  "apps/scheduler",
   "packages/agent-core",
   "packages/agents-sdk-adapter",
   "packages/event-store",
@@ -72,6 +78,8 @@ branch = true
 source = [
   "agent_api",
   "agent_core",
+  "agent_scheduler",
+  "agent_worker",
   "agents_sdk_adapter",
   "event_store",
   "gateway_client",
@@ -96,8 +104,10 @@ skip_covered = true
 line-length = 100
 target-version = "py312"
 src = [
-  "packages/agent-core/src",
   "apps/agent-api/src",
+  "apps/agent-worker/src",
+  "apps/scheduler/src",
+  "packages/agent-core/src",
   "packages/agents-sdk-adapter/src",
   "packages/event-store/src",
   "packages/gateway-client/src",
@@ -148,8 +158,10 @@ strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 mypy_path = [
-  "packages/agent-core/src",
   "apps/agent-api/src",
+  "apps/agent-worker/src",
+  "apps/scheduler/src",
+  "packages/agent-core/src",
   "packages/agents-sdk-adapter/src",
   "packages/event-store/src",
   "packages/gateway-client/src",

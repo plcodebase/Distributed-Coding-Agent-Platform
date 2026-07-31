@@ -13,6 +13,8 @@ members = [
     "agent-api",
     "agent-core",
     "agent-platform",
+    "agent-scheduler",
+    "agent-worker",
     "agents-sdk-adapter",
     "event-store",
     "gateway-client",
@@ -32,6 +34,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "platform-persistence" },
     { name = "pydantic-settings" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -43,6 +46,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "platform-persistence", editable = "packages/persistence" },
     { name = "pydantic-settings", specifier = ">=2.9,<3" },
+    { name = "starlette", specifier = ">=0.40,<2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
 ]
 
@@ -70,6 +74,8 @@ source = { virtual = "." }
 dependencies = [
     { name = "agent-api" },
     { name = "agent-core" },
+    { name = "agent-scheduler" },
+    { name = "agent-worker" },
     { name = "agents-sdk-adapter" },
     { name = "event-store" },
     { name = "gateway-client" },
@@ -96,6 +102,8 @@ dev = [
 requires-dist = [
     { name = "agent-api", editable = "apps/agent-api" },
     { name = "agent-core", editable = "packages/agent-core" },
+    { name = "agent-scheduler", editable = "apps/scheduler" },
+    { name = "agent-worker", editable = "apps/agent-worker" },
     { name = "agents-sdk-adapter", editable = "packages/agents-sdk-adapter" },
     { name = "event-store", editable = "packages/event-store" },
     { name = "gateway-client", editable = "packages/gateway-client" },
@@ -117,6 +125,28 @@ dev = [
     { name = "ruff", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", specifier = ">=6,<7" },
 ]
+
+[[package]]
+name = "agent-scheduler"
+version = "0.1.0"
+source = { editable = "apps/scheduler" }
+dependencies = [
+    { name = "agent-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "agent-core", editable = "packages/agent-core" }]
+
+[[package]]
+name = "agent-worker"
+version = "0.1.0"
+source = { editable = "apps/agent-worker" }
+dependencies = [
+    { name = "agent-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "agent-core", editable = "packages/agent-core" }]
 
 [[package]]
 name = "agents-sdk-adapter"

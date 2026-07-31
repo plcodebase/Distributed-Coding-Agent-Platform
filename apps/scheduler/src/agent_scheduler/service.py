@@ -1,0 +1,58 @@
+"""Targeted recovery scheduler for expired run leases."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
+from pydantic import Field
+
+from agent_core.domain.base import DomainModel
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from agent_core.distributed import RunQueue
+    from agent_core.loop import Clock
+
+type Sleep = Callable[[float], Awaitable[None]]
+
+
+class SchedulerConfig(DomainModel):
+    """Bounded scheduler polling and recovery batch limits."""
+
+    poll_seconds: float = Field(default=1, ge=0.05, le=60)
+    recovery_batch_size: int = Field(default=100, ge=1, le=1000)
+
+
+class SchedulerService:
+    """Requeue expired attempts without touching unrelated queue rows."""
+
+    def __init__(
+        self,
+        *,
+        queue: RunQueue,
+        clock: Clock,
+        config: SchedulerConfig | None = None,
+        sleep: Sleep = asyncio.sleep,
+    ) -> None:
+        self._queue = queue
+        self._clock = clock
+        self._config = config or SchedulerConfig()
+        self._sleep = sleep
+
+    async def recover_once(self) -> int:
+        recovered = await self._queue.recover_expired(
+            occurred_at=self._clock.now(),
+            limit=self._config.recovery_batch_size,
+        )
+        return len(recovered)
+
+    async def serve(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            recovered = await self.recover_once()
+            if recovered == 0:
+                await self._sleep(self._config.poll_seconds)
+
+
+__all__ = ["SchedulerConfig", "SchedulerService"]
