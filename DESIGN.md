@@ -1090,6 +1090,11 @@ Implementation status through Sequences 17–20:
   `FOR UPDATE SKIP LOCKED`. Claim also reserves worker capacity, a token/generation
   fenced run lease, and the workspace writer; cancelled and already-owned workspaces
   are excluded before selection.
+* Sequence 18 persists worker identity, supported sandbox types, slots, status, and
+  heartbeat. A provider-neutral worker service starts, renews, cancels, finishes, and
+  gracefully drains run attempts. Its local fleet CLI starts three spawned processes
+  by default, and the API contains no execution loop.
+
 
 ### Acceptance criteria
 

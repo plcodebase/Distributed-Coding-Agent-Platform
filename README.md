@@ -305,6 +305,20 @@ Sequence 17 provides:
 - transactionally returned capacity and ownership on completion or recovery;
 - real PostgreSQL concurrency coverage with three independent worker identities.
 
+### Sequence 18: worker leases and heartbeats
+
+Sequence 18 provides:
+
+- durable worker identity, sandbox capabilities, slots, status, and heartbeat records;
+- bounded run leases with periodic run and workspace renewal;
+- a worker service that runs model/tool orchestration outside FastAPI;
+- immediate pre-execution and heartbeat-observed distributed cancellation;
+- graceful draining that rejects new claims while owned work finishes;
+- surfaced background task failures instead of unobserved asyncio exceptions;
+- a trusted composition-factory CLI that starts three spawned worker processes by
+  default;
+- a separately composed lease-recovery scheduler process.
+
 ## Local setup
 
 ```shell
@@ -322,9 +336,20 @@ make api
 `podman-compose` package with the native Podman CLI explicitly. `make compose-smoke`
 verifies every exposed dependency and routes requests through LiteLLM to both
 deterministic fake providers. `make migrate` creates the durable control-plane schema;
-`make api` serves the authenticated API on `127.0.0.1:8000`. Workers are added in later
-implementation sequences. The fake LiteLLM routes are the default local configuration
-and do not need provider credentials.
+`make api` serves the authenticated API on `127.0.0.1:8000`. The fake LiteLLM routes are
+the default local configuration and do not need provider credentials.
+
+Worker and scheduler processes use trusted application composition factories:
+
+```shell
+uv run python -m agent_worker --factory your_app.workers:create_worker
+uv run python -m agent_scheduler --factory your_app.scheduler:create_scheduler
+```
+
+The worker command starts three OS processes by default. A production factory must
+inject the PostgreSQL queue/stores, gateway client, durable checkpoint coordinator,
+workspace snapshot restorer, and sandbox; each worker index must map to a unique worker
+ID. These are deployment composition references, not model- or user-controlled values.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
 sandbox environments.
