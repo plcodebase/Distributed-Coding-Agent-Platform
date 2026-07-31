@@ -86,6 +86,7 @@ class RunRecord(Base):
         ),
         UniqueConstraint("tenant_id", "id"),
         UniqueConstraint("tenant_id", "id", "session_id"),
+        UniqueConstraint("tenant_id", "id", "workspace_id"),
         UniqueConstraint("tenant_id", "session_id", "idempotency_key"),
         CheckConstraint(
             "status IN "
@@ -94,6 +95,7 @@ class RunRecord(Base):
             name="status",
         ),
         CheckConstraint("attempt >= 1", name="attempt"),
+        CheckConstraint("lease_generation >= 0", name="lease_generation"),
         CheckConstraint("next_event_sequence >= 1", name="next_event_sequence"),
         CheckConstraint("creation_hash ~ '^[0-9a-f]{64}$'", name="creation_hash"),
         CheckConstraint(
@@ -121,12 +123,18 @@ class RunRecord(Base):
             name="active_lease",
         ),
         CheckConstraint(
-            "status NOT IN ('queued', 'waiting_approval', 'retry_pending') "
+            "status NOT IN ('queued', 'waiting_approval', 'retry_pending', 'lost') "
             "OR (assigned_worker_id IS NULL AND lease_expires_at IS NULL)",
             name="suspended_without_lease",
         ),
         Index("ix_runs_tenant_session_created", "tenant_id", "session_id", "created_at"),
         Index("ix_runs_status_created", "status", "created_at"),
+        Index(
+            "ix_runs_queue_claim",
+            "status",
+            text("priority DESC"),
+            "created_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
@@ -136,6 +144,11 @@ class RunRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    lease_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
     assigned_worker_id: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     last_checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -255,6 +268,10 @@ class ToolCallRecord(Base):
             name="result_object",
         ),
         CheckConstraint(
+            "error IS NULL OR jsonb_typeof(error) = 'object'",
+            name="error_object",
+        ),
+        CheckConstraint(
             "completed_at IS NULL OR started_at IS NULL OR completed_at >= started_at",
             name="timestamp_order",
         ),
@@ -266,6 +283,13 @@ class ToolCallRecord(Base):
             "(status IN ('completed', 'failed', 'cancelled') AND completed_at IS NOT NULL) "
             "OR (status NOT IN ('completed', 'failed', 'cancelled') AND completed_at IS NULL)",
             name="terminal_state",
+        ),
+        CheckConstraint(
+            "(status = 'completed' AND result IS NOT NULL AND error IS NULL) "
+            "OR (status IN ('failed', 'cancelled') AND result IS NULL AND error IS NOT NULL) "
+            "OR (status NOT IN ('completed', 'failed', 'cancelled') "
+            "AND result IS NULL AND error IS NULL)",
+            name="terminal_outcome",
         ),
         Index("ix_tool_calls_run_status", "tenant_id", "run_id", "status"),
     )
@@ -281,6 +305,7 @@ class ToolCallRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     workspace_version: Mapped[str | None] = mapped_column(String(255))
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
     started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -390,6 +415,7 @@ class AgentEventRecord(Base):
             ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", "sequence"),
+        UniqueConstraint("run_id", "delivery_key"),
         CheckConstraint("sequence >= 1", name="sequence"),
         CheckConstraint(
             "event_type IN "
@@ -407,6 +433,7 @@ class AgentEventRecord(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    delivery_key: Mapped[str | None] = mapped_column(String(255))
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
@@ -414,6 +441,123 @@ class AgentEventRecord(Base):
         nullable=False,
         server_default=_UTC_NOW,
     )
+
+
+class WorkerRecord(Base):
+    """Registered execution worker with advertised capacity and liveness."""
+
+    __tablename__ = "workers"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'draining', 'offline')",
+            name="status",
+        ),
+        CheckConstraint("total_slots >= 1 AND total_slots <= 1024", name="total_slots"),
+        CheckConstraint(
+            "available_slots >= 0 AND available_slots <= total_slots",
+            name="available_slots",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(supported_sandbox_types) = 'array'",
+            name="sandbox_types_array",
+        ),
+        CheckConstraint("last_heartbeat_at >= registered_at", name="heartbeat_order"),
+        Index("ix_workers_status_heartbeat", "status", "last_heartbeat_at"),
+    )
+
+    worker_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    supported_sandbox_types: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    total_slots: Mapped[int] = mapped_column(Integer, nullable=False)
+    available_slots: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    registered_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    last_heartbeat_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
+class RunLeaseRecord(Base):
+    """Active fenced ownership over one leased or running run."""
+
+    __tablename__ = "run_leases"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id"),
+            ("runs.tenant_id", "runs.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("worker_id",),
+            ("workers.worker_id",),
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("tenant_id", "run_id"),
+        UniqueConstraint("lease_token"),
+        CheckConstraint("generation >= 1", name="generation"),
+        CheckConstraint("last_heartbeat_at >= acquired_at", name="heartbeat_order"),
+        CheckConstraint("expires_at > last_heartbeat_at", name="expiry_order"),
+        Index("ix_run_leases_expiry", "expires_at"),
+        Index("ix_run_leases_worker", "worker_id", "expires_at"),
+    )
+
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    lease_token: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    acquired_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_heartbeat_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkspaceLeaseRecord(Base):
+    """Persistent generation plus optional active writer for one workspace."""
+
+    __tablename__ = "workspace_writer_leases"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id", "workspace_id"),
+            ("runs.tenant_id", "runs.id", "runs.workspace_id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("worker_id",),
+            ("workers.worker_id",),
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("lease_token"),
+        CheckConstraint("generation >= 0", name="generation"),
+        CheckConstraint(
+            "(run_id IS NULL AND worker_id IS NULL AND run_lease_token IS NULL "
+            "AND lease_token IS NULL AND acquired_at IS NULL AND expires_at IS NULL) "
+            "OR (run_id IS NOT NULL AND worker_id IS NOT NULL "
+            "AND run_lease_token IS NOT NULL AND lease_token IS NOT NULL "
+            "AND acquired_at IS NOT NULL AND expires_at > acquired_at)",
+            name="ownership",
+        ),
+        Index("ix_workspace_writer_leases_expiry", "expires_at"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    run_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    acquired_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ModelCallRecord(Base):

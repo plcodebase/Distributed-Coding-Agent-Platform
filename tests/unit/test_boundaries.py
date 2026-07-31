@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 CORE_ROOTS = (
+    Path("apps/agent-worker/src"),
+    Path("apps/scheduler/src"),
     Path("packages/agent-core/src"),
     Path("packages/sandbox-runtime/src"),
     Path("packages/telemetry/src"),

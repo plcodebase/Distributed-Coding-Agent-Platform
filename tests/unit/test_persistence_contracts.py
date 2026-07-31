@@ -9,12 +9,17 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import CreateTable
 
 from agent_core.domain.errors import DomainOperationError
-from agent_core.event_store import EventDraft, EventPage, StoredEvent
+from agent_core.event_store import (
+    MAX_EVENT_PAGE_BYTES,
+    EventDraft,
+    EventPage,
+    StoredEvent,
+)
 from platform_persistence import Base, Database, DatabaseSettings
 from platform_persistence.models import GatewayRequestRecord, ToolCallRecord
 
@@ -31,15 +36,18 @@ EXPECTED_TABLES = {
     "messages",
     "model_calls",
     "runs",
+    "run_leases",
     "sessions",
     "task_plans",
     "tool_calls",
+    "workers",
+    "workspace_writer_leases",
 }
-TENANT_OWNED_TABLES = EXPECTED_TABLES - {"gateway_circuits"}
+TENANT_OWNED_TABLES = EXPECTED_TABLES - {"gateway_circuits", "workers"}
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_metadata_contains_every_phase_five_entity_and_compiles_for_postgresql() -> None:
+def test_metadata_contains_every_durable_control_and_execution_entity() -> None:
     assert set(Base.metadata.tables) == EXPECTED_TABLES
     engine = create_async_engine("postgresql+asyncpg://")
     try:
@@ -67,6 +75,55 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
         if hasattr(constraint, "columns")
     }
     assert ("tenant_id", "session_id", "idempotency_key") in run_constraints
+    assert ("tenant_id", "id", "session_id") in run_constraints
+    assert ("tenant_id", "id", "workspace_id") in run_constraints
+
+    expected_foreign_keys = {
+        "runs": {
+            (
+                ("tenant_id", "session_id", "workspace_id"),
+                ("tenant_id", "id", "workspace_id"),
+            ),
+            (
+                ("tenant_id", "id", "last_checkpoint_id"),
+                ("tenant_id", "run_id", "id"),
+            ),
+        },
+        "messages": {
+            (
+                ("tenant_id", "run_id", "session_id"),
+                ("tenant_id", "id", "session_id"),
+            )
+        },
+        "checkpoints": {
+            (
+                ("tenant_id", "run_id", "session_id"),
+                ("tenant_id", "id", "session_id"),
+            )
+        },
+        "approvals": {
+            (
+                ("tenant_id", "run_id", "tool_call_id"),
+                ("tenant_id", "run_id", "tool_call_id"),
+            )
+        },
+        "workspace_writer_leases": {
+            (
+                ("tenant_id", "run_id", "workspace_id"),
+                ("tenant_id", "id", "workspace_id"),
+            )
+        },
+    }
+    for table_name, expected in expected_foreign_keys.items():
+        actual = {
+            (
+                tuple(element.parent.name for element in constraint.elements),
+                tuple(element.column.name for element in constraint.elements),
+            )
+            for constraint in Base.metadata.tables[table_name].constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+        }
+        assert expected <= actual
 
     circuit = Base.metadata.tables["gateway_circuits"]
     assert "tenant_id" not in circuit.c
@@ -78,7 +135,7 @@ def test_nullable_json_objects_bind_python_none_as_sql_null() -> None:
     assert GatewayRequestRecord.error.type.none_as_null is True
 
 
-def test_initial_migration_check_constraints_match_declarative_metadata() -> None:
+def test_initial_migration_constraints_remain_compatible_with_head_metadata() -> None:
     migration = ast.parse(
         (
             ROOT
@@ -116,7 +173,30 @@ def test_initial_migration_check_constraints_match_declarative_metadata() -> Non
         }
         for table in Base.metadata.sorted_tables
     }
-    assert migrated == declared
+    assert set(migrated) <= set(declared)
+    replaced_at_head = {("runs", "ck_runs_suspended_without_lease")}
+    for table_name, checks in migrated.items():
+        for constraint_name, sql in checks.items():
+            if (table_name, constraint_name) in replaced_at_head:
+                continue
+            assert declared[table_name][constraint_name] == sql
+
+    distributed_migration = (
+        ROOT
+        / "packages"
+        / "persistence"
+        / "migrations"
+        / "versions"
+        / "0002_distributed_execution.py"
+    ).read_text(encoding="utf-8")
+    for required in (
+        "workers",
+        "run_leases",
+        "workspace_writer_leases",
+        "ck_runs_suspended_without_lease",
+        "ck_tool_calls_terminal_outcome",
+    ):
+        assert required in distributed_migration
 
 
 def test_database_settings_are_closed_bounded_and_secret_safe() -> None:
@@ -281,6 +361,33 @@ def test_event_page_requires_strict_order_and_cursor_alignment() -> None:
         )
     with pytest.raises(ValidationError):
         EventPage(events=(), next_after=0, has_more=True)
+    with pytest.raises(ValidationError, match="contiguous"):
+        EventPage(
+            events=(first, _event(run_id, 3, now)),
+            next_after=3,
+            has_more=False,
+        )
+
+    large_events = tuple(
+        StoredEvent(
+            run_id=run_id,
+            sequence=sequence,
+            event_type="model.text_delta",
+            payload={
+                "model_call_id": "large-page",
+                "delta": "🙂" * 225_000,
+            },
+            created_at=now,
+        )
+        for sequence in range(1, 6)
+    )
+    assert sum(event.serialized_size_bytes for event in large_events) > MAX_EVENT_PAGE_BYTES
+    with pytest.raises(ValidationError, match="serialized event page"):
+        EventPage(
+            events=large_events,
+            next_after=len(large_events),
+            has_more=False,
+        )
 
 
 def _event(run_id: uuid.UUID, sequence: int, now: datetime) -> StoredEvent:

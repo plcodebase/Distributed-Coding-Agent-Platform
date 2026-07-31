@@ -2,6 +2,11 @@
 
 from platform_persistence.base import Base
 from platform_persistence.database import Database, DatabaseSettings, PostgreSQLUrl
+from platform_persistence.distributed import (
+    PostgresRecoveryStore,
+    PostgresRunQueue,
+    PostgresWorkspaceLeaseStore,
+)
 from platform_persistence.gateway_policies import (
     PostgresGatewayCircuitBreaker,
     PostgresGatewayRateLimiter,
@@ -38,8 +43,11 @@ __all__ = [
     "PostgresGatewayCircuitBreaker",
     "PostgresGatewayRateLimiter",
     "PostgresGatewayRequestStore",
+    "PostgresRecoveryStore",
+    "PostgresRunQueue",
     "PostgresRunRepository",
     "PostgresSessionRepository",
+    "PostgresWorkspaceLeaseStore",
     "RunCreationResult",
     "run_creation_hash",
 ]

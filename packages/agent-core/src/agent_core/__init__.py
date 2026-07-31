@@ -11,6 +11,21 @@ from agent_core.control import (
     RunCreationResult,
     run_creation_hash,
 )
+from agent_core.distributed import (
+    DurableToolOutcome,
+    RecoveryStore,
+    RunExecutionResult,
+    RunExecutor,
+    RunLease,
+    RunLeaseHeartbeat,
+    RunQueue,
+    RunRecoveryState,
+    WorkerRegistration,
+    WorkerStatus,
+    WorkspaceLeaseStore,
+    WorkspaceRestorer,
+    WorkspaceWriterLease,
+)
 from agent_core.domain import (
     ApprovalMode,
     Checkpoint,
@@ -28,7 +43,15 @@ from agent_core.domain import (
     ToolCallStatus,
     transition_run,
 )
-from agent_core.event_store import EventDraft, EventPage, StoredEvent
+from agent_core.event_store import (
+    MAX_EVENT_PAGE_BYTES,
+    MAX_EVENT_PAGE_SIZE,
+    EventDeliveryKey,
+    EventDraft,
+    EventPage,
+    IdempotentEventStore,
+    StoredEvent,
+)
 from agent_core.events import (
     MAX_EVENT_PAYLOAD_BYTES,
     AgentEvent,
@@ -94,6 +117,8 @@ from agent_core.tools import (
 )
 
 __all__ = [
+    "MAX_EVENT_PAGE_BYTES",
+    "MAX_EVENT_PAGE_SIZE",
     "MAX_EVENT_PAYLOAD_BYTES",
     "MAX_GATEWAY_REQUEST_BYTES",
     "MAX_LOOP_VALUE_BYTES",
@@ -113,7 +138,9 @@ __all__ = [
     "CommandOutput",
     "CommandSpec",
     "DomainOperationError",
+    "DurableToolOutcome",
     "ErrorDetail",
+    "EventDeliveryKey",
     "EventDraft",
     "EventPage",
     "EventType",
@@ -136,6 +163,7 @@ __all__ = [
     "GatewayToolDefinition",
     "IdGenerator",
     "IdempotencyKey",
+    "IdempotentEventStore",
     "InvalidRunTransitionError",
     "MessageRole",
     "ModelCall",
@@ -146,10 +174,17 @@ __all__ = [
     "PersistedTaskPlan",
     "PlatformSettings",
     "PreparedToolExecution",
+    "RecoveryStore",
     "RegisteredTool",
     "RewindState",
     "Run",
     "RunCreationResult",
+    "RunExecutionResult",
+    "RunExecutor",
+    "RunLease",
+    "RunLeaseHeartbeat",
+    "RunQueue",
+    "RunRecoveryState",
     "RunStatus",
     "Sandbox",
     "Session",
@@ -168,7 +203,12 @@ __all__ = [
     "ToolOutputChunk",
     "ToolRegistration",
     "ToolRegistry",
+    "WorkerRegistration",
+    "WorkerStatus",
+    "WorkspaceLeaseStore",
+    "WorkspaceRestorer",
     "WorkspaceSnapshot",
+    "WorkspaceWriterLease",
     "parse_agent_event",
     "parse_gateway_event",
     "run_creation_hash",
