@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
-from typing import Self
+from itertools import pairwise
+from typing import Annotated, Protocol, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject
-from agent_core.events import AnyAgentEvent, EventType, parse_agent_event
+from agent_core.events import (
+    MAX_EVENT_PAYLOAD_BYTES,
+    AnyAgentEvent,
+    EventType,
+    parse_agent_event,
+)
 
 MAX_EVENT_PAGE_SIZE = 1000
+MAX_EVENT_PAGE_BYTES = 4 * 1024 * 1024
+MIN_EVENT_PAGE_BYTES = MAX_EVENT_PAYLOAD_BYTES + 64 * 1024
+EVENT_PAGE_ENVELOPE_RESERVE_BYTES = 1024
+type EventDeliveryKey = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
 
 
 class EventDraft(DomainModel):
@@ -54,6 +72,12 @@ class StoredEvent(DomainModel):
 
         return parse_agent_event(self.model_dump(mode="python"))
 
+    @property
+    def serialized_size_bytes(self) -> int:
+        """Return the exact UTF-8 size of this event's compact JSON representation."""
+
+        return len(self.model_dump_json().encode("utf-8"))
+
 
 class EventPage(DomainModel):
     """Bounded reconnect page returned by the HTTP API."""
@@ -67,13 +91,46 @@ class EventPage(DomainModel):
         sequences = [event.sequence for event in self.events]
         if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
             raise ValueError("event page sequences must be strictly increasing")
+        if any(current != previous + 1 for previous, current in pairwise(sequences)):
+            raise ValueError("event page sequences must be contiguous")
         if self.events and len({event.run_id for event in self.events}) != 1:
             raise ValueError("event page entries must belong to one run")
         if self.events and self.next_after != self.events[-1].sequence:
             raise ValueError("next_after must equal the final event sequence")
         if not self.events and self.has_more:
             raise ValueError("an empty event page may not report more events")
+        serialized = json.dumps(
+            self.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(serialized) > MAX_EVENT_PAGE_BYTES:
+            raise ValueError(f"serialized event page exceeds {MAX_EVENT_PAGE_BYTES}-byte limit")
         return self
 
 
-__all__ = ["MAX_EVENT_PAGE_SIZE", "EventDraft", "EventPage", "StoredEvent"]
+class IdempotentEventStore(Protocol):
+    """Append worker events once under at-least-once delivery."""
+
+    async def append_idempotent(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        delivery_key: EventDeliveryKey,
+        draft: EventDraft,
+    ) -> StoredEvent:
+        """Return the existing identical event when a delivery is repeated."""
+
+
+__all__ = [
+    "EVENT_PAGE_ENVELOPE_RESERVE_BYTES",
+    "MAX_EVENT_PAGE_BYTES",
+    "MAX_EVENT_PAGE_SIZE",
+    "MIN_EVENT_PAGE_BYTES",
+    "EventDeliveryKey",
+    "EventDraft",
+    "EventPage",
+    "IdempotentEventStore",
+    "StoredEvent",
+]

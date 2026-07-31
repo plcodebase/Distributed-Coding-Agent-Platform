@@ -33,7 +33,7 @@ from agent_core.domain.status import (
     SessionStatus,
     ToolCallStatus,
 )
-from agent_core.event_store import EventDraft, EventPage, StoredEvent
+from agent_core.event_store import MIN_EVENT_PAGE_BYTES, EventDraft, EventPage, StoredEvent
 from agent_core.gateway import GatewayFinishReason, GatewayResponseCompleted, GatewayTextDelta
 from agent_core.gateway_reliability import GatewayRequestClaimStatus
 from event_store import PostgresEventStore
@@ -55,9 +55,23 @@ REQUEST_HASH = "a" * 64
 class _ScalarRows:
     def __init__(self, rows: list[object]) -> None:
         self._rows = rows
+        self._iterator = iter(cast("tuple[object, ...]", ()))
 
     def all(self) -> list[object]:
         return self._rows
+
+    def __aiter__(self) -> _ScalarRows:
+        self._iterator = iter(self._rows)
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            return next(self._iterator)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+    async def close(self) -> None:
+        return None
 
 
 class _FakeDatabase:
@@ -86,7 +100,7 @@ class _FakeDatabase:
             raise AssertionError("unexpected scalar query")
         return self.scalar_values.popleft()
 
-    async def scalars(self, _statement: object) -> _ScalarRows:
+    async def stream_scalars(self, _statement: object) -> _ScalarRows:
         if not self.row_pages:
             raise AssertionError("unexpected scalars query")
         return _ScalarRows(self.row_pages.popleft())
@@ -463,12 +477,27 @@ async def test_postgres_gateway_store_rejects_lost_claim(operation: str) -> None
             await store.release(TENANT_ID, "request-1", REQUEST_HASH)
 
 
-@pytest.mark.parametrize("poll_interval", [True, 0.0, 10.1, float("nan")])
-def test_postgres_event_store_rejects_invalid_poll_interval(poll_interval: object) -> None:
+@pytest.mark.parametrize(
+    ("poll_interval", "page_bytes"),
+    [
+        (True, MIN_EVENT_PAGE_BYTES),
+        (0.0, MIN_EVENT_PAGE_BYTES),
+        (10.1, MIN_EVENT_PAGE_BYTES),
+        (float("nan"), MIN_EVENT_PAGE_BYTES),
+        (0.25, True),
+        (0.25, MIN_EVENT_PAGE_BYTES - 1),
+        (0.25, 4 * 1024 * 1024 + 1),
+    ],
+)
+def test_postgres_event_store_rejects_invalid_configuration(
+    poll_interval: object,
+    page_bytes: object,
+) -> None:
     with pytest.raises(ValueError):
         PostgresEventStore(
             _sessions(),
             poll_interval_seconds=cast("Any", poll_interval),
+            max_page_bytes=cast("Any", page_bytes),
         )
 
 
@@ -511,6 +540,43 @@ async def test_postgres_event_store_append_page_and_latest_sequence() -> None:
     with pytest.raises(DomainOperationError) as error:
         await missing_store.append(TENANT_ID, run_id, draft)
     assert error.value.code == "run_not_found"
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_store_limits_page_bytes_before_materializing_all_rows() -> None:
+    run_id = uuid.uuid4()
+    large_text = "x" * 600_000
+    rows: list[object] = [
+        SimpleNamespace(
+            run_id=run_id,
+            sequence=sequence,
+            event_type="model.text_delta",
+            payload={"model_call_id": "call", "delta": large_text},
+            created_at=NOW,
+        )
+        for sequence in range(1, 4)
+    ]
+    store = PostgresEventStore(
+        _sessions(_FakeDatabase(row_pages=[rows])),
+        max_page_bytes=MIN_EVENT_PAGE_BYTES,
+    )
+
+    page = await store.read_page(TENANT_ID, run_id, limit=1000)
+
+    assert [event.sequence for event in page.events] == [1]
+    assert page.next_after == 1
+    assert page.has_more is True
+
+
+@pytest.mark.asyncio
+async def test_postgres_event_store_fails_closed_on_sequence_gap() -> None:
+    run_id = uuid.uuid4()
+    store = PostgresEventStore(_sessions(_FakeDatabase(row_pages=[[_event_row(run_id, 2)]])))
+
+    with pytest.raises(DomainOperationError) as error:
+        await store.read_page(TENANT_ID, run_id)
+
+    assert error.value.code == "event_sequence_gap"
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,15 @@ from pydantic import TypeAdapter
 from sqlalchemy import func, select, update
 
 from agent_core.domain.errors import DomainOperationError
-from agent_core.event_store import MAX_EVENT_PAGE_SIZE, EventDraft, EventPage, StoredEvent
+from agent_core.event_store import (
+    EVENT_PAGE_ENVELOPE_RESERVE_BYTES,
+    MAX_EVENT_PAGE_BYTES,
+    MAX_EVENT_PAGE_SIZE,
+    MIN_EVENT_PAGE_BYTES,
+    EventDraft,
+    EventPage,
+    StoredEvent,
+)
 from agent_core.events import EventType
 from platform_persistence.models import AgentEventRecord, RunRecord
 
@@ -35,6 +43,7 @@ class PostgresEventStore:
         sessions: async_sessionmaker[AsyncSession],
         *,
         poll_interval_seconds: float = 0.25,
+        max_page_bytes: int = MAX_EVENT_PAGE_BYTES,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if (
@@ -44,8 +53,16 @@ class PostgresEventStore:
             or not MIN_POLL_INTERVAL_SECONDS <= poll_interval_seconds <= MAX_POLL_INTERVAL_SECONDS
         ):
             raise ValueError("poll_interval_seconds must be in [0.01, 10]")
+        if (
+            type(max_page_bytes) is not int
+            or not MIN_EVENT_PAGE_BYTES <= max_page_bytes <= MAX_EVENT_PAGE_BYTES
+        ):
+            raise ValueError(
+                f"max_page_bytes must be in [{MIN_EVENT_PAGE_BYTES}, {MAX_EVENT_PAGE_BYTES}]"
+            )
         self._sessions = sessions
         self._poll_interval = poll_interval_seconds
+        self._max_page_bytes = max_page_bytes
         self._sleep = sleep
 
     async def append(
@@ -128,24 +145,48 @@ class PostgresEventStore:
         after: int,
         limit: int,
     ) -> EventPage:
+        retained: list[StoredEvent] = []
+        retained_bytes = EVENT_PAGE_ENVELOPE_RESERVE_BYTES
+        has_more = False
+        expected_sequence = after + 1
         async with self._sessions() as database:
-            rows = tuple(
-                (
-                    await database.scalars(
-                        select(AgentEventRecord)
-                        .where(
-                            AgentEventRecord.tenant_id == tenant_id,
-                            AgentEventRecord.run_id == run_id,
-                            AgentEventRecord.sequence > after,
-                        )
-                        .order_by(AgentEventRecord.sequence)
-                        .limit(limit + 1)
-                    )
-                ).all()
+            result = await database.stream_scalars(
+                select(AgentEventRecord)
+                .where(
+                    AgentEventRecord.tenant_id == tenant_id,
+                    AgentEventRecord.run_id == run_id,
+                    AgentEventRecord.sequence > after,
+                )
+                .order_by(AgentEventRecord.sequence)
+                .limit(limit + 1)
+                .execution_options(yield_per=1)
             )
-        has_more = len(rows) > limit
-        retained = rows[:limit]
-        events = tuple(_stored_event(row) for row in retained)
+            try:
+                async for row in result:
+                    event = _stored_event(row)
+                    if event.sequence != expected_sequence:
+                        raise DomainOperationError(
+                            code="event_sequence_gap",
+                            message="the durable event sequence is not contiguous",
+                            retryable=True,
+                            details={
+                                "run_id": str(run_id),
+                                "expected_sequence": expected_sequence,
+                            },
+                        )
+                    expected_sequence += 1
+                    event_bytes = event.serialized_size_bytes + 1
+                    if (
+                        len(retained) >= limit
+                        or retained_bytes + event_bytes > self._max_page_bytes
+                    ):
+                        has_more = True
+                        break
+                    retained.append(event)
+                    retained_bytes += event_bytes
+            finally:
+                await result.close()
+        events = tuple(retained)
         return EventPage(
             events=events,
             next_after=events[-1].sequence if events else after,
