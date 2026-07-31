@@ -994,7 +994,8 @@ Implementation status through Sequences 14–16:
 * Sequence 15 adds an injected FastAPI control plane with bearer authentication,
   tenant-scoped session/run operations, database-enforced run creation idempotency,
   cancellation, durable approval decisions, checkpoint rewind selection, and
-  live/ready health endpoints.
+  live/ready health endpoints. New runs require active sessions and all HTTP request
+  bodies pass a 64 KiB pre-routing streamed-byte boundary.
 * Sequence 16 allocates event sequences atomically from the run row, commits the event
   in the same transaction, and exposes cursor-based HTTP replay plus authenticated
   WebSocket catch-up/live polling. A socket disconnect never changes run state.

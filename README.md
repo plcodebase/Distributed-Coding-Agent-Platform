@@ -267,13 +267,16 @@ Sequence 15 provides:
 - tenant-scoped session/run reads that do not reveal cross-tenant resource existence;
 - API run-creation idempotency keys with matching-result replay and payload-conflict
   rejection;
+- active-session enforcement for new runs;
+- a pre-routing 64 KiB body ceiling that validates declared and actual streamed bytes;
 - durable cancellation, approval-decision, and rewind-selection operations;
 - live and PostgreSQL-backed readiness endpoints;
 - duplicate-key-safe local credential parsing and explicit WebSocket authentication,
   tenant-absence, and internal-failure close codes;
 - closed domain errors and opaque unexpected failures.
 
-Run creation persists `QUEUED` work. PostgreSQL queue claiming begins in Sequence 17.
+Run creation persists `QUEUED` work. Sequence 17 workers claim it outside the API
+process.
 
 ### Sequence 16: durable event store and WebSocket replay
 
