@@ -1098,7 +1098,17 @@ Implementation status through Sequences 17–20:
   and loads bounded checkpoint state only for the replacement lease. Tool states are
   monotonic, event delivery keys are idempotent, and recovery restores the latest
   durable post-tool workspace revision before reusing a terminal outcome.
-
+* Sequence 20 enforces one `(tenant_id, workspace_id)` writer with an independent token
+  and monotonic generation. Renewal cannot outlive its run lease, stale releases fail
+  closed, and a composite foreign key proves the writer's run owns the same workspace.
+* Real PostgreSQL acceptance covers three concurrent claimers and an abandoned Worker A
+  lease recovered by Worker B through the actual worker restore/completion boundary
+  without another mutating tool record.
+* Snapshot materialization and concrete worker construction remain injected deployment
+  responsibilities: the composition root must supply a durable checkpoint coordinator,
+  an object-store/worktree `WorkspaceRestorer`, the gateway client, and the sandbox.
+  The distributed core never substitutes an in-memory checkpoint for production
+  recovery.
 
 ### Acceptance criteria
 

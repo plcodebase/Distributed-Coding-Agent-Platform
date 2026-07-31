@@ -334,6 +334,19 @@ Sequence 19 provides:
 - stable event delivery keys with database-enforced identical replay;
 - real PostgreSQL Worker A loss / Worker B restoration and completion coverage.
 
+### Sequence 20: workspace writer leases
+
+Sequence 20 provides:
+
+- exactly one durable writer row per tenant workspace;
+- writer reservation in the same transaction as run claim;
+- distinct random writer tokens and monotonic writer generations;
+- renewal bounded by the owning run lease;
+- stale heartbeat and release rejection;
+- a composite database foreign key proving the writer's run targets the same workspace;
+- conservative serialization of all runs for a workspace until measured read sharing is
+  introduced.
+
 ## Local setup
 
 ```shell

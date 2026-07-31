@@ -17,7 +17,8 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from agent_api.factory import AgentApiSettings, create_production_app
 from agent_core.control import (
@@ -25,6 +26,13 @@ from agent_core.control import (
     PersistedApproval,
     PersistedMessage,
     PersistedTaskPlan,
+)
+from agent_core.distributed import (
+    RunExecutionResult,
+    RunLease,
+    RunRecoveryState,
+    WorkerRegistration,
+    WorkerStatus,
 )
 from agent_core.domain.base import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError
@@ -44,7 +52,29 @@ from agent_core.domain.status import (
     ToolCallStatus,
 )
 from agent_core.event_store import EventDraft
-from agent_core.gateway import GatewayFinishReason, GatewayResponseCompleted, MessageRole
+from agent_core.fakes import (
+    ScriptedGatewayTurn,
+    ScriptedModelGateway,
+    SequentialIdGenerator,
+    SteppingClock,
+)
+from agent_core.gateway import (
+    GatewayFinishReason,
+    GatewayResponseCompleted,
+    GatewayToolCall,
+    MessageRole,
+)
+from agent_core.loop import AgentLoop
+from agent_core.tools import (
+    RegisteredTool,
+    ToolArguments,
+    ToolEffect,
+    ToolExecutionCompleted,
+    ToolExecutionContext,
+    ToolExecutionEvent,
+    ToolRegistry,
+)
+from agent_worker import AgentLoopRunExecutor, WorkerConfig, WorkerService
 from event_store import PostgresEventStore
 from gateway_client import GatewayRequestClaimStatus
 from platform_persistence import (
@@ -54,21 +84,28 @@ from platform_persistence import (
     PostgresGatewayCircuitBreaker,
     PostgresGatewayRateLimiter,
     PostgresGatewayRequestStore,
+    PostgresRecoveryStore,
+    PostgresRunQueue,
     PostgresRunRepository,
     PostgresSessionRepository,
+    PostgresWorkspaceLeaseStore,
     run_creation_hash,
 )
 from platform_persistence.models import (
+    AgentEventRecord,
     ApprovalRecord,
     CheckpointRecord,
     MessageRecord,
     ModelCallRecord,
+    RunRecord,
     TaskPlanRecord,
     ToolCallRecord,
+    WorkerRecord,
+    WorkspaceLeaseRecord,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncGenerator, Iterator
 
 pytestmark = [
     pytest.mark.security,
@@ -93,6 +130,62 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+class SteppingWorkerClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def now(self) -> datetime:
+        self.value += timedelta(milliseconds=1)
+        return self.value
+
+
+class RecordingWorkspaceRestorer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[uuid.UUID, uuid.UUID, str]] = []
+
+    async def restore(
+        self,
+        lease: RunLease,
+        checkpoint: Checkpoint,
+        *,
+        workspace_revision: str,
+    ) -> None:
+        self.calls.append((lease.run_id, checkpoint.id, workspace_revision))
+
+
+class ReplayEditArguments(ToolArguments):
+    path: str
+    old: str
+    new: str
+
+
+class CountingMutationHandler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(
+        self,
+        arguments: ReplayEditArguments,
+        context: ToolExecutionContext,
+    ) -> AsyncGenerator[ToolExecutionEvent, None]:
+        del arguments, context
+        self.calls += 1
+        yield ToolExecutionCompleted(
+            result={
+                "path": "README.md",
+                "workspace_revision": "duplicate-revision",
+            }
+        )
+
+
+async def wait_for_worker_idle(worker: WorkerService) -> None:
+    for _ in range(200):
+        if worker.active_count == 0:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("worker did not finish its claimed run")
 
 
 @pytest.fixture(scope="module")
@@ -139,14 +232,18 @@ def postgres_url() -> Iterator[str]:
             ready = _podman(
                 "exec",
                 name,
-                "pg_isready",
+                "psql",
                 "-U",
                 "agent_test",
                 "-d",
                 "agent_test",
+                "--tuples-only",
+                "--no-align",
+                "--command",
+                "SELECT 1",
                 check=False,
             )
-            if ready.returncode == 0:
+            if ready.returncode == 0 and ready.stdout.strip() == b"1":
                 break
             time.sleep(0.25)
         else:
@@ -166,6 +263,7 @@ def _migrated_database(url: str) -> Iterator[str]:
     try:
         configuration = Config(str(ROOT / "alembic.ini"))
         command.upgrade(configuration, "head")
+        command.check(configuration)
         yield url
         command.downgrade(configuration, "base")
         command.upgrade(configuration, "head")
@@ -286,6 +384,512 @@ async def test_concurrent_event_appends_are_unique_ordered_and_replayable(
             )
         ]
         assert [event.sequence for event in replayed] == list(range(21, 51))
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idempotent_worker_event_delivery_reuses_one_sequence(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    run = _run(session, now)
+    await sessions.create(session)
+    await runs.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key=f"delivery-{run.id}",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    store = PostgresEventStore(database.sessions)
+    draft = EventDraft(
+        event_type="context.build_started",
+        payload={"message_count": 1, "checkpoint_id": None},
+        created_at=now,
+    )
+    try:
+        first = await store.append_idempotent(
+            TENANT_ID,
+            run.id,
+            "a1.g1.e1",
+            draft,
+        )
+        replay = await store.append_idempotent(
+            TENANT_ID,
+            run.id,
+            "a1.g1.e1",
+            draft.model_copy(update={"created_at": now + timedelta(seconds=1)}),
+        )
+        assert replay == first
+        with pytest.raises(DomainOperationError) as conflict:
+            await store.append_idempotent(
+                TENANT_ID,
+                run.id,
+                "a1.g1.e1",
+                EventDraft(
+                    event_type="context.build_started",
+                    payload={"message_count": 2, "checkpoint_id": None},
+                    created_at=now,
+                ),
+            )
+        assert conflict.value.code == "event_delivery_conflict"
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_three_workers_claim_distinct_runs_without_overlap(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    now = datetime.now(UTC)
+    worker_ids = ("worker-process-1", "worker-process-2", "worker-process-3")
+    for worker_id in worker_ids:
+        await queue.register_worker(
+            WorkerRegistration(
+                worker_id=worker_id,
+                supported_sandbox_types=("podman",),
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+    created_runs: list[Run] = []
+    for index in range(3):
+        session = _session(now + timedelta(microseconds=index))
+        await sessions.create(session)
+        run = _run(session, now + timedelta(microseconds=index)).model_copy(
+            update={"priority": 100}
+        )
+        await runs.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key=f"three-workers-{run.id}",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+        created_runs.append(run)
+    try:
+        leases = await asyncio.gather(
+            *(
+                queue.claim(
+                    worker_id,
+                    occurred_at=now + timedelta(seconds=1),
+                    lease_duration=timedelta(seconds=30),
+                )
+                for worker_id in worker_ids
+            )
+        )
+        assert all(lease is not None for lease in leases)
+        assert {lease.run_id for lease in leases if lease is not None} == {
+            run.id for run in created_runs
+        }
+        assert {lease.worker_id for lease in leases if lease is not None} == set(worker_ids)
+    finally:
+        await queue.recover_expired(
+            occurred_at=now + timedelta(seconds=32),
+            limit=10,
+        )
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplicate(  # noqa: PLR0915
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    workspaces = PostgresWorkspaceLeaseStore(database.sessions)
+    recovery = PostgresRecoveryStore(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    await sessions.create(session)
+    primary = _run(session, now).model_copy(update={"priority": 1000})
+    waiting = _run(session, now + timedelta(microseconds=1))
+    for run in (primary, waiting):
+        await runs.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key=f"recovery-{run.id}",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+    await execution.append_message(
+        TENANT_ID,
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=primary.id,
+            sequence=1,
+            role=MessageRole.USER,
+            content="recover this run",
+            created_at=now,
+        ),
+    )
+    checkpoint = Checkpoint(
+        id=uuid.uuid4(),
+        run_id=primary.id,
+        session_id=session.id,
+        message_sequence=1,
+        workspace_snapshot_uri="s3://agent-platform/recovery-checkpoint",
+        workspace_revision="revision-before-recovery",
+        task_plan=FrozenJsonObject({"steps": [{"title": "finish", "done": False}]}),
+        context_summary="durable summary",
+        created_at=now + timedelta(seconds=2),
+    )
+    await execution.create_checkpoint(TENANT_ID, checkpoint)
+    await runs.rewind(TENANT_ID, primary.id, checkpoint.id)
+    arguments = FrozenJsonObject({"path": "README.md", "old": "a", "new": "b"})
+    completed_tool = ToolCall(
+        id="mutating-call-1",
+        run_id=primary.id,
+        turn_number=1,
+        tool_name="edit_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.COMPLETED,
+        workspace_version="revision-after-edit",
+        result=FrozenJsonObject(
+            {
+                "path": "README.md",
+                "workspace_revision": "revision-after-edit",
+            }
+        ),
+        started_at=now + timedelta(seconds=3),
+        completed_at=now + timedelta(seconds=4),
+    )
+    await execution.save_tool_call(TENANT_ID, completed_tool)
+
+    worker_ids = ("worker-a", "worker-b", "worker-c")
+    for worker_id in worker_ids:
+        await queue.register_worker(
+            WorkerRegistration(
+                worker_id=worker_id,
+                supported_sandbox_types=("podman",),
+                total_slots=2 if worker_id == "worker-b" else 1,
+                available_slots=2 if worker_id == "worker-b" else 1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+    try:
+        worker_a = await queue.claim(
+            "worker-a",
+            occurred_at=now + timedelta(seconds=5),
+            lease_duration=timedelta(seconds=10),
+        )
+        assert worker_a is not None
+        assert worker_a.run_id == primary.id
+        worker_a = await queue.start(
+            worker_a,
+            occurred_at=now + timedelta(seconds=6),
+        )
+        writer_a = await workspaces.acquire(
+            worker_a,
+            occurred_at=now + timedelta(seconds=6),
+            lease_duration=timedelta(seconds=10),
+        )
+        assert writer_a is not None
+
+        other_lease = await queue.claim(
+            "worker-b",
+            occurred_at=now + timedelta(seconds=7),
+            lease_duration=timedelta(seconds=10),
+        )
+        if other_lease is not None:
+            assert other_lease.run_id != waiting.id
+            assert other_lease.workspace_id != session.workspace_id
+
+        recovered = await queue.recover_expired(
+            occurred_at=now + timedelta(seconds=16),
+            limit=10,
+        )
+        assert len(recovered) == 1
+        assert recovered[0].id == primary.id
+        assert recovered[0].status is RunStatus.QUEUED
+        assert recovered[0].attempt == 2
+        with pytest.raises(DomainOperationError) as stale:
+            await queue.heartbeat(
+                worker_a,
+                occurred_at=now + timedelta(seconds=17),
+                lease_duration=timedelta(seconds=10),
+            )
+        assert stale.value.code == "run_lease_lost"
+
+        worker_b = await queue.claim(
+            "worker-b",
+            occurred_at=now + timedelta(seconds=17),
+            lease_duration=timedelta(seconds=10),
+        )
+        assert worker_b is not None
+        assert worker_b.run_id == primary.id
+        assert worker_b.attempt == 2
+        worker_b = await queue.start(
+            worker_b,
+            occurred_at=now + timedelta(seconds=18),
+        )
+        writer_b = await workspaces.acquire(
+            worker_b,
+            occurred_at=now + timedelta(seconds=18),
+            lease_duration=timedelta(seconds=10),
+        )
+        assert writer_b is not None
+        assert writer_b.generation > writer_a.generation
+
+        restored = await recovery.load(worker_b)
+        assert restored.checkpoint == checkpoint
+        assert restored.workspace_restore_revision == "revision-after-edit"
+        assert restored.context_summary == "durable summary"
+        assert restored.prior_tool_outcomes[0].tool_call_id == completed_tool.id
+        assert restored.prior_tool_outcomes[0].result == completed_tool.result
+
+        completed = await queue.finish(
+            worker_b,
+            RunExecutionResult(
+                status=RunStatus.COMPLETED,
+                last_checkpoint_id=checkpoint.id,
+            ),
+            occurred_at=now + timedelta(seconds=19),
+        )
+        assert completed.status is RunStatus.COMPLETED
+        assert completed.attempt == 2
+
+        await queue.set_worker_draining(
+            "worker-c",
+            draining=True,
+            occurred_at=now + timedelta(seconds=20),
+        )
+        assert (
+            await queue.claim(
+                "worker-c",
+                occurred_at=now + timedelta(seconds=20),
+                lease_duration=timedelta(seconds=10),
+            )
+            is None
+        )
+
+        async with database.sessions() as query:
+            tool_count = await query.scalar(
+                select(func.count())
+                .select_from(ToolCallRecord)
+                .where(ToolCallRecord.run_id == primary.id)
+            )
+            active_writer = await query.scalar(
+                select(WorkspaceLeaseRecord).where(
+                    WorkspaceLeaseRecord.tenant_id == TENANT_ID,
+                    WorkspaceLeaseRecord.workspace_id == session.workspace_id,
+                )
+            )
+            workers = await query.scalar(select(func.count()).select_from(WorkerRecord))
+        assert tool_count == 1
+        assert active_writer is not None
+        assert active_writer.lease_token is None
+        assert workers is not None and workers >= 3
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reassigned_worker_service_restores_post_tool_revision_and_completes(  # noqa: PLR0915
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    recovery = PostgresRecoveryStore(database.sessions)
+    workspaces = PostgresWorkspaceLeaseStore(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    await sessions.create(session)
+    run = _run(session, now).model_copy(update={"priority": 10_000})
+    await runs.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key=f"worker-service-recovery-{run.id}",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    await execution.append_message(
+        TENANT_ID,
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=run.id,
+            sequence=1,
+            role=MessageRole.USER,
+            content="resume safely",
+            created_at=now,
+        ),
+    )
+    earlier_arguments = FrozenJsonObject({"path": "old.txt", "old": "x", "new": "y"})
+    await execution.save_tool_call(
+        TENANT_ID,
+        ToolCall(
+            id="tool-before-selected-checkpoint",
+            run_id=run.id,
+            turn_number=1,
+            tool_name="edit_file",
+            arguments=earlier_arguments,
+            argument_hash=canonical_argument_hash(earlier_arguments),
+            status=ToolCallStatus.COMPLETED,
+            workspace_version="obsolete-revision",
+            result=FrozenJsonObject(
+                {
+                    "path": "old.txt",
+                    "workspace_revision": "obsolete-revision",
+                }
+            ),
+            started_at=now + timedelta(milliseconds=100),
+            completed_at=now + timedelta(milliseconds=200),
+        ),
+    )
+    checkpoint = Checkpoint(
+        id=uuid.uuid4(),
+        run_id=run.id,
+        session_id=session.id,
+        message_sequence=1,
+        workspace_snapshot_uri="s3://agent-platform/worker-service-recovery",
+        workspace_revision="revision-before-tool",
+        task_plan=FrozenJsonObject({"steps": [{"title": "finish", "done": False}]}),
+        created_at=now + timedelta(seconds=1),
+    )
+    await execution.create_checkpoint(TENANT_ID, checkpoint)
+    await runs.rewind(TENANT_ID, run.id, checkpoint.id)
+    arguments = FrozenJsonObject({"path": "README.md", "old": "a", "new": "b"})
+    completed_tool = ToolCall(
+        id="worker-service-tool",
+        run_id=run.id,
+        turn_number=1,
+        tool_name="edit_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.COMPLETED,
+        workspace_version="revision-after-tool",
+        result=FrozenJsonObject(
+            {
+                "path": "README.md",
+                "workspace_revision": "revision-after-tool",
+            }
+        ),
+        started_at=now + timedelta(seconds=2),
+        completed_at=now + timedelta(seconds=3),
+    )
+    await execution.save_tool_call(TENANT_ID, completed_tool)
+    await queue.register_worker(
+        WorkerRegistration(
+            worker_id="abandoned-worker",
+            supported_sandbox_types=("podman",),
+            total_slots=1,
+            available_slots=1,
+            status=WorkerStatus.ACTIVE,
+            registered_at=now,
+            last_heartbeat_at=now,
+        )
+    )
+    try:
+        abandoned = await queue.claim(
+            "abandoned-worker",
+            occurred_at=now + timedelta(seconds=4),
+            lease_duration=timedelta(seconds=5),
+        )
+        assert abandoned is not None and abandoned.run_id == run.id
+        await queue.start(abandoned, occurred_at=now + timedelta(seconds=5))
+        recovered = await queue.recover_expired(
+            occurred_at=now + timedelta(seconds=10),
+            limit=10,
+        )
+        assert [item.id for item in recovered] == [run.id]
+
+        restorer = RecordingWorkspaceRestorer()
+        mutation = CountingMutationHandler()
+        captured_recovery: list[RunRecoveryState] = []
+        tools = ToolRegistry(
+            (
+                RegisteredTool(
+                    name="edit_file",
+                    description="Edit one workspace file",
+                    arguments_type=ReplayEditArguments,
+                    handler=mutation,
+                    effect=ToolEffect.WORKSPACE_MUTATION,
+                ),
+            )
+        )
+
+        def loop_factory(
+            lease: RunLease,
+            recovery_state: RunRecoveryState,
+        ) -> AgentLoop:
+            del lease
+            captured_recovery.append(recovery_state)
+            call = GatewayToolCall(
+                id=completed_tool.id,
+                name=completed_tool.tool_name,
+                arguments=completed_tool.arguments,
+            )
+            return AgentLoop(
+                gateway=ScriptedModelGateway(
+                    (
+                        ScriptedGatewayTurn.tool_calls(call),
+                        ScriptedGatewayTurn.text("recovery complete"),
+                    )
+                ),
+                tools=tools,
+                clock=SteppingClock(now + timedelta(seconds=11)),
+                id_generator=SequentialIdGenerator(),
+            )
+
+        executor = AgentLoopRunExecutor(
+            loop_factory=loop_factory,
+            events=PostgresEventStore(database.sessions),
+            tool_calls=execution,
+        )
+        worker = WorkerService(
+            config=WorkerConfig(worker_id="replacement-worker"),
+            queue=queue,
+            workspace_leases=workspaces,
+            recovery=recovery,
+            restorer=restorer,
+            executor=executor,
+            clock=SteppingWorkerClock(now + timedelta(seconds=11)),
+        )
+        assert await worker.run_once() is True
+        await wait_for_worker_idle(worker)
+
+        assert restorer.calls == [
+            (run.id, checkpoint.id, "revision-after-tool"),
+        ]
+        assert len(captured_recovery) == 1
+        restored = captured_recovery[0]
+        assert len(restored.prior_tool_outcomes) == 1
+        assert restored.prior_tool_outcomes[0].tool_call_id == completed_tool.id
+        assert restored.prior_tool_outcomes[0].result == completed_tool.result
+        assert mutation.calls == 0
+        persisted = await runs.get(TENANT_ID, run.id)
+        assert persisted is not None
+        assert persisted.status is RunStatus.COMPLETED
+        assert persisted.attempt == 2
+        async with database.sessions() as query:
+            tool_count = await query.scalar(
+                select(func.count())
+                .select_from(ToolCallRecord)
+                .where(
+                    ToolCallRecord.run_id == run.id,
+                    ToolCallRecord.tool_call_id == completed_tool.id,
+                )
+            )
+        assert tool_count == 1
     finally:
         await database.aclose()
 
@@ -422,6 +1026,31 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
         await execution.append_message(TENANT_ID, message)
         await execution.save_task_plan(TENANT_ID, task_plan)
         await execution.save_tool_call(TENANT_ID, tool_call)
+        received_replay = ToolCall(
+            id=tool_call.id,
+            run_id=tool_call.run_id,
+            turn_number=tool_call.turn_number,
+            tool_name=tool_call.tool_name,
+            arguments=tool_call.arguments,
+            argument_hash=tool_call.argument_hash,
+            status=ToolCallStatus.RECEIVED,
+        )
+        assert (await execution.save_tool_call(TENANT_ID, received_replay)).status is (
+            ToolCallStatus.COMPLETED
+        )
+        running_replay = received_replay.model_copy(
+            update={"status": ToolCallStatus.RUNNING, "started_at": now}
+        )
+        assert (await execution.save_tool_call(TENANT_ID, running_replay)).status is (
+            ToolCallStatus.COMPLETED
+        )
+        timestamp_replay = tool_call.model_copy(
+            update={
+                "started_at": now + timedelta(microseconds=1),
+                "completed_at": now + timedelta(microseconds=2),
+            }
+        )
+        assert await execution.save_tool_call(TENANT_ID, timestamp_replay) == tool_call
         await execution.create_approval(TENANT_ID, approval, tool_call_id=tool_call.id)
         await execution.create_checkpoint(TENANT_ID, checkpoint)
         await execution.save_model_call(TENANT_ID, model_call)
@@ -445,6 +1074,13 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
             )
         assert name_conflict.value.code == "tool_call_id_conflict"
 
+        with pytest.raises(DomainOperationError) as state_conflict:
+            await execution.save_tool_call(
+                TENANT_ID,
+                tool_call.model_copy(update={"result": FrozenJsonObject({"content": "different"})}),
+            )
+        assert state_conflict.value.code == "tool_call_state_conflict"
+
         with pytest.raises(DomainOperationError) as model_conflict:
             await execution.save_model_call(
                 TENANT_ID,
@@ -454,7 +1090,9 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
 
         async with database.sessions() as query:
             counts = [
-                await query.scalar(select(func.count()).select_from(record))
+                await query.scalar(
+                    select(func.count()).select_from(record).where(record.run_id == run.id)
+                )
                 for record in (
                     MessageRecord,
                     TaskPlanRecord,
@@ -467,6 +1105,159 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
         assert counts == [1, 1, 1, 1, 1, 1]
     finally:
         await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_relational_constraints_reject_cross_entity_mismatches(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    now = datetime.now(UTC)
+    first_session = _session(now)
+    second_session = _session(now)
+    await sessions.create(first_session)
+    await sessions.create(second_session)
+    first_run = _run(first_session, now)
+    second_run = _run(second_session, now)
+    for run in (first_run, second_run):
+        await runs.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key=f"relational-{run.id}",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+
+    bad_workspace_run = _run(first_session, now).model_copy(
+        update={"workspace_id": second_session.workspace_id}
+    )
+    with pytest.raises(IntegrityError):
+        await runs.create_idempotent(
+            TENANT_ID,
+            bad_workspace_run,
+            idempotency_key=f"bad-workspace-{bad_workspace_run.id}",
+            creation_hash=run_creation_hash(priority=bad_workspace_run.priority),
+        )
+
+    mismatched_message = PersistedMessage(
+        id=uuid.uuid4(),
+        session_id=second_session.id,
+        run_id=first_run.id,
+        sequence=1,
+        role=MessageRole.USER,
+        content="must be rejected",
+        created_at=now,
+    )
+    with pytest.raises(IntegrityError):
+        await execution.append_message(TENANT_ID, mismatched_message)
+
+    mismatched_checkpoint = Checkpoint(
+        id=uuid.uuid4(),
+        run_id=first_run.id,
+        session_id=second_session.id,
+        message_sequence=0,
+        workspace_snapshot_uri="s3://agent-platform/invalid",
+        workspace_revision="invalid",
+        task_plan=FrozenJsonObject({}),
+        created_at=now,
+    )
+    with pytest.raises(IntegrityError):
+        await execution.create_checkpoint(TENANT_ID, mismatched_checkpoint)
+
+    arguments = FrozenJsonObject({"path": "README.md"})
+    second_tool = ToolCall(
+        id="second-run-tool",
+        run_id=second_run.id,
+        turn_number=1,
+        tool_name="read_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.COMPLETED,
+        result=FrozenJsonObject({"content": "bounded"}),
+        started_at=now,
+        completed_at=now,
+    )
+    await execution.save_tool_call(TENANT_ID, second_tool)
+    mismatched_approval = PersistedApproval(
+        id=uuid.uuid4(),
+        run_id=first_run.id,
+        status=ApprovalStatus.PENDING,
+        reason="must not reference another run",
+        requested_at=now,
+    )
+    with pytest.raises(IntegrityError):
+        await execution.create_approval(
+            TENANT_ID,
+            mismatched_approval,
+            tool_call_id=second_tool.id,
+        )
+
+    second_checkpoint = Checkpoint(
+        id=uuid.uuid4(),
+        run_id=second_run.id,
+        session_id=second_session.id,
+        message_sequence=0,
+        workspace_snapshot_uri="s3://agent-platform/second",
+        workspace_revision="second",
+        task_plan=FrozenJsonObject({}),
+        created_at=now,
+    )
+    await execution.create_checkpoint(TENANT_ID, second_checkpoint)
+    with pytest.raises(IntegrityError):
+        async with database.sessions() as transaction, transaction.begin():
+            await transaction.execute(
+                update(RunRecord)
+                .where(
+                    RunRecord.tenant_id == TENANT_ID,
+                    RunRecord.id == first_run.id,
+                )
+                .values(last_checkpoint_id=second_checkpoint.id)
+            )
+
+    with pytest.raises(IntegrityError):
+        async with database.sessions() as transaction, transaction.begin():
+            transaction.add(
+                AgentEventRecord(
+                    tenant_id=TENANT_ID,
+                    run_id=first_run.id,
+                    sequence=1,
+                    event_type="unsupported.event",
+                    payload={},
+                    created_at=now,
+                )
+            )
+
+    worker_id = f"relational-worker-{uuid.uuid4()}"
+    async with database.sessions() as transaction, transaction.begin():
+        transaction.add(
+            WorkerRecord(
+                worker_id=worker_id,
+                supported_sandbox_types=["podman"],
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE.value,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+    with pytest.raises(IntegrityError):
+        async with database.sessions() as transaction, transaction.begin():
+            transaction.add(
+                WorkspaceLeaseRecord(
+                    tenant_id=TENANT_ID,
+                    workspace_id=first_session.workspace_id,
+                    run_id=second_run.id,
+                    worker_id=worker_id,
+                    run_lease_token=uuid.uuid4(),
+                    lease_token=uuid.uuid4(),
+                    generation=1,
+                    acquired_at=now,
+                    expires_at=now + timedelta(seconds=30),
+                )
+            )
+    await database.aclose()
 
 
 @pytest.mark.asyncio
