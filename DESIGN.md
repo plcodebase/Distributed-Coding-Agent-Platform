@@ -988,7 +988,9 @@ Implementation status through Sequences 14–16:
 * Sequence 14 adds SQLAlchemy 2.x async PostgreSQL records and an explicit Alembic
   revision for sessions, runs, messages, task plans, tool calls, approvals,
   checkpoints, events, model calls, gateway requests, rate windows, and circuit state.
-  Tenant-owned relationships and repository predicates include `tenant_id`.
+  Tenant-owned relationships and repository predicates include `tenant_id`; composite
+  foreign keys also prove workspace/session, run/session, approval/tool/run, and
+  checkpoint/run ownership.
 * Sequence 15 adds an injected FastAPI control plane with bearer authentication,
   tenant-scoped session/run operations, database-enforced run creation idempotency,
   cancellation, durable approval decisions, checkpoint rewind selection, and

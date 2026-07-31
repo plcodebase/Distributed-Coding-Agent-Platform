@@ -247,7 +247,11 @@ Sequence 14 provides:
 - durable sessions, runs, messages, task plans, tool calls, approvals, checkpoints,
   events, model-call accounting, gateway requests, rate windows, and circuits;
 - tenant IDs in every tenant-owned query and relational constraint;
+- composite ownership constraints tying run/workspace/session, message/run/session,
+  checkpoint/run/session, approval/tool/run, and selected checkpoint/run identities;
 - database uniqueness for run/tool/model/request idempotency and ordered records;
+- database-enforced event types plus runtime validation of run and gateway idempotency
+  identities before SQL construction;
 - compare-and-set run transitions using the core transition policy;
 - bounded connection pools, statement timeouts, UTC sessions, readiness, and explicit
   cancellation-safe engine cleanup;

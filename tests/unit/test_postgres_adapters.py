@@ -855,6 +855,26 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("idempotency_key", "creation_hash"),
+    [("bad key", run_creation_hash(priority=0)), ("request-1", "b" * 64)],
+)
+async def test_postgres_run_repository_validates_creation_identity(
+    idempotency_key: str,
+    creation_hash: str,
+) -> None:
+    repository = PostgresRunRepository(_sessions())
+    with pytest.raises(DomainOperationError) as error:
+        await repository.create_idempotent(
+            TENANT_ID,
+            _run(),
+            idempotency_key=cast("Any", idempotency_key),
+            creation_hash=creation_hash,
+        )
+    assert error.value.code == "invalid_run_creation"
+
+
+@pytest.mark.asyncio
 async def test_postgres_approval_repository_is_idempotent_and_resumes_run() -> None:
     run_id = uuid.uuid4()
     approval_id = uuid.uuid4()
