@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
+from pydantic import StringConstraints, TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -18,6 +19,17 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 MAX_POLICY_SECONDS = 3600.0
+MAX_RATE_LIMIT_REQUESTS = 1_000_000
+MAX_CIRCUIT_FAILURE_THRESHOLD = 100
+type PolicyRouteName = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z][a-z0-9-]*$",
+    ),
+]
+_ROUTE_NAME_ADAPTER: TypeAdapter[PolicyRouteName] = TypeAdapter(PolicyRouteName)
 
 
 class PostgresGatewayRateLimiter:
@@ -31,8 +43,11 @@ class PostgresGatewayRateLimiter:
         window_seconds: float,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        if type(requests_per_window) is not int or requests_per_window < 1:
-            raise ValueError("requests_per_window must be positive")
+        if (
+            type(requests_per_window) is not int
+            or not 1 <= requests_per_window <= MAX_RATE_LIMIT_REQUESTS
+        ):
+            raise ValueError("requests_per_window must be in [1, 1000000]")
         if (
             isinstance(window_seconds, bool)
             or not isinstance(window_seconds, (int, float))
@@ -46,6 +61,7 @@ class PostgresGatewayRateLimiter:
         self._clock = clock
 
     async def acquire(self, tenant_id: uuid.UUID, route_name: str) -> float | None:
+        route_name = _route_name(route_name)
         now = _aware_utc(self._clock())
         async with self._sessions() as database, database.begin():
             await database.execute(
@@ -95,8 +111,11 @@ class PostgresGatewayCircuitBreaker:
         recovery_seconds: float,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        if type(failure_threshold) is not int or failure_threshold < 1:
-            raise ValueError("failure_threshold must be positive")
+        if (
+            type(failure_threshold) is not int
+            or not 1 <= failure_threshold <= MAX_CIRCUIT_FAILURE_THRESHOLD
+        ):
+            raise ValueError("failure_threshold must be in [1, 100]")
         if (
             isinstance(recovery_seconds, bool)
             or not isinstance(recovery_seconds, (int, float))
@@ -110,6 +129,7 @@ class PostgresGatewayCircuitBreaker:
         self._clock = clock
 
     async def allow(self, route_name: str) -> bool:
+        route_name = _route_name(route_name)
         now = _aware_utc(self._clock())
         async with self._sessions() as database, database.begin():
             row = await self._locked_row(database, route_name, now)
@@ -128,6 +148,7 @@ class PostgresGatewayCircuitBreaker:
             return True
 
     async def record_success(self, route_name: str) -> None:
+        route_name = _route_name(route_name)
         now = _aware_utc(self._clock())
         async with self._sessions() as database, database.begin():
             row = await self._locked_row(database, route_name, now)
@@ -138,6 +159,7 @@ class PostgresGatewayCircuitBreaker:
             row.updated_at = now
 
     async def record_failure(self, route_name: str) -> None:
+        route_name = _route_name(route_name)
         now = _aware_utc(self._clock())
         async with self._sessions() as database, database.begin():
             row = await self._locked_row(database, route_name, now)
@@ -176,9 +198,21 @@ class PostgresGatewayCircuitBreaker:
 
 
 def _aware_utc(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("gateway policy clock must return a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("gateway policy clock must return an aware timestamp")
     return value.astimezone(UTC)
+
+
+def _route_name(value: str) -> str:
+    try:
+        validated = _ROUTE_NAME_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise ValueError("gateway route name is invalid") from None
+    if validated != value:
+        raise ValueError("gateway route name must not contain surrounding whitespace")
+    return validated
 
 
 __all__ = ["PostgresGatewayCircuitBreaker", "PostgresGatewayRateLimiter"]

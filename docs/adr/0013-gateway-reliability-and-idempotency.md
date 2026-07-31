@@ -42,9 +42,16 @@ treated as a transparent transport retry.
 - Treat the durable terminal commit as complete before yielding the terminal event.
   Closing a consumer immediately after that event must not rewrite the completed claim
   as failed.
+- Run the terminal completion commit in a shielded task. If caller cancellation arrives
+  during that commit, wait for its outcome before propagating cancellation. A successful
+  commit records durable completion in the execution coordinator so outer abort
+  bookkeeping cannot rewrite it to `failed`.
 - Shield request failure/release bookkeeping from caller cancellation and await it
   before propagating cancellation. A bookkeeping failure blocks client reuse rather
   than allowing an ambiguous second provider request.
+- Bound local/shared rate counts and circuit thresholds consistently, reject booleans
+  disguised as integers, and reject non-finite injected clock values before they can
+  corrupt admission state.
 
 ## Consequences
 
@@ -61,7 +68,7 @@ treated as a transparent transport retry.
 - Unit tests cover completed replay, running/conflicting claims, tenant scoping,
   pre-output retry delays, partial-stream suppression, half-open probes, rate windows,
   configuration bounds, close-after-terminal behavior, and cancellation during durable
-  failure recording.
+  failure and completion recording.
 - PostgreSQL integration tests cover durable replay and shared policy state across
   independently composed adapter instances, including recovery of an abandoned
   half-open probe.

@@ -8,6 +8,7 @@ import json
 import math
 import random
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Self
 
 from pydantic import Field, StringConstraints, model_validator
@@ -58,6 +59,11 @@ type RouteName = Annotated[
         pattern=r"^[a-z][a-z0-9-]*$",
     ),
 ]
+
+
+@dataclass(slots=True)
+class _ExecutionState:
+    durable_completion: bool = False
 
 
 class GatewayClientConfig(DomainModel):
@@ -190,11 +196,16 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
 
         provider_contacted = False
         completed = False
+        execution_state = _ExecutionState()
         try:
             await self._enforce_rate_limit(request)
             await self._require_closed_circuit(request)
             provider_contacted = True
-            execution = self._execute_with_retries(request, request_hash)
+            execution = self._execute_with_retries(
+                request,
+                request_hash,
+                execution_state,
+            )
             try:
                 async for event in execution:
                     if isinstance(event, GatewayResponseCompleted):
@@ -208,7 +219,7 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 await _close_stream(execution, request=request)
             completed = True
         finally:
-            if provider_contacted and not completed:
+            if provider_contacted and not completed and not execution_state.durable_completion:
                 await self._fail_request(
                     request,
                     request_hash,
@@ -261,6 +272,7 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         self,
         request: GatewayRequest,
         request_hash: Sha256Hex,
+        execution_state: _ExecutionState,
     ) -> AsyncIterator[GatewayEvent]:
         retained_events: list[GatewayEvent] = []
         for attempt in range(1, self._config.max_attempts + 1):
@@ -286,7 +298,12 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 continue
 
             await self._record_circuit_success(request)
-            await self._complete_request(request, request_hash, tuple(retained_events))
+            await self._complete_request(
+                request,
+                request_hash,
+                tuple(retained_events),
+                execution_state,
+            )
             yield _require_terminal_event(retained_events, request)
             return
 
@@ -465,14 +482,27 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         request: GatewayRequest,
         request_hash: Sha256Hex,
         events: tuple[GatewayEvent, ...],
+        execution_state: _ExecutionState,
     ) -> None:
-        try:
-            await self._request_store.complete(
+        operation = asyncio.create_task(
+            self._request_store.complete(
                 request.tenant_id,
                 request.request_id,
                 request_hash,
                 events,
             )
+        )
+        try:
+            await asyncio.shield(operation)
+            execution_state.durable_completion = True
+        except asyncio.CancelledError:
+            try:
+                await operation
+            except Exception:
+                self._cleanup_required = True
+            else:
+                execution_state.durable_completion = True
+            raise
         except Exception as error:
             raise DomainOperationError(
                 code="gateway_idempotency_commit_failed",

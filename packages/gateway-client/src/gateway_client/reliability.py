@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 MAX_POLICY_SECONDS = 3600.0
 MAX_LOCAL_POLICY_KEYS = 100_000
 MAX_LOCAL_CIRCUIT_ROUTES = 1000
+MAX_RATE_LIMIT_REQUESTS = 1_000_000
+MAX_CIRCUIT_FAILURE_THRESHOLD = 100
 
 
 @dataclass(slots=True)
@@ -42,7 +44,7 @@ class InMemoryGatewayRequestStore:
     """Deterministic process-local request store used by tests and local composition."""
 
     def __init__(self, *, max_requests: int = 10_000) -> None:
-        if not 1 <= max_requests <= MAX_LOCAL_POLICY_KEYS:
+        if type(max_requests) is not int or not 1 <= max_requests <= MAX_LOCAL_POLICY_KEYS:
             raise ValueError("max_requests must be in [1, 100000]")
         self._lock = asyncio.Lock()
         self._requests: dict[tuple[uuid.UUID, GatewayRequestIdentifier], _StoredRequest] = {}
@@ -154,8 +156,11 @@ class InMemoryGatewayRateLimiter:
         max_keys: int = 10_000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if type(requests_per_window) is not int or requests_per_window < 1:
-            raise ValueError("requests_per_window must be positive")
+        if (
+            type(requests_per_window) is not int
+            or not 1 <= requests_per_window <= MAX_RATE_LIMIT_REQUESTS
+        ):
+            raise ValueError("requests_per_window must be in [1, 1000000]")
         if (
             isinstance(window_seconds, bool)
             or not isinstance(window_seconds, (int, float))
@@ -163,7 +168,7 @@ class InMemoryGatewayRateLimiter:
             or not 0 < window_seconds <= MAX_POLICY_SECONDS
         ):
             raise ValueError("window_seconds must be in (0, 3600]")
-        if not 1 <= max_keys <= MAX_LOCAL_POLICY_KEYS:
+        if type(max_keys) is not int or not 1 <= max_keys <= MAX_LOCAL_POLICY_KEYS:
             raise ValueError("max_keys must be in [1, 100000]")
         self._limit = requests_per_window
         self._window = window_seconds
@@ -173,7 +178,7 @@ class InMemoryGatewayRateLimiter:
         self._requests: dict[tuple[uuid.UUID, str], deque[float]] = {}
 
     async def acquire(self, tenant_id: uuid.UUID, route_name: str) -> float | None:
-        now = self._clock()
+        now = _finite_clock_value(self._clock())
         boundary = now - self._window
         key = (tenant_id, route_name)
         async with self._lock:
@@ -207,8 +212,11 @@ class InMemoryGatewayCircuitBreaker:
         max_routes: int = 100,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if type(failure_threshold) is not int or failure_threshold < 1:
-            raise ValueError("failure_threshold must be positive")
+        if (
+            type(failure_threshold) is not int
+            or not 1 <= failure_threshold <= MAX_CIRCUIT_FAILURE_THRESHOLD
+        ):
+            raise ValueError("failure_threshold must be in [1, 100]")
         if (
             isinstance(recovery_seconds, bool)
             or not isinstance(recovery_seconds, (int, float))
@@ -216,7 +224,7 @@ class InMemoryGatewayCircuitBreaker:
             or not 0 < recovery_seconds <= MAX_POLICY_SECONDS
         ):
             raise ValueError("recovery_seconds must be in (0, 3600]")
-        if not 1 <= max_routes <= MAX_LOCAL_CIRCUIT_ROUTES:
+        if type(max_routes) is not int or not 1 <= max_routes <= MAX_LOCAL_CIRCUIT_ROUTES:
             raise ValueError("max_routes must be in [1, 1000]")
         self._threshold = failure_threshold
         self._recovery = recovery_seconds
@@ -226,7 +234,7 @@ class InMemoryGatewayCircuitBreaker:
         self._states: dict[str, _CircuitState] = {}
 
     async def allow(self, route_name: str) -> bool:
-        now = self._clock()
+        now = _finite_clock_value(self._clock())
         async with self._lock:
             if route_name not in self._states and len(self._states) >= self._max_routes:
                 raise RuntimeError("in-memory gateway circuit breaker reached capacity")
@@ -254,7 +262,7 @@ class InMemoryGatewayCircuitBreaker:
             self._states[route_name] = _CircuitState()
 
     async def record_failure(self, route_name: str) -> None:
-        now = self._clock()
+        now = _finite_clock_value(self._clock())
         async with self._lock:
             if route_name not in self._states and len(self._states) >= self._max_routes:
                 raise RuntimeError("in-memory gateway circuit breaker reached capacity")
@@ -264,6 +272,12 @@ class InMemoryGatewayCircuitBreaker:
             state.failures += 1
             if state.failures >= self._threshold:
                 state.opened_at = now
+
+
+def _finite_clock_value(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("gateway policy clock must return a finite number")
+    return float(value)
 
 
 __all__ = [

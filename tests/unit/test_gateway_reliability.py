@@ -192,6 +192,26 @@ class BlockingFailureStore(InMemoryGatewayRequestStore):
         await super().fail(tenant_id, request_id, request_hash, error)
 
 
+class BlockingCompletionStore(StrictCompletionStore):
+    """Expose whether cancellation can interrupt the durable terminal commit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.complete_started = asyncio.Event()
+        self.allow_complete = asyncio.Event()
+
+    async def complete(
+        self,
+        tenant_id: UUID,
+        request_id: GatewayRequestIdentifier,
+        request_hash: Sha256Hex,
+        events: tuple[GatewayEvent, ...],
+    ) -> None:
+        self.complete_started.set()
+        await self.allow_complete.wait()
+        await super().complete(tenant_id, request_id, request_hash, events)
+
+
 @pytest.mark.asyncio
 async def test_completed_request_is_replayed_without_another_provider_call() -> None:
     events: list[GatewayEvent] = [
@@ -249,6 +269,30 @@ async def test_cancellation_waits_for_durable_failure_before_propagating() -> No
         _ = [event async for event in client.stream(logical_request)]
     assert stored.value.code == "gateway_request_failed"
     assert gateway.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_waits_for_terminal_commit_without_rewriting_it_failed() -> None:
+    terminal = GatewayResponseCompleted(finish_reason=GatewayFinishReason.STOP)
+    gateway = AttemptGateway([[terminal]])
+    store = BlockingCompletionStore()
+    client = GatewayClient(gateway, request_store=store)
+    logical_request = request("cancelled-terminal-commit")
+    execution = asyncio.create_task(_collect(client.stream(logical_request)))
+    await store.complete_started.wait()
+
+    execution.cancel()
+    await asyncio.sleep(0)
+    assert not execution.done()
+
+    store.allow_complete.set()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    replayed = [event async for event in client.stream(logical_request)]
+    assert replayed == [terminal]
+    assert gateway.requests == [logical_request]
+    assert store.fail_calls == 0
 
 
 @pytest.mark.asyncio
@@ -423,6 +467,8 @@ def test_reliability_configuration_is_closed_and_bounded() -> None:
     with pytest.raises(ValueError):
         InMemoryGatewayRequestStore(max_requests=0)
     with pytest.raises(ValueError):
+        InMemoryGatewayRequestStore(max_requests=True)
+    with pytest.raises(ValueError):
         InMemoryGatewayRateLimiter(
             requests_per_window=1,
             window_seconds=1,
@@ -443,6 +489,18 @@ def test_reliability_configuration_is_closed_and_bounded() -> None:
         InMemoryGatewayCircuitBreaker(
             failure_threshold=True,
             recovery_seconds=1,
+        )
+    with pytest.raises(ValueError):
+        InMemoryGatewayRateLimiter(
+            requests_per_window=1,
+            window_seconds=1,
+            max_keys=True,
+        )
+    with pytest.raises(ValueError):
+        InMemoryGatewayCircuitBreaker(
+            failure_threshold=1,
+            recovery_seconds=1,
+            max_routes=True,
         )
 
 
@@ -532,6 +590,25 @@ async def test_local_policy_state_has_fail_closed_capacity_limits() -> None:
     await circuit.record_failure("coding-default")
     with pytest.raises(RuntimeError):
         await circuit.record_success("coding-fast")
+
+
+@pytest.mark.asyncio
+async def test_local_policy_clocks_must_return_finite_numbers() -> None:
+    limiter = InMemoryGatewayRateLimiter(
+        requests_per_window=1,
+        window_seconds=1,
+        clock=lambda: float("nan"),
+    )
+    with pytest.raises(ValueError, match="finite"):
+        await limiter.acquire(TENANT_ID, "coding-default")
+
+    circuit = InMemoryGatewayCircuitBreaker(
+        failure_threshold=1,
+        recovery_seconds=1,
+        clock=lambda: float("inf"),
+    )
+    with pytest.raises(ValueError, match="finite"):
+        await circuit.allow("coding-default")
 
 
 async def _collect(stream: AsyncIterator[GatewayEvent]) -> list[GatewayEvent]:

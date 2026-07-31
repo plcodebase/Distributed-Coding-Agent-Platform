@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, select, update
+from pydantic import TypeAdapter, ValidationError
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.domain.errors import ErrorDetail
-from agent_core.gateway import GatewayEvent, parse_gateway_event
+from agent_core.domain.models import Sha256Hex
+from agent_core.gateway import GatewayEvent, GatewayRequestIdentifier, parse_gateway_event
 from agent_core.gateway_reliability import (
     GatewayRequestClaim,
     GatewayRequestClaimStatus,
@@ -21,8 +22,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from agent_core.domain.models import Sha256Hex
-    from agent_core.gateway import GatewayRequestIdentifier
+_REQUEST_ID_ADAPTER: TypeAdapter[GatewayRequestIdentifier] = TypeAdapter(GatewayRequestIdentifier)
+_REQUEST_HASH_ADAPTER: TypeAdapter[Sha256Hex] = TypeAdapter(Sha256Hex)
 
 
 class PostgresGatewayRequestStore:
@@ -37,6 +38,7 @@ class PostgresGatewayRequestStore:
         request_id: GatewayRequestIdentifier,
         request_hash: Sha256Hex,
     ) -> GatewayRequestClaim:
+        request_id, request_hash = _request_identity(request_id, request_hash)
         async with self._sessions() as database, database.begin():
             inserted = await database.scalar(
                 insert(GatewayRequestRecord)
@@ -82,6 +84,7 @@ class PostgresGatewayRequestStore:
         request_hash: Sha256Hex,
         events: tuple[GatewayEvent, ...],
     ) -> None:
+        request_id, request_hash = _request_identity(request_id, request_hash)
         validated = GatewayRequestClaim(
             status=GatewayRequestClaimStatus.COMPLETED,
             request_hash=request_hash,
@@ -101,7 +104,7 @@ class PostgresGatewayRequestStore:
                     status=GatewayRequestClaimStatus.COMPLETED.value,
                     events=serialized,
                     error=None,
-                    updated_at=datetime.now(UTC),
+                    updated_at=func.now(),
                 )
                 .returning(GatewayRequestRecord.request_id)
             )
@@ -115,6 +118,7 @@ class PostgresGatewayRequestStore:
         request_hash: Sha256Hex,
         error: ErrorDetail,
     ) -> None:
+        request_id, request_hash = _request_identity(request_id, request_hash)
         async with self._sessions() as database, database.begin():
             updated = await database.scalar(
                 update(GatewayRequestRecord)
@@ -127,7 +131,7 @@ class PostgresGatewayRequestStore:
                 .values(
                     status=GatewayRequestClaimStatus.FAILED.value,
                     error=error.model_dump(mode="json"),
-                    updated_at=datetime.now(UTC),
+                    updated_at=func.now(),
                 )
                 .returning(GatewayRequestRecord.request_id)
             )
@@ -140,6 +144,7 @@ class PostgresGatewayRequestStore:
         request_id: GatewayRequestIdentifier,
         request_hash: Sha256Hex,
     ) -> None:
+        request_id, request_hash = _request_identity(request_id, request_hash)
         async with self._sessions() as database, database.begin():
             released = await database.scalar(
                 delete(GatewayRequestRecord)
@@ -165,6 +170,19 @@ def _claim_from_record(record: GatewayRequestRecord) -> GatewayRequestClaim:
         events=events,
         error=error,
     )
+
+
+def _request_identity(
+    request_id: GatewayRequestIdentifier,
+    request_hash: Sha256Hex,
+) -> tuple[GatewayRequestIdentifier, Sha256Hex]:
+    try:
+        return (
+            _REQUEST_ID_ADAPTER.validate_python(request_id),
+            _REQUEST_HASH_ADAPTER.validate_python(request_hash),
+        )
+    except ValidationError:
+        raise ValueError("gateway request identity is invalid") from None
 
 
 __all__ = ["PostgresGatewayRequestStore"]
