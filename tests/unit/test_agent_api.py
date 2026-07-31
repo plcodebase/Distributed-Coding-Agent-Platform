@@ -3,14 +3,21 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
+from collections import deque
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from agent_api import ApiServices, Principal, StaticTokenAuthenticator, create_app
+from agent_api import (
+    ApiServices,
+    Principal,
+    RequestBodyLimitMiddleware,
+    StaticTokenAuthenticator,
+    create_app,
+)
 from agent_api.factory import AgentApiSettings, _credentials
 from agent_core.control import (
     ApprovalDecision,
@@ -27,6 +34,8 @@ from agent_core.event_store import EventPage, StoredEvent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    from starlette.types import ASGIApp, Message, Scope
 
 
 TENANT_A = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -326,7 +335,7 @@ def test_static_credential_json_is_secret_safe_and_rejects_duplicate_keys() -> N
 
 
 def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
-    api_services, _, _, _ = services()
+    api_services, sessions, _, _ = services()
     client = TestClient(create_app(api_services))
     created_session = client.post(
         "/v1/sessions",
@@ -363,6 +372,93 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     assert second.json()["run"]["id"] == first.json()["run"]["id"]
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "run_idempotency_conflict"
+
+    stored_session = sessions.values[(TENANT_A, uuid.UUID(session_id))]
+    sessions.values[(TENANT_A, stored_session.id)] = stored_session.model_copy(
+        update={"status": SessionStatus.COMPLETED}
+    )
+    inactive = client.post(
+        f"/v1/sessions/{session_id}/runs",
+        headers={**authorization(), "Idempotency-Key": "inactive-session"},
+        json={},
+    )
+    assert inactive.status_code == 409
+    assert inactive.json()["error"]["code"] == "session_state_conflict"
+
+
+def test_request_body_limit_rejects_declared_oversize_and_invalid_configuration() -> None:
+    api_services, _, _, _ = services()
+    client = TestClient(create_app(api_services, max_request_body_bytes=4))
+    response = client.post(
+        "/v1/sessions",
+        headers={**authorization(), "content-type": "application/json"},
+        content=b"12345",
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_body_limit"
+    for value in (0, True, 1024 * 1024 + 1):
+        with pytest.raises(ValueError):
+            create_app(api_services, max_request_body_bytes=value)
+
+
+@pytest.mark.asyncio
+async def test_request_body_limit_bounds_chunked_and_rejects_duplicate_lengths() -> None:
+    called = False
+
+    async def downstream(
+        scope: Scope,
+        receive: object,
+        send: object,
+    ) -> None:
+        del scope, receive, send
+        nonlocal called
+        called = True
+
+    async def invoke(
+        headers: list[tuple[bytes, bytes]],
+        incoming: list[Message],
+    ) -> list[Message]:
+        queued = deque(incoming)
+        sent: list[Message] = []
+
+        async def receive() -> Message:
+            return queued.popleft()
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        middleware = RequestBodyLimitMiddleware(
+            cast("ASGIApp", downstream),
+            max_body_bytes=4,
+        )
+        scope = cast("Scope", {"type": "http", "headers": headers})
+        await middleware(scope, receive, send)
+        return sent
+
+    oversized = await invoke(
+        [],
+        [
+            {"type": "http.request", "body": b"123", "more_body": True},
+            {"type": "http.request", "body": b"45", "more_body": False},
+        ],
+    )
+    assert oversized[0]["status"] == 413
+    assert called is False
+
+    invalid = await invoke(
+        [(b"content-length", b"1"), (b"content-length", b"1")],
+        [{"type": "http.request", "body": b"1", "more_body": False}],
+    )
+    assert invalid[0]["status"] == 400
+    assert called is False
+
+    mismatched = await invoke(
+        [(b"content-length", b"1")],
+        [{"type": "http.request", "body": b"12", "more_body": False}],
+    )
+    assert mismatched[0]["status"] == 400
+    assert called is False
 
 
 def test_cancel_rewind_approval_and_event_replay_do_not_cross_tenants() -> None:

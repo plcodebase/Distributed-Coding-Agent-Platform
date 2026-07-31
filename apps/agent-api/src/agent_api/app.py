@@ -22,6 +22,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from agent_api.auth import Principal
+from agent_api.body_limit import (
+    MAX_CONFIGURED_HTTP_REQUEST_BODY_BYTES,
+    MAX_HTTP_REQUEST_BODY_BYTES,
+    RequestBodyLimitMiddleware,
+)
 from agent_api.dependencies import ApiServices
 from agent_api.schemas import (
     ApprovalDecisionRequest,
@@ -45,9 +50,18 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
     services: ApiServices,
     *,
     close: CloseCallback | None = None,
+    max_request_body_bytes: int = MAX_HTTP_REQUEST_BODY_BYTES,
 ) -> FastAPI:
     """Compose one dependency-injected API instance without global mutable state."""
 
+    if (
+        type(max_request_body_bytes) is not int
+        or not 1 <= max_request_body_bytes <= MAX_CONFIGURED_HTTP_REQUEST_BODY_BYTES
+    ):
+        raise ValueError(
+            "max_request_body_bytes must be an integer in "
+            f"[1, {MAX_CONFIGURED_HTTP_REQUEST_BODY_BYTES}]"
+        )
     active_event_sockets: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -67,6 +81,10 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         title="Agent Platform API",
         version="0.1.0",
         lifespan=lifespan,
+    )
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=max_request_body_bytes,
     )
 
     @app.exception_handler(DomainOperationError)
@@ -180,6 +198,11 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         session = await services.sessions.get(identity.tenant_id, session_id)
         if session is None:
             raise _not_found("session", session_id)
+        if session.status is not SessionStatus.ACTIVE:
+            raise DomainOperationError(
+                code="session_state_conflict",
+                message="runs may only be created for active sessions",
+            )
         now = datetime.now(UTC)
         run = Run(
             id=uuid.uuid4(),

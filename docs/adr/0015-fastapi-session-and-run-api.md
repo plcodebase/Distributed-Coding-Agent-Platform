@@ -22,6 +22,12 @@ objects into the domain or exposing unscoped persistence records.
 - Require a header-safe `Idempotency-Key` for run creation. Database uniqueness returns
   the original run for a matching payload and rejects key reuse with a different
   payload.
+- Create new runs only while their session is `active`; completed and cancelled
+  sessions fail with a closed state-conflict response.
+- Put a 64 KiB pre-routing ASGI request-body ceiling in front of FastAPI parsing.
+  Validate a single decimal `Content-Length` when present, count the actual streamed
+  bytes even when it is absent, reject declared/actual length mismatches, and never
+  pass rejected bytes to a route or validation handler.
 - Scope every repository call with the authenticated tenant. Cross-tenant resources
   are returned as not found rather than revealing their existence.
 - Store approval decisions durably before resuming a suspended run through `QUEUED`.
@@ -40,10 +46,13 @@ objects into the domain or exposing unscoped persistence records.
 
 ## Consequences
 
-- Sequence 15 creates queued durable runs but does not execute them. PostgreSQL queue
-  claiming begins in PR 17.
+- Sequence 15 creates queued durable runs but does not execute them. Sequence 17
+  workers claim those rows through the PostgreSQL queue.
 - Local development uses `make api` and the bearer map in
   `AGENT_PLATFORM_API_CREDENTIALS_JSON`. Production must replace local static tokens
   with an external authentication implementation.
 - API handlers depend on core protocols and values; only the production factory imports
   PostgreSQL adapters.
+- The 64 KiB ceiling is intentionally sized for the current control endpoints. A
+  future upload API must use a separate streaming object-storage boundary instead of
+  raising this global control-plane limit.

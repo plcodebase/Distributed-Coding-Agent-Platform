@@ -10,6 +10,7 @@ dependencies = [
   "anyio>=4,<5",
   "fastapi>=0.115,<1",
   "pydantic-settings>=2.9,<3",
+  "starlette>=0.40,<2",
   "uvicorn[standard]>=0.34,<1",
 ]
 
