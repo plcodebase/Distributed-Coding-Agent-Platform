@@ -132,6 +132,51 @@ def test_final_patch_is_incrementally_bounded(tmp_path: Path) -> None:
         asyncio.run(workspace.destroy())
 
 
+def test_final_patch_captures_add_delete_binary_and_mode_changes(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="run-patch-shapes",
+    )
+    try:
+        workspace.write_file_atomic(
+            "added.txt",
+            b"added\n",
+            require_absent=True,
+        )
+        workspace.write_file_atomic(
+            "binary.dat",
+            b"\x00\x01changed\xff",
+            require_absent=True,
+        )
+        (workspace.root / "tracked.txt").unlink()
+        (workspace.root / "other.txt").chmod(0o755)
+
+        patch = workspace.final_patch()
+
+        assert b"new file mode 100644" in patch
+        assert b"deleted file mode 100644" in patch
+        assert b"GIT binary patch" in patch
+        assert b"old mode 100644" in patch
+        assert b"new mode 100755" in patch
+    finally:
+        asyncio.run(workspace.destroy())
+
+
+def test_unchanged_workspace_has_an_empty_final_patch(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="run-empty-patch",
+    )
+    try:
+        assert workspace.final_patch() == b""
+    finally:
+        asyncio.run(workspace.destroy())
+
+
 def test_git_boundary_disables_repository_code_execution(tmp_path: Path) -> None:
     source = tmp_path / "source"
     create_repository(source)

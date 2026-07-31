@@ -289,6 +289,29 @@ async def test_edit_requires_read_hash_and_writes_atomically(
     assert rooted_workspace.file_bytes("new.py") == b"created = True\n"
 
 
+async def test_edit_can_replace_the_selected_text_with_empty_content(
+    rooted_workspace: RootedWorkspace,
+) -> None:
+    original = rooted_workspace.file_bytes("README.md")
+    events = await invoke(
+        WorkspaceToolset(rooted_workspace),
+        "edit_file",
+        {
+            "path": "README.md",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+            "old_text": original.decode(),
+            "new_text": "",
+        },
+    )
+
+    result = EditFileResult.model_validate(completed(events).result.to_json_object())
+    assert result.created is False
+    assert result.replacement_count == 1
+    assert result.bytes_written == 0
+    assert result.sha256 == hashlib.sha256(b"").hexdigest()
+    assert rooted_workspace.file_bytes("README.md") == b""
+
+
 async def test_edit_transactions_serialize_same_hash_and_return_canonical_results(
     rooted_workspace: RootedWorkspace,
 ) -> None:
