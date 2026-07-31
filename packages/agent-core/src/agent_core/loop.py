@@ -104,7 +104,15 @@ class AgentLoop:
         transcript = [_redact_message(message, self._redactor) for message in loop_input.messages]
         tool_call_count = 0
         semantic_retry_count = 0
-        outcomes: dict[str, ToolOutcome] = {}
+        outcomes = {
+            outcome.tool_call_id: ToolOutcome(
+                argument_hash=outcome.argument_hash,
+                status=outcome.status,
+                result=outcome.result,
+                error=outcome.error,
+            )
+            for outcome in loop_input.prior_tool_outcomes
+        }
         last_checkpoint_id = loop_input.checkpoint_id
 
         yield events.run_started(

@@ -207,7 +207,7 @@ def test_run_follows_happy_path_and_sets_lifecycle_fields() -> None:
     assert retrying.lease_expires_at is None
     assert retry_requeued.attempt == 2
     assert completed.completed_at == NOW + timedelta(seconds=11)
-    assert completed.assigned_worker_id == "worker-3"
+    assert completed.assigned_worker_id is None
     assert completed.lease_expires_at is None
     assert allowed_run_transitions(completed.status) == frozenset()
 
@@ -409,7 +409,7 @@ def test_lost_run_requeues_with_new_attempt_and_no_lease() -> None:
         occurred_at=NOW + timedelta(seconds=4),
     )
 
-    assert lost.assigned_worker_id == "worker-1"
+    assert lost.assigned_worker_id is None
     assert lost.lease_expires_at is None
     assert requeued.attempt == 2
     assert requeued.assigned_worker_id is None

@@ -117,9 +117,11 @@ def transition_run(
         if run.status in {RunStatus.RETRY_PENDING, RunStatus.LOST}:
             data["attempt"] = run.attempt + 1
     elif new_status is RunStatus.LOST:
+        data["assigned_worker_id"] = None
         data["lease_expires_at"] = None
     elif new_status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
         data["completed_at"] = timestamp
+        data["assigned_worker_id"] = None
         data["lease_expires_at"] = None
         if new_status is RunStatus.CANCELLED:
             data["cancellation_requested"] = True

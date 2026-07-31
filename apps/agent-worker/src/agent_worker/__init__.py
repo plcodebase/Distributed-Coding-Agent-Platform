@@ -1,5 +1,6 @@
 """Distributed worker runtime for durable coding-agent execution."""
 
+from agent_worker.executor import AgentLoopFactory, AgentLoopRunExecutor, ToolCallStore
 from agent_worker.process import (
     DEFAULT_LOCAL_WORKER_PROCESSES,
     MAX_LOCAL_WORKER_PROCESSES,
@@ -12,6 +13,9 @@ from agent_worker.service import WorkerConfig, WorkerService
 __all__ = [
     "DEFAULT_LOCAL_WORKER_PROCESSES",
     "MAX_LOCAL_WORKER_PROCESSES",
+    "AgentLoopFactory",
+    "AgentLoopRunExecutor",
+    "ToolCallStore",
     "WorkerConfig",
     "WorkerService",
     "WorkerServiceFactory",

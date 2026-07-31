@@ -8,7 +8,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import anyio
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, select, update
 
 from agent_core.domain.errors import DomainOperationError
@@ -17,6 +17,7 @@ from agent_core.event_store import (
     MAX_EVENT_PAGE_BYTES,
     MAX_EVENT_PAGE_SIZE,
     MIN_EVENT_PAGE_BYTES,
+    EventDeliveryKey,
     EventDraft,
     EventPage,
     StoredEvent,
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _EVENT_TYPE_ADAPTER: TypeAdapter[EventType] = TypeAdapter(EventType)
+_DELIVERY_KEY_ADAPTER: TypeAdapter[EventDeliveryKey] = TypeAdapter(EventDeliveryKey)
 MIN_POLL_INTERVAL_SECONDS = 0.01
 MAX_POLL_INTERVAL_SECONDS = 10.0
 
@@ -107,6 +109,70 @@ class PostgresEventStore:
             payload=draft.payload,
             created_at=draft.created_at,
         )
+
+    async def append_idempotent(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        delivery_key: EventDeliveryKey,
+        draft: EventDraft,
+    ) -> StoredEvent:
+        """Append once for a stable worker delivery key."""
+
+        try:
+            validated_key = _DELIVERY_KEY_ADAPTER.validate_python(delivery_key)
+        except ValidationError:
+            raise DomainOperationError(
+                code="event_delivery_key_invalid",
+                message="the event delivery key is invalid",
+            ) from None
+        async with self._sessions() as database, database.begin():
+            run_row = await database.scalar(
+                select(RunRecord)
+                .where(
+                    RunRecord.tenant_id == tenant_id,
+                    RunRecord.id == run_id,
+                )
+                .with_for_update()
+            )
+            if run_row is None:
+                raise DomainOperationError(
+                    code="run_not_found",
+                    message="the run does not exist for this tenant",
+                    details={"run_id": str(run_id)},
+                )
+            existing = await database.scalar(
+                select(AgentEventRecord).where(
+                    AgentEventRecord.tenant_id == tenant_id,
+                    AgentEventRecord.run_id == run_id,
+                    AgentEventRecord.delivery_key == validated_key,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.event_type != draft.event_type.value
+                    or existing.payload != draft.payload.to_json_object()
+                ):
+                    raise DomainOperationError(
+                        code="event_delivery_conflict",
+                        message="the event delivery key belongs to different event data",
+                        details={"run_id": str(run_id), "delivery_key": validated_key},
+                    )
+                return _stored_event(existing)
+            sequence = run_row.next_event_sequence
+            run_row.next_event_sequence += 1
+            row = AgentEventRecord(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sequence=sequence,
+                delivery_key=validated_key,
+                event_type=draft.event_type.value,
+                payload=draft.payload.to_json_object(),
+                created_at=draft.created_at,
+            )
+            database.add(row)
+            await database.flush()
+            return _stored_event(row)
 
     async def read_page(
         self,

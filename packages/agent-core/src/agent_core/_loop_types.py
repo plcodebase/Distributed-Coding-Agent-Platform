@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import uuid  # noqa: TC003 - Pydantic resolves this field type at runtime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
+from agent_core.distributed import (  # noqa: TC001 - Pydantic resolves this field at runtime
+    DurableToolOutcome,
+)
 from agent_core.domain.base import DomainModel, FrozenJsonObject
 from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves this field at runtime
     IdentifierString,
@@ -86,6 +89,17 @@ class AgentLoopInput(DomainModel):
     checkpoint_id: uuid.UUID | None = None
     task_plan: FrozenJsonObject = Field(default_factory=lambda: FrozenJsonObject({}))
     context_summary: str | None = None
+    prior_tool_outcomes: tuple[DurableToolOutcome, ...] = Field(
+        default=(),
+        max_length=100,
+    )
+
+    @model_validator(mode="after")
+    def validate_prior_outcomes(self) -> Self:
+        identifiers = [outcome.tool_call_id for outcome in self.prior_tool_outcomes]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("prior durable tool-call IDs must be unique")
+        return self
 
 
 __all__ = [

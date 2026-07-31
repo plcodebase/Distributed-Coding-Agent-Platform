@@ -913,6 +913,8 @@ async def test_postgres_execution_repository_serializes_entities_and_detects_con
         status=ToolCallStatus.RECEIVED,
     )
     existing_tool = SimpleNamespace(
+        tool_call_id=tool_call.id,
+        run_id=tool_call.run_id,
         argument_hash=tool_call.argument_hash,
         tool_name=tool_call.tool_name,
         turn_number=tool_call.turn_number,
@@ -920,6 +922,7 @@ async def test_postgres_execution_repository_serializes_entities_and_detects_con
         status=tool_call.status.value,
         workspace_version=None,
         result=None,
+        error=None,
         started_at=None,
         completed_at=None,
     )
@@ -996,3 +999,71 @@ async def test_postgres_execution_repository_serializes_entities_and_detects_con
     assert len(databases[5].added) == 1
     assert len(databases[6].added) == 1
     assert len(databases[7].added) == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_call_replay_returns_later_durable_state_and_rejects_divergence() -> None:
+    run = _run()
+    arguments = FrozenJsonObject({"path": "README.md"})
+    received = ToolCall(
+        id="tool-replay-1",
+        run_id=run.id,
+        turn_number=1,
+        tool_name="read_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.RECEIVED,
+    )
+    completed = received.model_copy(
+        update={
+            "status": ToolCallStatus.COMPLETED,
+            "result": FrozenJsonObject({"content": "durable"}),
+            "started_at": NOW,
+            "completed_at": NOW + timedelta(seconds=1),
+        }
+    )
+    durable_row = SimpleNamespace(
+        tool_call_id=completed.id,
+        run_id=completed.run_id,
+        turn_number=completed.turn_number,
+        tool_name=completed.tool_name,
+        arguments=completed.arguments.to_json_object(),
+        argument_hash=completed.argument_hash,
+        status=completed.status.value,
+        workspace_version=None,
+        result=completed.result.to_json_object() if completed.result is not None else None,
+        error=None,
+        started_at=completed.started_at,
+        completed_at=completed.completed_at,
+    )
+    repository = PostgresExecutionRepository(
+        _sessions(
+            _FakeDatabase(scalars=[durable_row]),
+            _FakeDatabase(scalars=[durable_row]),
+            _FakeDatabase(scalars=[durable_row]),
+            _FakeDatabase(scalars=[durable_row]),
+        )
+    )
+
+    assert (await repository.save_tool_call(TENANT_ID, received)).status is (
+        ToolCallStatus.COMPLETED
+    )
+    running_replay = received.model_copy(
+        update={"status": ToolCallStatus.RUNNING, "started_at": NOW}
+    )
+    assert (await repository.save_tool_call(TENANT_ID, running_replay)).status is (
+        ToolCallStatus.COMPLETED
+    )
+    timestamp_replay = completed.model_copy(
+        update={
+            "started_at": NOW + timedelta(milliseconds=1),
+            "completed_at": NOW + timedelta(seconds=2),
+        }
+    )
+    assert await repository.save_tool_call(TENANT_ID, timestamp_replay) == completed
+    conflicting = completed.model_copy(
+        update={"result": FrozenJsonObject({"content": "different"})}
+    )
+    with pytest.raises(DomainOperationError) as error:
+        await repository.save_tool_call(TENANT_ID, conflicting)
+    assert error.value.code == "tool_call_state_conflict"

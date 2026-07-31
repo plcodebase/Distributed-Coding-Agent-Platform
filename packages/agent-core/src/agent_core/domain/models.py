@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Self
 from pydantic import Field, StringConstraints, model_validator
 
 from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject, JsonObject
-from agent_core.domain.errors import DomainOperationError
+from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.status import (
     ApprovalMode,
     ModelCallStatus,
@@ -51,7 +51,7 @@ _STARTED_RUN_STATUSES = frozenset(
 )
 _ASSIGNED_RUN_STATUSES = frozenset({RunStatus.LEASED, RunStatus.RUNNING})
 _UNASSIGNED_RUN_STATUSES = frozenset(
-    {RunStatus.QUEUED, RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING}
+    {RunStatus.QUEUED, RunStatus.WAITING_APPROVAL, RunStatus.RETRY_PENDING, RunStatus.LOST}
 )
 _TERMINAL_TOOL_STATUSES = frozenset(
     {ToolCallStatus.COMPLETED, ToolCallStatus.FAILED, ToolCallStatus.CANCELLED}
@@ -179,6 +179,7 @@ class ToolCall(DomainModel):
     status: ToolCallStatus
     workspace_version: IdentifierString | None = None
     result: FrozenJsonObject | None = None
+    error: ErrorDetail | None = None
     started_at: AwareTimestamp | None = None
     completed_at: AwareTimestamp | None = None
 
@@ -203,6 +204,14 @@ class ToolCall(DomainModel):
                 raise ValueError(f"{self.status.value} tool call must have completed_at")
         elif self.completed_at is not None:
             raise ValueError("non-terminal tool call may not have completed_at")
+        if self.status is ToolCallStatus.COMPLETED:
+            if self.result is None or self.error is not None:
+                raise ValueError("completed tool call requires only a result")
+        elif self.status in {ToolCallStatus.FAILED, ToolCallStatus.CANCELLED}:
+            if self.error is None or self.result is not None:
+                raise ValueError("failed or cancelled tool call requires only an error")
+        elif self.result is not None or self.error is not None:
+            raise ValueError("non-terminal tool call may not have a result or error")
         return self
 
 

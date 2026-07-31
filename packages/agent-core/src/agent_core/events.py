@@ -120,10 +120,13 @@ class ToolCompletedPayload(EventPayload):
 
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
-        if self.status is ToolCallStatus.COMPLETED and self.error is not None:
-            raise ValueError("completed tool event may not contain an error")
-        if self.status is ToolCallStatus.FAILED and self.error is None:
-            raise ValueError("failed tool event must contain an error")
+        if self.status is ToolCallStatus.COMPLETED:
+            if self.result is None or self.error is not None:
+                raise ValueError(
+                    "completed tool event must contain a result and may not contain an error"
+                )
+        elif self.result is not None or self.error is None:
+            raise ValueError("failed or cancelled tool event must contain an error and no result")
         return self
 
 
