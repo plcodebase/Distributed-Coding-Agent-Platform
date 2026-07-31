@@ -226,7 +226,14 @@ def _event_row(run_id: uuid.UUID, sequence: int) -> SimpleNamespace:
 
 @pytest.mark.parametrize(
     ("requests", "seconds"),
-    [(0, 1.0), (True, 1.0), (1, 0.0), (1, float("inf")), (1, True)],
+    [
+        (0, 1.0),
+        (True, 1.0),
+        (1_000_001, 1.0),
+        (1, 0.0),
+        (1, float("inf")),
+        (1, True),
+    ],
 )
 def test_postgres_rate_limiter_rejects_invalid_configuration(
     requests: object,
@@ -280,11 +287,34 @@ async def test_postgres_rate_limiter_enforces_and_resets_shared_window() -> None
     )
     with pytest.raises(ValueError, match="aware"):
         await naive.acquire(TENANT_ID, "primary")
+    invalid_clock = PostgresGatewayRateLimiter(
+        _sessions(),
+        requests_per_window=1,
+        window_seconds=1,
+        clock=cast("Any", lambda: "not-a-datetime"),
+    )
+    with pytest.raises(TypeError, match="datetime"):
+        await invalid_clock.acquire(TENANT_ID, "primary")
+    invalid_route = PostgresGatewayRateLimiter(
+        _sessions(),
+        requests_per_window=1,
+        window_seconds=1,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(ValueError, match="route"):
+        await invalid_route.acquire(TENANT_ID, " ")
 
 
 @pytest.mark.parametrize(
     ("threshold", "seconds"),
-    [(0, 1.0), (True, 1.0), (1, 0.0), (1, float("nan")), (1, True)],
+    [
+        (0, 1.0),
+        (True, 1.0),
+        (101, 1.0),
+        (1, 0.0),
+        (1, float("nan")),
+        (1, True),
+    ],
 )
 def test_postgres_circuit_breaker_rejects_invalid_configuration(
     threshold: object,
@@ -452,6 +482,24 @@ async def test_postgres_gateway_store_claim_outcomes_and_terminal_cas() -> None:
         ErrorDetail(code="gateway_failed", message="failed", retryable=True),
     )
     await store.release(TENANT_ID, "request-1", REQUEST_HASH)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "request_hash"),
+    [("", REQUEST_HASH), ("bad request", REQUEST_HASH), ("request-1", "invalid")],
+)
+async def test_postgres_gateway_store_validates_request_identity(
+    request_id: str,
+    request_hash: str,
+) -> None:
+    store = PostgresGatewayRequestStore(_sessions())
+    with pytest.raises(ValueError, match="identity"):
+        await store.claim(
+            TENANT_ID,
+            cast("Any", request_id),
+            cast("Any", request_hash),
+        )
 
 
 @pytest.mark.asyncio

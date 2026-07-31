@@ -917,6 +917,8 @@ Implementation status through Sequences 11 and 12:
   pre-output-only exponential retry with jitter, and closed/open/half-open circuit plus
   tenant/route admission policies. Production composition uses PostgreSQL-backed
   shared state; deterministic local tests use in-memory adapters.
+  Terminal completion/failure/release writes are cancellation-safe and a successful
+  completion cannot be rewritten as an aborted request.
 * The client never retries after a normalized event has been emitted. Compatible
   provider fallback remains centralized in LiteLLM so retries preserve the stable
   logical route and request ID.

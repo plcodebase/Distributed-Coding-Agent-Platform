@@ -232,8 +232,9 @@ Sequence 13 provides:
 - deterministic in-memory policies for tests plus shared PostgreSQL production
   adapters;
 - durable terminal-event commit before terminal success reaches the agent;
-- cancellation-safe durable failure/release bookkeeping and close-after-terminal
-  replay safety;
+- cancellation-safe durable completion/failure/release bookkeeping and
+  close-after-terminal replay safety;
+- bounded rate/circuit configuration and finite injected policy clocks;
 - compatible provider fallback retained inside LiteLLM with stable logical route and
   request identity.
 
