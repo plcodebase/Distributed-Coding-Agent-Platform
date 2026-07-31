@@ -319,6 +319,21 @@ Sequence 18 provides:
   default;
 - a separately composed lease-recovery scheduler process.
 
+### Sequence 19: failure recovery and idempotent replay
+
+Sequence 19 provides:
+
+- bounded scheduler recovery of expired leases through `LOST` and back to `QUEUED`;
+- attempt increments and complete stale run/workspace lease cleanup;
+- active-lease-fenced loading of checkpoint conversation, plan, summary, and terminal
+  tool outcomes;
+- restoration at the latest durable post-tool workspace revision;
+- monotonic tool-call persistence that accepts predecessor replay but rejects identity
+  or terminal-outcome divergence;
+- reuse of matching terminal tool results without another handler invocation;
+- stable event delivery keys with database-enforced identical replay;
+- real PostgreSQL Worker A loss / Worker B restoration and completion coverage.
+
 ## Local setup
 
 ```shell

@@ -1094,6 +1094,10 @@ Implementation status through Sequences 17–20:
   heartbeat. A provider-neutral worker service starts, renews, cancels, finishes, and
   gracefully drains run attempts. Its local fleet CLI starts three spawned processes
   by default, and the API contains no execution loop.
+* Sequence 19 requeues matching expired attempts through `LOST`, increments the attempt,
+  and loads bounded checkpoint state only for the replacement lease. Tool states are
+  monotonic, event delivery keys are idempotent, and recovery restores the latest
+  durable post-tool workspace revision before reusing a terminal outcome.
 
 
 ### Acceptance criteria
