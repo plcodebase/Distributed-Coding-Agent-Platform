@@ -288,7 +288,9 @@ Sequence 16 provides:
 - the unique `(run_id, sequence)` database invariant;
 - ordered HTTP replay after an exclusive cursor with exact pagination;
 - authenticated WebSocket catch-up followed by live durable polling;
-- a shared 1,000-event page ceiling enforced by core, API, and persistence;
+- shared 1,000-event and 4 MiB serialized page ceilings with incrementally streamed
+  database rows;
+- fail-closed durable sequence-gap detection;
 - awaited sends for backpressure and disconnect handling that never cancels a run.
 
 ## Local setup

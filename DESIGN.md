@@ -998,7 +998,9 @@ Implementation status through Sequences 14–16:
   bodies pass a 64 KiB pre-routing streamed-byte boundary.
 * Sequence 16 allocates event sequences atomically from the run row, commits the event
   in the same transaction, and exposes cursor-based HTTP replay plus authenticated
-  WebSocket catch-up/live polling. A socket disconnect never changes run state.
+  WebSocket catch-up/live polling. Replay pages are bounded by both 1,000 events and
+  4 MiB of serialized JSON, and sequence gaps fail closed. A socket disconnect never
+  changes run state.
 * Run creation persists `QUEUED` work. Queue claiming, worker leases, and execution
   begin in PRs 17 and 18.
 
