@@ -47,6 +47,12 @@ def upgrade() -> None:
             name="ck_sessions_timestamp_order",
         ),
         sa.UniqueConstraint("tenant_id", "id", name="uq_sessions_tenant_id_id"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "id",
+            "workspace_id",
+            name="uq_sessions_tenant_id_id_workspace_id",
+        ),
     )
     op.create_index("ix_sessions_tenant_created", "sessions", ["tenant_id", "created_at"])
 
@@ -121,12 +127,18 @@ def upgrade() -> None:
             name="ck_runs_suspended_without_lease",
         ),
         sa.ForeignKeyConstraint(
-            ("tenant_id", "session_id"),
-            ("sessions.tenant_id", "sessions.id"),
-            name="fk_runs_tenant_id_session_id_sessions",
+            ("tenant_id", "session_id", "workspace_id"),
+            ("sessions.tenant_id", "sessions.id", "sessions.workspace_id"),
+            name="fk_runs_tenant_id_session_id_workspace_id_sessions",
             ondelete="CASCADE",
         ),
         sa.UniqueConstraint("tenant_id", "id", name="uq_runs_tenant_id_id"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "id",
+            "session_id",
+            name="uq_runs_tenant_id_id_session_id",
+        ),
         sa.UniqueConstraint(
             "tenant_id",
             "session_id",
@@ -146,6 +158,13 @@ def upgrade() -> None:
     _create_tool_calls()
     _create_approvals()
     _create_checkpoints()
+    op.create_foreign_key(
+        "fk_runs_tenant_id_id_last_checkpoint_id_checkpoints",
+        "runs",
+        "checkpoints",
+        ["tenant_id", "id", "last_checkpoint_id"],
+        ["tenant_id", "run_id", "id"],
+    )
     _create_agent_events()
     _create_model_calls()
     _create_gateway_requests()
@@ -157,6 +176,15 @@ def _run_foreign_key(name: str) -> sa.ForeignKeyConstraint:
     return sa.ForeignKeyConstraint(
         ("tenant_id", "run_id"),
         ("runs.tenant_id", "runs.id"),
+        name=name,
+        ondelete="CASCADE",
+    )
+
+
+def _run_session_foreign_key(name: str) -> sa.ForeignKeyConstraint:
+    return sa.ForeignKeyConstraint(
+        ("tenant_id", "run_id", "session_id"),
+        ("runs.tenant_id", "runs.id", "runs.session_id"),
         name=name,
         ondelete="CASCADE",
     )
@@ -194,7 +222,7 @@ def _create_messages() -> None:
             name="fk_messages_tenant_id_session_id_sessions",
             ondelete="CASCADE",
         ),
-        _run_foreign_key("fk_messages_tenant_id_run_id_runs"),
+        _run_session_foreign_key("fk_messages_tenant_id_run_id_session_id_runs"),
         sa.UniqueConstraint(
             "tenant_id",
             "session_id",
@@ -324,6 +352,15 @@ def _create_approvals() -> None:
             name="ck_approvals_decision_state",
         ),
         _run_foreign_key("fk_approvals_tenant_id_run_id_runs"),
+        sa.ForeignKeyConstraint(
+            ("tenant_id", "run_id", "tool_call_id"),
+            (
+                "tool_calls.tenant_id",
+                "tool_calls.run_id",
+                "tool_calls.tool_call_id",
+            ),
+            name="fk_approvals_tenant_id_run_id_tool_call_id_tool_calls",
+        ),
     )
     op.create_index(
         "ix_approvals_run_status",
@@ -358,7 +395,7 @@ def _create_checkpoints() -> None:
             "jsonb_typeof(task_plan) = 'object'",
             name="ck_checkpoints_task_plan_object",
         ),
-        _run_foreign_key("fk_checkpoints_tenant_id_run_id_runs"),
+        _run_session_foreign_key("fk_checkpoints_tenant_id_run_id_session_id_runs"),
         sa.ForeignKeyConstraint(
             ("tenant_id", "session_id"),
             ("sessions.tenant_id", "sessions.id"),
@@ -370,6 +407,12 @@ def _create_checkpoints() -> None:
             "run_id",
             "message_sequence",
             name="uq_checkpoints_tenant_id_run_id_message_sequence",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "run_id",
+            "id",
+            name="uq_checkpoints_tenant_id_run_id_id",
         ),
     )
 
@@ -385,6 +428,14 @@ def _create_agent_events() -> None:
         sa.Column("payload", JSONB, nullable=False),
         sa.Column("created_at", UTC_TIMESTAMP, nullable=False, server_default=sa.text("now()")),
         sa.CheckConstraint("sequence >= 1", name="ck_agent_events_sequence"),
+        sa.CheckConstraint(
+            "event_type IN "
+            "('run.started', 'context.build_started', 'model.request_started', "
+            "'model.text_delta', 'model.tool_call_received', 'tool.approval_required', "
+            "'tool.started', 'tool.stdout', 'tool.stderr', 'tool.completed', "
+            "'checkpoint.created', 'run.retry_scheduled', 'run.completed', 'run.failed')",
+            name="ck_agent_events_event_type",
+        ),
         sa.CheckConstraint(
             "jsonb_typeof(payload) = 'object'",
             name="ck_agent_events_payload_object",
@@ -585,6 +636,11 @@ def _create_gateway_circuits() -> None:
 def downgrade() -> None:
     """Drop only Sequence 14-owned schema objects in dependency-safe order."""
 
+    op.drop_constraint(
+        "fk_runs_tenant_id_id_last_checkpoint_id_checkpoints",
+        "runs",
+        type_="foreignkey",
+    )
     for table_name in (
         "gateway_circuits",
         "gateway_rate_limits",

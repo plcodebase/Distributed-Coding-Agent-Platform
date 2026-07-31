@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
@@ -32,6 +33,8 @@ from platform_persistence.models import (
     TaskPlanRecord,
     ToolCallRecord,
 )
+
+_IDEMPOTENCY_KEY_ADAPTER: TypeAdapter[IdempotencyKey] = TypeAdapter(IdempotencyKey)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -89,6 +92,19 @@ class PostgresRunRepository:
         idempotency_key: IdempotencyKey,
         creation_hash: str,
     ) -> RunCreationResult:
+        try:
+            idempotency_key = _IDEMPOTENCY_KEY_ADAPTER.validate_python(idempotency_key)
+        except ValidationError:
+            raise DomainOperationError(
+                code="invalid_run_creation",
+                message="the run idempotency key is invalid",
+            ) from None
+        expected_creation_hash = run_creation_hash(priority=run.priority)
+        if creation_hash != expected_creation_hash:
+            raise DomainOperationError(
+                code="invalid_run_creation",
+                message="the run creation hash does not match the run payload",
+            )
         values = _run_values(
             tenant_id,
             run,

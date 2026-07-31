@@ -37,6 +37,7 @@ class SessionRecord(Base):
     __tablename__ = "sessions"
     __table_args__ = (
         UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "id", "workspace_id"),
         CheckConstraint(
             "status IN ('active', 'completed', 'cancelled')",
             name="status",
@@ -73,11 +74,18 @@ class RunRecord(Base):
     __tablename__ = "runs"
     __table_args__ = (
         ForeignKeyConstraint(
-            ("tenant_id", "session_id"),
-            ("sessions.tenant_id", "sessions.id"),
+            ("tenant_id", "session_id", "workspace_id"),
+            ("sessions.tenant_id", "sessions.id", "sessions.workspace_id"),
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ("tenant_id", "id", "last_checkpoint_id"),
+            ("checkpoints.tenant_id", "checkpoints.run_id", "checkpoints.id"),
+            name="fk_runs_tenant_id_id_last_checkpoint_id_checkpoints",
+            use_alter=True,
+        ),
         UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "id", "session_id"),
         UniqueConstraint("tenant_id", "session_id", "idempotency_key"),
         CheckConstraint(
             "status IN "
@@ -163,8 +171,8 @@ class MessageRecord(Base):
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
-            ("tenant_id", "run_id"),
-            ("runs.tenant_id", "runs.id"),
+            ("tenant_id", "run_id", "session_id"),
+            ("runs.tenant_id", "runs.id", "runs.session_id"),
             ondelete="CASCADE",
         ),
         UniqueConstraint("tenant_id", "session_id", "sequence"),
@@ -287,6 +295,14 @@ class ApprovalRecord(Base):
             ("runs.tenant_id", "runs.id"),
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id", "tool_call_id"),
+            (
+                "tool_calls.tenant_id",
+                "tool_calls.run_id",
+                "tool_calls.tool_call_id",
+            ),
+        ),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected')",
             name="status",
@@ -328,8 +344,8 @@ class CheckpointRecord(Base):
     __tablename__ = "checkpoints"
     __table_args__ = (
         ForeignKeyConstraint(
-            ("tenant_id", "run_id"),
-            ("runs.tenant_id", "runs.id"),
+            ("tenant_id", "run_id", "session_id"),
+            ("runs.tenant_id", "runs.id", "runs.session_id"),
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
@@ -338,6 +354,7 @@ class CheckpointRecord(Base):
             ondelete="CASCADE",
         ),
         UniqueConstraint("tenant_id", "run_id", "message_sequence"),
+        UniqueConstraint("tenant_id", "run_id", "id"),
         CheckConstraint("message_sequence >= 0", name="message_sequence"),
         CheckConstraint("jsonb_typeof(task_plan) = 'object'", name="task_plan_object"),
     )
@@ -374,6 +391,14 @@ class AgentEventRecord(Base):
         ),
         UniqueConstraint("run_id", "sequence"),
         CheckConstraint("sequence >= 1", name="sequence"),
+        CheckConstraint(
+            "event_type IN "
+            "('run.started', 'context.build_started', 'model.request_started', "
+            "'model.text_delta', 'model.tool_call_received', 'tool.approval_required', "
+            "'tool.started', 'tool.stdout', 'tool.stderr', 'tool.completed', "
+            "'checkpoint.created', 'run.retry_scheduled', 'run.completed', 'run.failed')",
+            name="event_type",
+        ),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
         Index("ix_agent_events_tenant_run_sequence", "tenant_id", "run_id", "sequence"),
     )
