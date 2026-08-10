@@ -33,6 +33,7 @@ from agent_core.distributed import (
     RunRecoveryState,
     WorkerRegistration,
     WorkerStatus,
+    WorkspaceWriterLease,
 )
 from agent_core.domain.base import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError
@@ -143,16 +144,24 @@ class SteppingWorkerClock:
 
 class RecordingWorkspaceRestorer:
     def __init__(self) -> None:
-        self.calls: list[tuple[uuid.UUID, uuid.UUID, str]] = []
+        self.calls: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID, str]] = []
 
     async def restore(
         self,
         lease: RunLease,
         checkpoint: Checkpoint,
         *,
+        writer_lease: WorkspaceWriterLease,
         workspace_revision: str,
     ) -> None:
-        self.calls.append((lease.run_id, checkpoint.id, workspace_revision))
+        self.calls.append(
+            (
+                lease.run_id,
+                checkpoint.id,
+                writer_lease.lease_token,
+                workspace_revision,
+            )
+        )
 
 
 class ReplayEditArguments(ToolArguments):
@@ -914,9 +923,10 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
 
         def loop_factory(
             lease: RunLease,
+            writer_lease: WorkspaceWriterLease,
             recovery_state: RunRecoveryState,
         ) -> AgentLoop:
-            del lease
+            assert writer_lease.run_id == lease.run_id
             captured_recovery.append(recovery_state)
             call = GatewayToolCall(
                 id=completed_tool.id,
@@ -952,9 +962,12 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         assert await worker.run_once() is True
         await wait_for_worker_idle(worker)
 
-        assert restorer.calls == [
-            (run.id, checkpoint.id, "revision-after-tool"),
-        ]
+        assert len(restorer.calls) == 1
+        restored_run, restored_checkpoint, writer_token, restored_revision = restorer.calls[0]
+        assert restored_run == run.id
+        assert restored_checkpoint == checkpoint.id
+        assert writer_token.version == 4
+        assert restored_revision == "revision-after-tool"
         assert len(captured_recovery) == 1
         restored = captured_recovery[0]
         assert len(restored.prior_tool_outcomes) == 1

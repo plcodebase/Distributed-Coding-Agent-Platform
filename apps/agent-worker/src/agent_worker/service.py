@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import timedelta
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from agent_core.loop import Clock
 
 type Sleep = Callable[[float], Awaitable[None]]
+_PhaseResult = TypeVar("_PhaseResult")
 
 
 class WorkerConfig(DomainModel):
@@ -210,18 +211,31 @@ class WorkerService:
                 self._heartbeat_lease(lease, workspace_lease),
                 name=f"agent-heartbeat-{lease.run_id}",
             )
-            recovery = await self._recovery.load(lease)
+            recovery = await self._wait_phase_or_heartbeat(
+                asyncio.create_task(
+                    self._recovery.load(lease),
+                    name=f"agent-recovery-{lease.run_id}",
+                ),
+                heartbeat,
+            )
             if recovery.checkpoint is not None:
-                await self._restorer.restore(
-                    lease,
-                    recovery.checkpoint,
-                    workspace_revision=self._require_restore_revision(recovery),
+                await self._wait_phase_or_heartbeat(
+                    asyncio.create_task(
+                        self._restorer.restore(
+                            lease,
+                            recovery.checkpoint,
+                            writer_lease=workspace_lease,
+                            workspace_revision=self._require_restore_revision(recovery),
+                        ),
+                        name=f"agent-restore-{lease.run_id}",
+                    ),
+                    heartbeat,
                 )
             execution = asyncio.create_task(
-                self._executor.execute(lease, recovery),
+                self._executor.execute(lease, workspace_lease, recovery),
                 name=f"agent-execution-{lease.run_id}",
             )
-            result = await self._wait_execution_or_heartbeat(execution, heartbeat)
+            result = await self._wait_phase_or_heartbeat(execution, heartbeat)
             await self._queue.finish(
                 lease,
                 result,
@@ -233,6 +247,10 @@ class WorkerService:
         except DomainOperationError as error:
             if error.code in {"run_lease_lost", "run_lease_expired"}:
                 await self._executor.cancel(lease)
+                return
+            if error.code == "run_cancellation_requested":
+                await self._executor.cancel(lease)
+                await self._finish_cancelled_if_owned(lease)
                 return
             await self._finish_failure_if_owned(lease, error.error)
         except Exception:
@@ -249,41 +267,40 @@ class WorkerService:
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, DomainOperationError):
                     await heartbeat
             if workspace_lease is not None:
                 with suppress(DomainOperationError):
                     await self._workspace_leases.release(workspace_lease)
 
     @staticmethod
-    async def _wait_execution_or_heartbeat(
-        execution: asyncio.Task[RunExecutionResult],
+    async def _wait_phase_or_heartbeat(
+        operation: asyncio.Task[_PhaseResult],
         heartbeat: asyncio.Task[None],
-    ) -> RunExecutionResult:
+    ) -> _PhaseResult:
         done, _ = await asyncio.wait(
-            {execution, heartbeat},
+            {operation, heartbeat},
             return_when=asyncio.FIRST_COMPLETED,
         )
         if heartbeat in done:
             error = heartbeat.exception()
-            execution.cancel()
+            operation.cancel()
             with suppress(asyncio.CancelledError):
-                await execution
+                await operation
             if error is not None:
                 raise error
             raise DomainOperationError(
                 code="run_lease_lost",
-                message="the lease heartbeat stopped before execution completed",
+                message="the lease heartbeat stopped before the worker phase completed",
                 retryable=True,
             )
-        return execution.result()
+        return operation.result()
 
     async def _heartbeat_lease(
         self,
         lease: RunLease,
         workspace_lease: WorkspaceWriterLease,
     ) -> None:
-        cancellation_sent = False
         current_workspace = workspace_lease
         while True:
             await self._sleep(self._config.heartbeat_seconds)
@@ -292,14 +309,30 @@ class WorkerService:
                 occurred_at=self._clock.now(),
                 lease_duration=self._lease_duration,
             )
+            if heartbeat.cancellation_requested:
+                await self._executor.cancel(lease)
+                raise DomainOperationError(
+                    code="run_cancellation_requested",
+                    message="distributed cancellation was requested for the run",
+                    retryable=False,
+                    details={"run_id": str(lease.run_id)},
+                )
             current_workspace = await self._workspace_leases.heartbeat(
                 current_workspace,
                 occurred_at=self._clock.now(),
                 lease_duration=self._lease_duration,
             )
-            if heartbeat.cancellation_requested and not cancellation_sent:
-                cancellation_sent = True
-                await self._executor.cancel(lease)
+
+    async def _finish_cancelled_if_owned(self, lease: RunLease) -> None:
+        try:
+            await self._queue.finish(
+                lease,
+                RunExecutionResult(status=RunStatus.CANCELLED),
+                occurred_at=self._clock.now(),
+            )
+        except DomainOperationError as finish_error:
+            if finish_error.code not in {"run_lease_lost", "run_lease_expired"}:
+                raise
 
     async def _finish_failure_if_owned(
         self,
@@ -325,6 +358,20 @@ class WorkerService:
             raise DomainOperationError(
                 code="workspace_lease_conflict",
                 message="the claimed run does not own its workspace writer lease",
+                retryable=True,
+                details={"workspace_id": str(run_lease.workspace_id)},
+            )
+        if (
+            workspace_lease.tenant_id != run_lease.tenant_id
+            or workspace_lease.workspace_id != run_lease.workspace_id
+            or workspace_lease.run_id != run_lease.run_id
+            or workspace_lease.worker_id != run_lease.worker_id
+            or workspace_lease.run_lease_token != run_lease.lease_token
+            or workspace_lease.expires_at > run_lease.expires_at
+        ):
+            raise DomainOperationError(
+                code="workspace_lease_invalid",
+                message="the workspace writer lease does not match the active run lease",
                 retryable=True,
                 details={"workspace_id": str(run_lease.workspace_id)},
             )

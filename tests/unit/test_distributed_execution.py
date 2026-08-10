@@ -81,6 +81,21 @@ def run_lease(*, worker_id: str = "worker-1", attempt: int = 1) -> RunLease:
     )
 
 
+def writer_lease(lease: RunLease | None = None) -> WorkspaceWriterLease:
+    active = lease or run_lease()
+    return WorkspaceWriterLease(
+        tenant_id=active.tenant_id,
+        workspace_id=active.workspace_id,
+        run_id=active.run_id,
+        worker_id=active.worker_id,
+        run_lease_token=active.lease_token,
+        lease_token=WORKSPACE_TOKEN,
+        generation=1,
+        acquired_at=active.acquired_at,
+        expires_at=active.expires_at,
+    )
+
+
 def recovery_state(
     *,
     checkpoint: Checkpoint | None = None,
@@ -276,8 +291,12 @@ async def test_agent_loop_executor_idempotently_persists_attempt_events() -> Non
     event_store = MemoryEventStore()
     tool_store = MemoryToolStore()
 
-    def loop_factory(lease: RunLease, recovery: RunRecoveryState) -> AgentLoop:
-        del lease, recovery
+    def loop_factory(
+        lease: RunLease,
+        workspace_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+    ) -> AgentLoop:
+        del lease, workspace_lease, recovery
         return AgentLoop(
             gateway=ScriptedModelGateway((ScriptedGatewayTurn.text("complete"),)),
             tools=ToolRegistry(()),
@@ -290,14 +309,32 @@ async def test_agent_loop_executor_idempotently_persists_attempt_events() -> Non
         events=event_store,
         tool_calls=tool_store,
     )
-    first = await executor.execute(run_lease(), recovery_state())
+    first = await executor.execute(run_lease(), writer_lease(), recovery_state())
     event_count = len(event_store.events)
-    second = await executor.execute(run_lease(), recovery_state())
+    second = await executor.execute(run_lease(), writer_lease(), recovery_state())
 
     assert first.status is RunStatus.COMPLETED
     assert second == first
     assert len(event_store.events) == event_count
     assert set(event_store.events).issuperset({"a1.g1.e1", "a1.g1.e2"})
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executor_rejects_a_mismatched_workspace_fence() -> None:
+    executor = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
+        events=MemoryEventStore(),
+        tool_calls=MemoryToolStore(),
+    )
+
+    with pytest.raises(DomainOperationError) as error:
+        await executor.execute(
+            run_lease(),
+            writer_lease().model_copy(update={"workspace_id": uuid.uuid4()}),
+            recovery_state(),
+        )
+
+    assert error.value.code == "workspace_lease_invalid"
 
 
 @pytest.mark.asyncio
@@ -317,7 +354,7 @@ async def test_agent_loop_executor_uses_later_durable_tool_state_on_replay() -> 
     )
     store = PreloadedToolStore(durable)
     executor = AgentLoopRunExecutor(
-        loop_factory=lambda _lease, _recovery: cast("Any", None),
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
         events=MemoryEventStore(),
         tool_calls=store,
     )
@@ -372,7 +409,7 @@ async def test_agent_loop_executor_persists_waiting_approval_state() -> None:
     argument_hash = canonical_argument_hash(arguments)
     store = MemoryToolStore()
     executor = AgentLoopRunExecutor(
-        loop_factory=lambda _lease, _recovery: cast("Any", None),
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
         events=MemoryEventStore(),
         tool_calls=store,
     )
@@ -554,16 +591,12 @@ class FakeWorkspaceLeases:
         occurred_at: datetime,
         lease_duration: timedelta,
     ) -> WorkspaceWriterLease:
-        return WorkspaceWriterLease(
-            tenant_id=lease.tenant_id,
-            workspace_id=lease.workspace_id,
-            run_id=lease.run_id,
-            worker_id=lease.worker_id,
-            run_lease_token=lease.lease_token,
-            lease_token=WORKSPACE_TOKEN,
-            generation=1,
-            acquired_at=occurred_at,
-            expires_at=occurred_at + lease_duration,
+        acquired = writer_lease(lease)
+        return acquired.model_copy(
+            update={
+                "acquired_at": occurred_at,
+                "expires_at": min(occurred_at + lease_duration, lease.expires_at),
+            }
         )
 
     async def heartbeat(
@@ -589,19 +622,60 @@ class FakeRecovery:
         return self.state
 
 
+class BlockingRecovery(FakeRecovery):
+    def __init__(self, state: RunRecoveryState | None = None) -> None:
+        super().__init__(state)
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def load(self, lease: RunLease) -> RunRecoveryState:
+        del lease
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("blocking recovery unexpectedly resumed")
+
+
 class FakeRestorer:
     def __init__(self) -> None:
-        self.restored: list[tuple[uuid.UUID, str]] = []
+        self.restored: list[tuple[uuid.UUID, uuid.UUID, str]] = []
 
     async def restore(
         self,
         lease: RunLease,
         checkpoint: Checkpoint,
         *,
+        writer_lease: WorkspaceWriterLease,
         workspace_revision: str,
     ) -> None:
         del lease
-        self.restored.append((checkpoint.id, workspace_revision))
+        self.restored.append((checkpoint.id, writer_lease.lease_token, workspace_revision))
+
+
+class BlockingRestorer(FakeRestorer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def restore(
+        self,
+        lease: RunLease,
+        checkpoint: Checkpoint,
+        *,
+        writer_lease: WorkspaceWriterLease,
+        workspace_revision: str,
+    ) -> None:
+        del lease, checkpoint, writer_lease, workspace_revision
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 class FailingFinishQueue(FakeQueue):
@@ -616,17 +690,38 @@ class FailingFinishQueue(FakeQueue):
         raise RuntimeError("durable finish unavailable")
 
 
+class LeaseLosingQueue(FakeQueue):
+    async def heartbeat(
+        self,
+        lease: RunLease,
+        *,
+        occurred_at: datetime,
+        lease_duration: timedelta,
+    ) -> RunLeaseHeartbeat:
+        del lease, occurred_at, lease_duration
+        raise DomainOperationError(
+            code="run_lease_lost",
+            message="the run was reassigned",
+            retryable=True,
+        )
+
+
 class FakeExecutor:
     def __init__(self, result: RunExecutionResult) -> None:
         self.result = result
         self.cancelled = False
+        self.executions = 0
+        self.writer_tokens: list[uuid.UUID] = []
 
     async def execute(
         self,
         lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
     ) -> RunExecutionResult:
         del lease, recovery
+        self.executions += 1
+        self.writer_tokens.append(writer_lease.lease_token)
         return self.result
 
     async def cancel(self, lease: RunLease) -> None:
@@ -638,9 +733,10 @@ class ExplodingExecutor(FakeExecutor):
     async def execute(
         self,
         lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
     ) -> RunExecutionResult:
-        del lease, recovery
+        del lease, writer_lease, recovery
         raise RuntimeError("sensitive implementation detail")
 
 
@@ -653,9 +749,10 @@ class BlockingExecutor:
     async def execute(
         self,
         lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
     ) -> RunExecutionResult:
-        del lease, recovery
+        del lease, writer_lease, recovery
         self.started.set()
         await self.release.wait()
         return RunExecutionResult(status=RunStatus.CANCELLED)
@@ -695,6 +792,7 @@ async def test_worker_claims_restores_completes_and_releases_workspace() -> None
     assert [result.status for result in queue.finished] == [RunStatus.COMPLETED]
     assert workspace.released is True
     assert executor.cancelled is False
+    assert executor.writer_tokens == [WORKSPACE_TOKEN]
 
 
 @pytest.mark.asyncio
@@ -724,7 +822,7 @@ async def test_worker_restores_checkpoint_before_execution() -> None:
     assert await worker.run_once() is True
     await wait_for_idle(worker)
 
-    assert restorer.restored == [(checkpoint.id, "revision-1")]
+    assert restorer.restored == [(checkpoint.id, WORKSPACE_TOKEN, "revision-1")]
 
 
 @pytest.mark.asyncio
@@ -799,6 +897,104 @@ async def test_worker_observes_distributed_cancellation_on_heartbeat() -> None:
     await asyncio.wait_for(wait_for_idle(worker), timeout=2)
 
     assert executor.cancelled is True
+    assert [result.status for result in queue.finished] == [RunStatus.CANCELLED]
+
+
+@pytest.mark.asyncio
+async def test_worker_cancellation_interrupts_recovery_before_execution() -> None:
+    queue = FakeQueue(run_lease())
+    recovery = BlockingRecovery()
+    executor = FakeExecutor(RunExecutionResult(status=RunStatus.COMPLETED))
+    worker = WorkerService(
+        config=WorkerConfig(
+            worker_id="worker-1",
+            lease_seconds=2,
+            heartbeat_seconds=0.2,
+        ),
+        queue=queue,
+        workspace_leases=FakeWorkspaceLeases(),
+        recovery=recovery,
+        restorer=FakeRestorer(),
+        executor=executor,
+        clock=MutableClock(),
+    )
+
+    assert await worker.run_once() is True
+    await asyncio.wait_for(recovery.started.wait(), timeout=1)
+    queue.cancellation_requested = True
+    await asyncio.wait_for(wait_for_idle(worker), timeout=2)
+
+    assert recovery.cancelled is True
+    assert executor.executions == 0
+    assert [result.status for result in queue.finished] == [RunStatus.CANCELLED]
+    assert await worker.run_once() is False
+
+
+@pytest.mark.asyncio
+async def test_worker_lease_loss_interrupts_recovery_without_stale_finish() -> None:
+    queue = LeaseLosingQueue(run_lease())
+    recovery = BlockingRecovery()
+    executor = FakeExecutor(RunExecutionResult(status=RunStatus.COMPLETED))
+    worker = WorkerService(
+        config=WorkerConfig(
+            worker_id="worker-1",
+            lease_seconds=2,
+            heartbeat_seconds=0.2,
+        ),
+        queue=queue,
+        workspace_leases=FakeWorkspaceLeases(),
+        recovery=recovery,
+        restorer=FakeRestorer(),
+        executor=executor,
+        clock=MutableClock(),
+    )
+
+    assert await worker.run_once() is True
+    await asyncio.wait_for(recovery.started.wait(), timeout=1)
+    await asyncio.wait_for(wait_for_idle(worker), timeout=2)
+
+    assert recovery.cancelled is True
+    assert executor.executions == 0
+    assert queue.finished == []
+    assert await worker.run_once() is False
+
+
+@pytest.mark.asyncio
+async def test_worker_cancellation_interrupts_restore_before_execution() -> None:
+    checkpoint = Checkpoint(
+        id=uuid.uuid4(),
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        message_sequence=1,
+        workspace_snapshot_uri="s3://agent-platform/checkpoint",
+        workspace_revision="revision-1",
+        task_plan={},
+        created_at=NOW,
+    )
+    queue = FakeQueue(run_lease())
+    restorer = BlockingRestorer()
+    executor = FakeExecutor(RunExecutionResult(status=RunStatus.COMPLETED))
+    worker = WorkerService(
+        config=WorkerConfig(
+            worker_id="worker-1",
+            lease_seconds=2,
+            heartbeat_seconds=0.2,
+        ),
+        queue=queue,
+        workspace_leases=FakeWorkspaceLeases(),
+        recovery=FakeRecovery(recovery_state(checkpoint=checkpoint)),
+        restorer=restorer,
+        executor=executor,
+        clock=MutableClock(),
+    )
+
+    assert await worker.run_once() is True
+    await asyncio.wait_for(restorer.started.wait(), timeout=1)
+    queue.cancellation_requested = True
+    await asyncio.wait_for(wait_for_idle(worker), timeout=2)
+
+    assert restorer.cancelled is True
+    assert executor.executions == 0
     assert [result.status for result in queue.finished] == [RunStatus.CANCELLED]
 
 

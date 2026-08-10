@@ -24,8 +24,10 @@ work is active. Process presence alone cannot establish ownership.
   - register before polling;
   - stop claiming at its local slot limit;
   - start and heartbeat owned runs and their writer leases;
+  - race recovery loading, workspace restoration, and loop execution against the same
+    run/writer heartbeat;
   - observe the durable cancellation flag on each heartbeat;
-  - cancel active executor work and commit `CANCELLED`;
+  - cancel whichever phase is active and commit `CANCELLED` only while still owned;
   - complete a cancellation already visible at start without creating an execution
     context;
   - surface unrecoverable background-task failures instead of silently discarding task
@@ -39,12 +41,15 @@ work is active. Process presence alone cannot establish ownership.
   fleet so the external supervisor can restart a known state.
 - Keep the worker and scheduler packages dependent only on `agent-core`. Application
   composition injects PostgreSQL, gateway-client, checkpoint, and sandbox adapters.
+- Pass the exact `WorkspaceWriterLease` to restoration, execution, and the agent-loop
+  factory. Validate its tenant/workspace/run/worker/run-token relationship before a
+  workspace phase begins.
 
 ## Consequences
 
 - Loss of process memory does not transfer ownership; only a new database lease can.
-- Cancellation latency is bounded by the heartbeat interval, except cancellation
-  already present at start, which is immediate.
+- Cancellation latency is bounded by the heartbeat interval in recovery, restoration,
+  and execution; cancellation already present at start is immediate.
 - Graceful draining does not abandon already accepted work.
 - A worker heartbeat records liveness and capacity, while run-lease expiry remains the
   correctness signal for recovery. Automatic `OFFLINE` labelling is an observability
@@ -53,8 +58,8 @@ work is active. Process presence alone cannot establish ownership.
 ## Verification
 
 - Unit tests cover registration, slot accounting, heartbeats, cancellation before and
-  during execution, draining/resume, lease loss, background failure propagation, and
-  unsafe configuration.
+  during recovery/restoration/execution, writer-fence propagation, draining/resume,
+  lease loss, background failure propagation, and unsafe configuration.
 - The default local process count is contract-tested as three.
 - Real PostgreSQL tests exercise concurrent worker registrations and claims, stale
   owner rejection, slot return, and a draining worker that cannot claim.

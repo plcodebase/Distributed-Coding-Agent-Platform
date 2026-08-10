@@ -7,8 +7,13 @@ import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from agent_core.distributed import RunExecutionResult, RunLease, RunRecoveryState
-from agent_core.domain.errors import ErrorDetail
+from agent_core.distributed import (
+    RunExecutionResult,
+    RunLease,
+    RunRecoveryState,
+    WorkspaceWriterLease,
+)
+from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import ToolCall
 from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.event_store import EventDraft
@@ -44,7 +49,10 @@ class ToolCallStore(Protocol):
         """Create or advance one logical invocation only for the active run lease."""
 
 
-type AgentLoopFactory = Callable[[RunLease, RunRecoveryState], AgentLoop | Awaitable[AgentLoop]]
+type AgentLoopFactory = Callable[
+    [RunLease, WorkspaceWriterLease, RunRecoveryState],
+    AgentLoop | Awaitable[AgentLoop],
+]
 
 
 @dataclass(slots=True)
@@ -74,8 +82,10 @@ class AgentLoopRunExecutor:
     async def execute(
         self,
         lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
     ) -> RunExecutionResult:
+        self._require_matching_writer(lease, writer_lease)
         current = asyncio.current_task()
         if current is None:
             raise RuntimeError("agent execution requires an asyncio task")
@@ -84,7 +94,7 @@ class AgentLoopRunExecutor:
                 raise RuntimeError("the lease is already executing in this worker")
             self._active[lease.lease_token] = current
         try:
-            loop = self._loop_factory(lease, recovery)
+            loop = self._loop_factory(lease, writer_lease, recovery)
             if inspect.isawaitable(loop):
                 loop = await loop
             if not isinstance(loop, AgentLoop):
@@ -297,6 +307,26 @@ class AgentLoopRunExecutor:
     @staticmethod
     def _delivery_key(lease: RunLease, event: AnyAgentEvent) -> str:
         return f"a{lease.attempt}.g{lease.generation}.e{event.sequence}"
+
+    @staticmethod
+    def _require_matching_writer(
+        lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
+    ) -> None:
+        if (
+            writer_lease.tenant_id != lease.tenant_id
+            or writer_lease.workspace_id != lease.workspace_id
+            or writer_lease.run_id != lease.run_id
+            or writer_lease.worker_id != lease.worker_id
+            or writer_lease.run_lease_token != lease.lease_token
+            or writer_lease.expires_at > lease.expires_at
+        ):
+            raise DomainOperationError(
+                code="workspace_lease_invalid",
+                message="the executor workspace fence does not match the active run lease",
+                retryable=True,
+                details={"workspace_id": str(lease.workspace_id)},
+            )
 
 
 __all__ = ["AgentLoopFactory", "AgentLoopRunExecutor", "ToolCallStore"]

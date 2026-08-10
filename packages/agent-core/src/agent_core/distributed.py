@@ -295,9 +295,10 @@ class WorkspaceRestorer(Protocol):
         lease: RunLease,
         checkpoint: Checkpoint,
         *,
+        writer_lease: WorkspaceWriterLease,
         workspace_revision: str,
     ) -> None:
-        """Restore the selected post-checkpoint workspace revision before execution."""
+        """Restore the selected revision under the exact workspace-writer fence."""
 
 
 class RunExecutor(Protocol):
@@ -306,9 +307,10 @@ class RunExecutor(Protocol):
     async def execute(
         self,
         lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
     ) -> RunExecutionResult:
-        """Execute one attempt and return the state transition to commit."""
+        """Execute one attempt under both run and workspace-writer fences."""
 
     async def cancel(self, lease: RunLease) -> None:
         """Cancel active model/tool/sandbox work for a distributed request."""
