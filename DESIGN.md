@@ -1182,6 +1182,14 @@ workspace writer limit
 * When capacity is exhausted, requests queue or fail predictably rather than causing memory exhaustion.
 * Load-test results are reproducible and stored under `benchmarks/reports`.
 
+Implementation status through Sequence 22: workers enforce independent run and
+sandbox semaphores; PostgreSQL coordinates tenant run quotas, gateway request/token
+leases, global queue admission, and priority-class aging. Live gateway work renews its
+distributed lease, and platform-owned route/admission configuration reconciles under
+durable locks. Queue snapshots expose depth and oldest wait for the future Sequence 25
+metrics layer. Warm pools and reproducible load reports remain assigned to Sequences 27
+and 30.
+
 ---
 
 ## Phase 8 — Context, Memory, and Task Management

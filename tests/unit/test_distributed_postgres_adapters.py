@@ -16,6 +16,7 @@ from agent_core.distributed import (
 )
 from agent_core.domain.errors import DomainOperationError
 from agent_core.domain.status import RunStatus, ToolCallStatus
+from agent_core.scheduling import RunPriorityClass
 from platform_persistence import (
     PostgresRecoveryStore,
     PostgresRunQueue,
@@ -80,6 +81,7 @@ class _Database:
         self.deleted: list[object] = []
         self.flushes = 0
         self.streams: list[_Scalars] = []
+        self.statements: list[object] = []
 
     async def __aenter__(self) -> Self:
         return self
@@ -91,6 +93,7 @@ class _Database:
         return self
 
     async def scalar(self, _statement: object) -> object:
+        self.statements.append(_statement)
         if not self.scalar_values:
             raise AssertionError("unexpected scalar query")
         return self.scalar_values.popleft()
@@ -108,6 +111,7 @@ class _Database:
         return result
 
     async def execute(self, _statement: object) -> object:
+        self.statements.append(_statement)
         if not self.execute_results:
             return _ExecuteResult()
         return self.execute_results.popleft()
@@ -163,7 +167,6 @@ def _quota_row(*, max_active_runs: int = 4) -> SimpleNamespace:
     )
 
 
-
 def _run_row(
     *,
     status: RunStatus = RunStatus.QUEUED,
@@ -180,6 +183,7 @@ def _run_row(
         session_id=SESSION_ID,
         workspace_id=workspace_id,
         status=status.value,
+        priority_class=RunPriorityClass.INTERACTIVE.value,
         priority=7,
         attempt=1,
         lease_generation=0 if status is RunStatus.QUEUED else 1,
@@ -352,6 +356,10 @@ async def test_postgres_queue_claim_start_heartbeat_and_finish() -> None:
     assert queued.status == RunStatus.LEASED.value
     assert worker.available_slots == 1
     assert workspace.lease_token == WORKSPACE_TOKEN
+    claim_sql = str(claim_database.statements[1])
+    assert "CASE" in claim_sql
+    assert "greatest" in claim_sql
+    assert "priority DESC" in claim_sql
 
     started = await queue.start(lease, occurred_at=NOW + timedelta(seconds=1))
     assert started.route_name == "coding-default"
@@ -372,6 +380,8 @@ async def test_postgres_queue_claim_start_heartbeat_and_finish() -> None:
     )
     assert completed.status is RunStatus.COMPLETED
     assert finish_database.deleted == [running_lease_row]
+    assert owned_workspace.lease_token is None
+    assert finishing_worker.available_slots == 2
 
 
 @pytest.mark.asyncio
@@ -418,8 +428,29 @@ async def test_postgres_queue_skips_tenant_at_active_run_quota() -> None:
     assert lease is not None
     assert lease.tenant_id == other_tenant
     assert lease.run_id == other_run.id
-    assert owned_workspace.lease_token is None
-    assert finishing_worker.available_slots == 2
+
+
+@pytest.mark.asyncio
+async def test_postgres_queue_snapshot_reports_class_depth_and_oldest_age() -> None:
+    queue = PostgresRunQueue(
+        _sessions(
+            _Database(
+                scalar_values=[
+                    2,
+                    3,
+                    4,
+                    NOW - timedelta(seconds=45),
+                ]
+            )
+        )
+    )
+
+    snapshot = await queue.snapshot(occurred_at=NOW)
+    assert snapshot.depth.interactive == 2
+    assert snapshot.depth.background == 3
+    assert snapshot.depth.evaluation == 4
+    assert snapshot.depth.total == 9
+    assert snapshot.oldest_age_seconds == 45
 
 
 @pytest.mark.asyncio

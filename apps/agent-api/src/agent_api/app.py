@@ -1,6 +1,7 @@
 """FastAPI control plane for durable sessions, runs, approvals, and events."""
 
 import asyncio
+import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -96,9 +97,7 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         return JSONResponse(
             status_code=_error_status(error),
             content={"error": error.as_dict()},
-            headers=(
-                {"WWW-Authenticate": "Bearer"} if error.code == "authentication_required" else None
-            ),
+            headers=_error_headers(error),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -210,6 +209,7 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             workspace_id=session.workspace_id,
             status=RunStatus.QUEUED,
             priority=body.priority,
+            priority_class=body.priority_class,
             attempt=1,
             created_at=now,
         )
@@ -217,7 +217,10 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             identity.tenant_id,
             run,
             idempotency_key=idempotency_key,
-            creation_hash=run_creation_hash(priority=body.priority),
+            creation_hash=run_creation_hash(
+                priority=body.priority,
+                priority_class=body.priority_class,
+            ),
         )
         return RunCreationResponse(run=result.run, created=result.created)
 
@@ -376,11 +379,31 @@ def _error_status(error: DomainOperationError) -> int:
         return 404
     if error.code.endswith("_conflict") or error.code.endswith("_in_progress"):
         return 409
-    if error.code == "gateway_rate_limited":
+    if error.code in {
+        "gateway_capacity_exhausted",
+        "gateway_rate_limited",
+        "queue_overloaded",
+        "tenant_queue_quota_exceeded",
+    }:
         return 429
     if error.retryable:
         return 503
     return 400
+
+
+def _error_headers(error: DomainOperationError) -> dict[str, str] | None:
+    headers: dict[str, str] = {}
+    if error.code == "authentication_required":
+        headers["WWW-Authenticate"] = "Bearer"
+    retry_after = error.details.get("retry_after_seconds")
+    if (
+        not isinstance(retry_after, bool)
+        and isinstance(retry_after, (int, float))
+        and math.isfinite(retry_after)
+        and retry_after > 0
+    ):
+        headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
+    return headers or None
 
 
 async def _close_event_stream(stream: AsyncIterator[StoredEvent]) -> None:

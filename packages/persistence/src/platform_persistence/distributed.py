@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import math
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
-from sqlalchemy import Text, func, select
+from sqlalchemy import Text, case, func, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
-from agent_core.capacity import TenantQuota
+from agent_core.capacity import QueueDepth, QueueSnapshot, TenantQuota
 from agent_core.distributed import (
     MAX_RECOVERY_STATE_BYTES,
     DurableToolOutcome,
@@ -29,6 +30,7 @@ from agent_core.domain.models import Checkpoint, Run
 from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.domain.transitions import transition_run
 from agent_core.gateway import GatewayMessage
+from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
 from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
@@ -46,7 +48,7 @@ from platform_persistence.repositories import _apply_run, _run_domain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -109,6 +111,7 @@ def _run_lease_domain(
         generation=record.generation,
         attempt=run.attempt,
         priority=run.priority,
+        priority_class=RunPriorityClass(run.priority_class),
         acquired_at=record.acquired_at,
         expires_at=record.expires_at,
         checkpoint_id=run.last_checkpoint_id,
@@ -143,13 +146,15 @@ class PostgresRunQueue:
         *,
         token_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         default_quota: TenantQuota | None = None,
+        admission_policy: QueueAdmissionPolicy | None = None,
     ) -> None:
         if not callable(token_factory):
             raise TypeError("token_factory must be callable")
         self._sessions = sessions
         self._token_factory = token_factory
-
         self._default_quota = default_quota or TenantQuota()
+        self._admission_policy = admission_policy or QueueAdmissionPolicy()
+
     async def register_worker(self, registration: WorkerRegistration) -> WorkerRegistration:
         async with self._sessions() as database, database.begin():
             row = await database.scalar(
@@ -258,7 +263,7 @@ class PostgresRunQueue:
             await database.flush()
             return _worker_domain(row)
 
-    async def claim(
+    async def claim(  # noqa: PLR0915 - one auditable atomic claim transaction
         self,
         worker_id: str,
         *,
@@ -283,6 +288,21 @@ class PostgresRunQueue:
             claimed: tuple[RunRecord, str] | None = None
             workspace_row: WorkspaceLeaseRecord | None = None
             skipped_run_ids: list[uuid.UUID] = []
+            class_rank = case(
+                (RunRecord.priority_class == RunPriorityClass.INTERACTIVE.value, 2),
+                (RunRecord.priority_class == RunPriorityClass.BACKGROUND.value, 1),
+                else_=0,
+            )
+            age_boost = func.greatest(
+                0,
+                func.least(
+                    2,
+                    func.floor(
+                        func.extract("epoch", timestamp - RunRecord.created_at)
+                        / self._admission_policy.priority_aging_seconds
+                    ),
+                ),
+            )
             for _ in range(MAX_CLAIM_CANDIDATES):
                 statement = (
                     select(RunRecord, SessionRecord.model_route)
@@ -303,6 +323,7 @@ class PostgresRunQueue:
                         .exists(),
                     )
                     .order_by(
+                        (class_rank + age_boost).desc(),
                         RunRecord.priority.desc(),
                         RunRecord.created_at,
                         RunRecord.id,
@@ -398,6 +419,53 @@ class PostgresRunQueue:
             worker.available_slots -= 1
             await database.flush()
             return _run_lease_domain(lease_row, run_row, str(route_name))
+
+    async def snapshot(self, *, occurred_at: datetime) -> QueueSnapshot:
+        """Return bounded queue depth and age for admission and later metrics."""
+
+        timestamp = _operation_time(occurred_at, code="queue_snapshot_invalid")
+        statuses = (
+            RunStatus.QUEUED.value,
+            RunStatus.WAITING_APPROVAL.value,
+            RunStatus.RETRY_PENDING.value,
+            RunStatus.LOST.value,
+        )
+        async with self._sessions() as database:
+            counts: dict[RunPriorityClass, int] = {}
+            for priority_class in RunPriorityClass:
+                counts[priority_class] = int(
+                    await database.scalar(
+                        select(func.count())
+                        .select_from(RunRecord)
+                        .where(
+                            RunRecord.status.in_(statuses),
+                            RunRecord.priority_class == priority_class.value,
+                        )
+                    )
+                    or 0
+                )
+            oldest = await database.scalar(
+                select(func.min(RunRecord.created_at)).where(RunRecord.status.in_(statuses))
+            )
+        oldest_age = 0.0
+        if isinstance(oldest, datetime):
+            normalized_oldest = _operation_time(oldest, code="queue_snapshot_invalid")
+            oldest_age = max(0.0, (timestamp - normalized_oldest).total_seconds())
+        elif oldest is not None:
+            raise DomainOperationError(
+                code="queue_snapshot_invalid",
+                message="the queue returned an invalid oldest-run timestamp",
+                retryable=True,
+            )
+        return QueueSnapshot(
+            depth=QueueDepth(
+                interactive=counts[RunPriorityClass.INTERACTIVE],
+                background=counts[RunPriorityClass.BACKGROUND],
+                evaluation=counts[RunPriorityClass.EVALUATION],
+            ),
+            oldest_age_seconds=oldest_age,
+            captured_at=timestamp,
+        )
 
     async def start(self, lease: RunLease, *, occurred_at: datetime) -> RunLease:
         timestamp = _operation_time(occurred_at, code="run_start_invalid")

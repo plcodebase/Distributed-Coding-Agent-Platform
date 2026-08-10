@@ -23,12 +23,15 @@ from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.gateway import (  # noqa: TC001 - Pydantic resolves fields at runtime
     GatewayMessage,
 )
+from agent_core.scheduling import (
+    RunPriorityClass,
+)
 
 if TYPE_CHECKING:
     from datetime import datetime, timedelta
 
-
 MAX_RECOVERY_STATE_BYTES = 16 * 1024 * 1024
+
 
 class WorkerStatus(StrEnum):
     """Scheduler-visible worker lifecycle."""
@@ -75,7 +78,8 @@ class RunLease(DomainModel):
     lease_token: uuid.UUID
     generation: int = Field(ge=1)
     attempt: int = Field(ge=1)
-    priority: int
+    priority: int = Field(ge=-100, le=100)
+    priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
     acquired_at: AwareTimestamp
     expires_at: AwareTimestamp
     checkpoint_id: uuid.UUID | None = None
@@ -323,8 +327,8 @@ class RunExecutor(Protocol):
 
 
 __all__ = [
-    "DurableToolOutcome",
     "MAX_RECOVERY_STATE_BYTES",
+    "DurableToolOutcome",
     "RecoveryStore",
     "RunExecutionResult",
     "RunExecutor",

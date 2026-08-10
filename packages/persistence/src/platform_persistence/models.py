@@ -95,6 +95,11 @@ class RunRecord(Base):
             name="status",
         ),
         CheckConstraint("attempt >= 1", name="attempt"),
+        CheckConstraint("priority >= -100 AND priority <= 100", name="priority"),
+        CheckConstraint(
+            "priority_class IN ('interactive', 'background', 'evaluation')",
+            name="priority_class",
+        ),
         CheckConstraint("lease_generation >= 0", name="lease_generation"),
         CheckConstraint("next_event_sequence >= 1", name="next_event_sequence"),
         CheckConstraint("creation_hash ~ '^[0-9a-f]{64}$'", name="creation_hash"),
@@ -132,6 +137,7 @@ class RunRecord(Base):
         Index(
             "ix_runs_queue_claim",
             "status",
+            "priority_class",
             text("priority DESC"),
             "created_at",
         ),
@@ -142,6 +148,11 @@ class RunRecord(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority_class: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'interactive'"),
+    )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     lease_generation: Mapped[int] = mapped_column(

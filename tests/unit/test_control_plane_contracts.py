@@ -14,11 +14,16 @@ from agent_core.control import (
 )
 from agent_core.domain.base import FrozenJsonObject
 from agent_core.event_store import MAX_EVENT_PAGE_SIZE, EventDraft, EventPage, StoredEvent
+from agent_core.scheduling import RunPriorityClass
 
 
 def test_run_creation_hash_is_canonical_and_payload_sensitive() -> None:
     assert run_creation_hash(priority=0) == run_creation_hash(priority=0)
     assert run_creation_hash(priority=0) != run_creation_hash(priority=1)
+    assert run_creation_hash(priority=0) != run_creation_hash(
+        priority=0,
+        priority_class=RunPriorityClass.BACKGROUND,
+    )
     assert len(run_creation_hash(priority=0)) == 64
 
 

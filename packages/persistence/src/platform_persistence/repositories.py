@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING
+from decimal import Decimal
+from typing import TYPE_CHECKING, cast
 
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
-from agent_core.control import (
 from agent_core.capacity import CapacityScope, TenantQuota
+from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
     IdempotencyKey,
@@ -29,13 +30,15 @@ from agent_core.domain.status import (
     ToolCallStatus,
 )
 from agent_core.domain.transitions import transition_run
+from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
+from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
-from platform_persistence.capacity import ensure_tenant_quota
     ApprovalRecord,
     CheckpointRecord,
     MessageRecord,
     ModelCallRecord,
+    QueueAdmissionRecord,
     RunRecord,
     SessionRecord,
     TaskPlanRecord,
@@ -105,9 +108,9 @@ _TOOL_CALL_PREDECESSORS: dict[ToolCallStatus, frozenset[ToolCallStatus]] = {
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from agent_core.distributed import RunLease
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 class PostgresSessionRepository:
@@ -154,9 +157,11 @@ class PostgresRunRepository:
         sessions: async_sessionmaker[AsyncSession],
         *,
         default_quota: TenantQuota | None = None,
+        admission_policy: QueueAdmissionPolicy | None = None,
     ) -> None:
         self._sessions = sessions
         self._default_quota = default_quota or TenantQuota()
+        self._admission_policy = admission_policy or QueueAdmissionPolicy()
 
     async def create_idempotent(
         self,
@@ -173,7 +178,10 @@ class PostgresRunRepository:
                 code="invalid_run_creation",
                 message="the run idempotency key is invalid",
             ) from None
-        expected_creation_hash = run_creation_hash(priority=run.priority)
+        expected_creation_hash = run_creation_hash(
+            priority=run.priority,
+            priority_class=run.priority_class,
+        )
         if creation_hash != expected_creation_hash:
             raise DomainOperationError(
                 code="invalid_run_creation",
@@ -186,12 +194,44 @@ class PostgresRunRepository:
             creation_hash=creation_hash,
         )
         async with self._sessions() as database, database.begin():
+            existing = await self._creation_record(
+                database,
+                tenant_id,
+                run.session_id,
+                idempotency_key,
+                lock=True,
+            )
+            if existing is not None:
+                return self._existing_creation(
+                    existing,
+                    run=run,
+                    idempotency_key=idempotency_key,
+                    creation_hash=creation_hash,
+                )
             quota = await ensure_tenant_quota(
                 database,
                 tenant_id,
                 default=self._default_quota,
                 occurred_at=run.created_at,
                 lock=True,
+            )
+            existing = await self._creation_record(
+                database,
+                tenant_id,
+                run.session_id,
+                idempotency_key,
+                lock=True,
+            )
+            if existing is not None:
+                return self._existing_creation(
+                    existing,
+                    run=run,
+                    idempotency_key=idempotency_key,
+                    creation_hash=creation_hash,
+                )
+            admission = await self._queue_admission(
+                database,
+                occurred_at=run.created_at,
             )
             queued_count = int(
                 await database.scalar(
@@ -222,6 +262,34 @@ class PostgresRunRepository:
                         "retry_after_seconds": 1.0,
                     },
                 )
+            global_queued_count = int(
+                await database.scalar(
+                    select(func.count())
+                    .select_from(RunRecord)
+                    .where(
+                        RunRecord.status.in_(
+                            (
+                                RunStatus.QUEUED.value,
+                                RunStatus.WAITING_APPROVAL.value,
+                                RunStatus.RETRY_PENDING.value,
+                                RunStatus.LOST.value,
+                            )
+                        )
+                    )
+                )
+                or 0
+            )
+            if global_queued_count >= admission.global_queue_limit:
+                raise DomainOperationError(
+                    code="queue_overloaded",
+                    message="the global run queue has reached its admission threshold",
+                    retryable=True,
+                    details={
+                        "limit": admission.global_queue_limit,
+                        "scope": CapacityScope.GLOBAL_QUEUE.value,
+                        "retry_after_seconds": float(admission.retry_after_seconds),
+                    },
+                )
             inserted = await database.scalar(
                 insert(RunRecord)
                 .values(**values)
@@ -236,25 +304,96 @@ class PostgresRunRepository:
             )
             if inserted is not None:
                 return RunCreationResult(run=run, created=True)
-            existing = await database.scalar(
-                select(RunRecord).where(
-                    RunRecord.tenant_id == tenant_id,
-                    RunRecord.session_id == run.session_id,
-                    RunRecord.idempotency_key == idempotency_key,
-                )
+            existing = await self._creation_record(
+                database,
+                tenant_id,
+                run.session_id,
+                idempotency_key,
+                lock=False,
             )
             if existing is None:
                 raise _persistence_conflict("run creation lost its idempotency record")
-            if existing.creation_hash != creation_hash:
+            return self._existing_creation(
+                existing,
+                run=run,
+                idempotency_key=idempotency_key,
+                creation_hash=creation_hash,
+            )
+
+    @staticmethod
+    async def _creation_record(
+        database: AsyncSession,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        idempotency_key: str,
+        *,
+        lock: bool,
+    ) -> RunRecord | None:
+        statement = select(RunRecord).where(
+            RunRecord.tenant_id == tenant_id,
+            RunRecord.session_id == session_id,
+            RunRecord.idempotency_key == idempotency_key,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return cast("RunRecord | None", await database.scalar(statement))
+
+    @staticmethod
+    def _existing_creation(
+        existing: RunRecord,
+        *,
+        run: Run,
+        idempotency_key: str,
+        creation_hash: str,
+    ) -> RunCreationResult:
+        if existing.creation_hash != creation_hash:
+            raise DomainOperationError(
+                code="run_idempotency_conflict",
+                message="the idempotency key belongs to a different run payload",
+                details={
+                    "idempotency_key": idempotency_key,
+                    "session_id": str(run.session_id),
+                },
+            )
+        return RunCreationResult(run=_run_domain(existing), created=False)
+
+    async def _queue_admission(
+        self,
+        database: AsyncSession,
+        *,
+        occurred_at: datetime,
+    ) -> QueueAdmissionRecord:
+        await database.execute(
+            insert(QueueAdmissionRecord)
+            .values(
+                id=1,
+                global_queue_limit=self._admission_policy.global_queue_limit,
+                retry_after_seconds=Decimal(str(self._admission_policy.retry_after_seconds)),
+                created_at=occurred_at,
+                updated_at=occurred_at,
+            )
+            .on_conflict_do_nothing(index_elements=(QueueAdmissionRecord.id,))
+        )
+        row = await database.scalar(
+            select(QueueAdmissionRecord).where(QueueAdmissionRecord.id == 1).with_for_update()
+        )
+        if row is None:
+            raise RuntimeError("queue admission row disappeared")
+        configured_retry = Decimal(str(self._admission_policy.retry_after_seconds))
+        if (
+            row.global_queue_limit != self._admission_policy.global_queue_limit
+            or row.retry_after_seconds != configured_retry
+        ):
+            if occurred_at < row.updated_at:
                 raise DomainOperationError(
-                    code="run_idempotency_conflict",
-                    message="the idempotency key belongs to a different run payload",
-                    details={
-                        "idempotency_key": idempotency_key,
-                        "session_id": str(run.session_id),
-                    },
+                    code="queue_admission_clock_invalid",
+                    message="queue admission configuration time may not move backward",
+                    retryable=True,
                 )
-            return RunCreationResult(run=_run_domain(existing), created=False)
+            row.global_queue_limit = self._admission_policy.global_queue_limit
+            row.retry_after_seconds = configured_retry
+            row.updated_at = occurred_at
+        return row
 
     async def get(self, tenant_id: uuid.UUID, run_id: uuid.UUID) -> Run | None:
         async with self._sessions() as database:
@@ -674,6 +813,7 @@ def _run_values(
         "session_id": run.session_id,
         "workspace_id": run.workspace_id,
         "status": run.status.value,
+        "priority_class": run.priority_class.value,
         "priority": run.priority,
         "attempt": run.attempt,
         "assigned_worker_id": run.assigned_worker_id,
@@ -694,6 +834,7 @@ def _run_domain(record: RunRecord) -> Run:
         session_id=record.session_id,
         workspace_id=record.workspace_id,
         status=RunStatus(record.status),
+        priority_class=RunPriorityClass(record.priority_class),
         priority=record.priority,
         attempt=record.attempt,
         assigned_worker_id=record.assigned_worker_id,

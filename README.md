@@ -363,6 +363,14 @@ and structured capacity errors. Platform-owned route settings reconcile after re
 All admission state is injected behind typed interfaces; no process-local fallback is
 used in production composition.
 
+### Sequence 22: backpressure and priority scheduling
+
+Sequence 22 adds interactive, background, and evaluation priority classes; bounded
+aging in atomic `SKIP LOCKED` queue claims; serialized global queue admission; HTTP 429
+responses with `Retry-After`; and bounded queue snapshots containing class depth and
+oldest wait. Global admission settings reconcile under the singleton lock. Worker
+claims stop at configured capacity instead of accumulating unbounded in-process work.
+
 ## Local setup
 
 ```shell

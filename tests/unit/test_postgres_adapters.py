@@ -38,6 +38,7 @@ from agent_core.domain.status import (
 from agent_core.event_store import MIN_EVENT_PAGE_BYTES, EventDraft, EventPage, StoredEvent
 from agent_core.gateway import GatewayFinishReason, GatewayResponseCompleted, GatewayTextDelta
 from agent_core.gateway_reliability import GatewayRequestClaimStatus
+from agent_core.scheduling import QueueAdmissionPolicy
 from event_store import PostgresEventStore
 from platform_persistence import (
     PostgresApprovalRepository,
@@ -202,6 +203,7 @@ def _run_row(run: Run, *, creation_hash: str | None = None) -> SimpleNamespace:
         session_id=run.session_id,
         workspace_id=run.workspace_id,
         status=run.status.value,
+        priority_class=run.priority_class.value,
         priority=run.priority,
         attempt=run.attempt,
         assigned_worker_id=run.assigned_worker_id,
@@ -209,7 +211,11 @@ def _run_row(run: Run, *, creation_hash: str | None = None) -> SimpleNamespace:
         last_checkpoint_id=run.last_checkpoint_id,
         cancellation_requested=run.cancellation_requested,
         idempotency_key="request-1",
-        creation_hash=creation_hash or run_creation_hash(priority=run.priority),
+        creation_hash=creation_hash
+        or run_creation_hash(
+            priority=run.priority,
+            priority_class=run.priority_class,
+        ),
         created_at=run.created_at,
         started_at=run.started_at,
         completed_at=run.completed_at,
@@ -886,12 +892,28 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
     completed_row = _run_row(_run(status=RunStatus.COMPLETED, run_id=uuid.uuid4()))
     rewind_row = _run_row(_run(run_id=uuid.uuid4()))
     checkpoint_id = uuid.uuid4()
+    quota_row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=4,
+        max_queued_runs=100,
+        max_gateway_requests=4,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    admission_row = SimpleNamespace(
+        id=1,
+        global_queue_limit=11,
+        retry_after_seconds=Decimal("9.000"),
+        created_at=NOW,
+        updated_at=NOW,
+    )
     repository = PostgresRunRepository(
         _sessions(
-            _FakeDatabase(scalars=[run.id]),
-            _FakeDatabase(scalars=[None, replay_row]),
-            _FakeDatabase(scalars=[None, conflict_row]),
-            _FakeDatabase(scalars=[None, None]),
+            _FakeDatabase(scalars=[None, quota_row, None, admission_row, 0, 0, run.id]),
+            _FakeDatabase(scalars=[replay_row]),
+            _FakeDatabase(scalars=[conflict_row]),
+            _FakeDatabase(scalars=[None, quota_row, None, admission_row, 0, 0, None, None]),
             _FakeDatabase(scalars=[transition_row]),
             _FakeDatabase(scalars=[None]),
             _FakeDatabase(scalars=[cancel_row]),
@@ -910,6 +932,8 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
         creation_hash=creation_hash,
     )
     assert created.created is True and created.run == run
+    assert admission_row.global_queue_limit == 10_000
+    assert admission_row.retry_after_seconds == Decimal("1.0")
     replay = await repository.create_idempotent(
         TENANT_ID,
         run,
@@ -977,6 +1001,123 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
     assert rewound is not None and rewound.last_checkpoint_id == checkpoint_id
     assert await repository.rewind(TENANT_ID, rewind_row.id, checkpoint_id) is None
     assert await repository.rewind(TENANT_ID, rewind_row.id, checkpoint_id) is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_run_repository_rejects_new_work_at_tenant_queue_quota() -> None:
+    run = _run()
+    quota_row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=1,
+        max_queued_runs=1,
+        max_gateway_requests=1,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    admission_row = SimpleNamespace(
+        id=1,
+        global_queue_limit=10_000,
+        retry_after_seconds=Decimal("1.000"),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository = PostgresRunRepository(
+        _sessions(_FakeDatabase(scalars=[None, quota_row, None, admission_row, 1]))
+    )
+
+    with pytest.raises(DomainOperationError) as rejected:
+        await repository.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key="queue-full-1",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+    assert rejected.value.code == "tenant_queue_quota_exceeded"
+    assert rejected.value.retryable is True
+    assert rejected.value.details["scope"] == "tenant_queued_runs"
+
+
+@pytest.mark.asyncio
+async def test_postgres_run_repository_rejects_global_overload_after_tenant_admission() -> None:
+    run = _run()
+    quota_row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=1,
+        max_queued_runs=10,
+        max_gateway_requests=1,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    admission_row = SimpleNamespace(
+        id=1,
+        global_queue_limit=1,
+        retry_after_seconds=Decimal("2.250"),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository = PostgresRunRepository(
+        _sessions(_FakeDatabase(scalars=[None, quota_row, None, admission_row, 0, 1])),
+        admission_policy=QueueAdmissionPolicy(
+            global_queue_limit=1,
+            retry_after_seconds=2.25,
+        ),
+    )
+
+    with pytest.raises(DomainOperationError) as rejected:
+        await repository.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key="globally-full-1",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+    assert rejected.value.code == "queue_overloaded"
+    assert rejected.value.details["retry_after_seconds"] == 2.25
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_allows_historical_work_but_rejects_stale_reconfiguration() -> None:
+    run = _run()
+    quota_row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=4,
+        max_queued_runs=100,
+        max_gateway_requests=4,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    current = SimpleNamespace(
+        id=1,
+        global_queue_limit=10_000,
+        retry_after_seconds=Decimal("1.000"),
+        created_at=NOW,
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    repository = PostgresRunRepository(
+        _sessions(_FakeDatabase(scalars=[None, quota_row, None, current, 0, 0, run.id]))
+    )
+    created = await repository.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key="historical-run",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    assert created.created is True
+
+    stale = SimpleNamespace(**vars(current))
+    stale.global_queue_limit = 99
+    with pytest.raises(DomainOperationError) as rejected:
+        await PostgresRunRepository(
+            _sessions(_FakeDatabase(scalars=[None, quota_row, None, stale])),
+        ).create_idempotent(
+            TENANT_ID,
+            _run(run_id=uuid.uuid4()),
+            idempotency_key="stale-config",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+    assert rejected.value.code == "queue_admission_clock_invalid"
 
 
 @pytest.mark.asyncio

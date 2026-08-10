@@ -31,19 +31,28 @@ EXPECTED_TABLES = {
     "approvals",
     "checkpoints",
     "gateway_requests",
+    "gateway_capacity_leases",
+    "gateway_provider_capacity",
     "gateway_rate_limits",
     "gateway_circuits",
     "messages",
     "model_calls",
+    "queue_admission",
     "runs",
     "run_leases",
     "sessions",
     "task_plans",
+    "tenant_quotas",
     "tool_calls",
     "workers",
     "workspace_writer_leases",
 }
-TENANT_OWNED_TABLES = EXPECTED_TABLES - {"gateway_circuits", "workers"}
+TENANT_OWNED_TABLES = EXPECTED_TABLES - {
+    "gateway_circuits",
+    "gateway_provider_capacity",
+    "queue_admission",
+    "workers",
+}
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -197,6 +206,26 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
         "ck_tool_calls_terminal_outcome",
     ):
         assert required in distributed_migration
+
+    migration_requirements = {
+        "0003_bounded_capacity_and_quotas.py": (
+            'revision: str = "0003"',
+            'down_revision: str | None = "0002"',
+            "tenant_quotas",
+            "gateway_capacity_leases",
+        ),
+        "0004_backpressure_and_priority.py": (
+            'revision: str = "0004"',
+            'down_revision: str | None = "0003"',
+            "priority_class",
+            "queue_admission",
+        ),
+    }
+    migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"
+    for filename, required_values in migration_requirements.items():
+        content = (migration_root / filename).read_text(encoding="utf-8")
+        for required in required_values:
+            assert required in content
 
 
 def test_database_settings_are_closed_bounded_and_secret_safe() -> None:

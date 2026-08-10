@@ -19,6 +19,7 @@ from agent_core.domain.status import (
     SessionStatus,
     ToolCallStatus,
 )
+from agent_core.scheduling import RunPriorityClass
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -101,7 +102,8 @@ class Run(DomainModel):
     session_id: uuid.UUID
     workspace_id: uuid.UUID
     status: RunStatus
-    priority: int
+    priority: int = Field(ge=-100, le=100)
+    priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
     attempt: int = Field(ge=1)
     assigned_worker_id: IdentifierString | None = None
     lease_expires_at: AwareTimestamp | None = None

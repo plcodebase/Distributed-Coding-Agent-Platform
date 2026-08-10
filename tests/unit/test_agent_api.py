@@ -353,12 +353,12 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     first = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers=headers,
-        json={"priority": 7},
+        json={"priority": 7, "priority_class": "background"},
     )
     second = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers=headers,
-        json={"priority": 7},
+        json={"priority": 7, "priority_class": "background"},
     )
     conflict = client.post(
         f"/v1/sessions/{session_id}/runs",
@@ -368,6 +368,7 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
 
     assert first.status_code == 200
     assert first.json()["created"] is True
+    assert first.json()["run"]["priority_class"] == "background"
     assert second.json()["created"] is False
     assert second.json()["run"]["id"] == first.json()["run"]["id"]
     assert conflict.status_code == 409

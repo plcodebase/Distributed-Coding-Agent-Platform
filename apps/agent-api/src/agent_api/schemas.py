@@ -12,6 +12,7 @@ from agent_core.domain.base import DomainModel, FrozenJsonObject
 from agent_core.domain.models import Run, Session
 from agent_core.domain.status import ApprovalMode
 from agent_core.event_store import MAX_EVENT_PAGE_SIZE, StoredEvent
+from agent_core.scheduling import RunPriorityClass
 
 type ModelRoute = Annotated[
     str,
@@ -31,6 +32,7 @@ class CreateSessionRequest(DomainModel):
 
 class CreateRunRequest(DomainModel):
     priority: int = Field(default=0, ge=-100, le=100)
+    priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
 
 
 class RunCreationResponse(DomainModel):

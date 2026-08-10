@@ -11,6 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from agent_api.app import create_app
 from agent_api.auth import Principal, StaticTokenAuthenticator
 from agent_api.dependencies import ApiServices
+from agent_core.capacity import TenantQuota
+from agent_core.scheduling import QueueAdmissionPolicy
 from event_store import PostgresEventStore
 from platform_persistence import (
     Database,
@@ -43,6 +45,11 @@ class AgentApiSettings(BaseSettings):
     api_credentials_json: SecretStr = Field(
         description="JSON map from bearer tokens to tenant_id and subject"
     )
+    tenant_active_run_limit: int = Field(default=4, ge=1, le=10_000)
+    tenant_queued_run_limit: int = Field(default=100, ge=1, le=100_000)
+    tenant_gateway_request_limit: int = Field(default=4, ge=1, le=10_000)
+    global_queue_limit: int = Field(default=10_000, ge=1, le=1_000_000)
+    overload_retry_after_seconds: float = Field(default=1, gt=0, le=3600)
 
 
 def create_production_app(
@@ -55,8 +62,20 @@ def create_production_app(
     resolved_api = api_settings or AgentApiSettings()
     authenticator = StaticTokenAuthenticator(_credentials(resolved_api))
     database = Database(database_settings or DatabaseSettings())
+    default_quota = TenantQuota(
+        max_active_runs=resolved_api.tenant_active_run_limit,
+        max_queued_runs=resolved_api.tenant_queued_run_limit,
+        max_gateway_requests=resolved_api.tenant_gateway_request_limit,
+    )
     sessions = PostgresSessionRepository(database.sessions)
-    runs = PostgresRunRepository(database.sessions)
+    runs = PostgresRunRepository(
+        database.sessions,
+        default_quota=default_quota,
+        admission_policy=QueueAdmissionPolicy(
+            global_queue_limit=resolved_api.global_queue_limit,
+            retry_after_seconds=resolved_api.overload_retry_after_seconds,
+        ),
+    )
     approvals = PostgresApprovalRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
     services = ApiServices(

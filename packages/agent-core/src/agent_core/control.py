@@ -13,6 +13,7 @@ from pydantic import Field, StringConstraints, model_validator
 from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject
 from agent_core.domain.models import Run  # noqa: TC001 - Pydantic resolves run at runtime
 from agent_core.gateway import MessageRole  # noqa: TC001 - Pydantic resolves role at runtime
+from agent_core.scheduling import RunPriorityClass
 
 type IdempotencyKey = Annotated[
     str,
@@ -97,11 +98,15 @@ class PersistedTaskPlan(DomainModel):
     created_at: AwareTimestamp
 
 
-def run_creation_hash(*, priority: int) -> str:
+def run_creation_hash(
+    *,
+    priority: int,
+    priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE,
+) -> str:
     """Return the canonical payload identity for API run idempotency."""
 
     encoded = json.dumps(
-        {"priority": priority},
+        {"priority": priority, "priority_class": priority_class.value},
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,

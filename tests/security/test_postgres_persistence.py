@@ -592,6 +592,12 @@ async def test_three_workers_claim_distinct_runs_without_overlap(
             occurred_at=now + timedelta(seconds=32),
             limit=10,
         )
+        for created_run in created_runs:
+            await runs.request_cancel(
+                TENANT_ID,
+                created_run.id,
+                occurred_at=now + timedelta(seconds=33),
+            )
         await database.aclose()
 
 
@@ -609,7 +615,7 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
     now = datetime.now(UTC)
     session = _session(now)
     await sessions.create(session)
-    primary = _run(session, now).model_copy(update={"priority": 1000})
+    primary = _run(session, now).model_copy(update={"priority": 100})
     waiting = _run(session, now + timedelta(microseconds=1))
     for run in (primary, waiting):
         await runs.create_idempotent(

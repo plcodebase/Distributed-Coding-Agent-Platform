@@ -109,6 +109,7 @@ from agent_core.sandbox import (
     Sandbox,
     WorkspaceSnapshot,
 )
+from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
 from agent_core.settings import PlatformSettings
 from agent_core.tools import (
     PreparedToolExecution,
@@ -191,6 +192,7 @@ __all__ = [
     "PersistedMessage",
     "PersistedTaskPlan",
     "PlatformSettings",
+    "QueueAdmissionPolicy",
     "PreparedToolExecution",
     "RecoveryStore",
     "RegisteredTool",
@@ -201,6 +203,7 @@ __all__ = [
     "RunExecutor",
     "RunLease",
     "RunLeaseHeartbeat",
+    "RunPriorityClass",
     "RunQueue",
     "RunRecoveryState",
     "RunStatus",
