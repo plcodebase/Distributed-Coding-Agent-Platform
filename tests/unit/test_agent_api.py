@@ -23,9 +23,14 @@ from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
     ContextCompactionStatus,
+    MemoryKind,
     PersistedApproval,
     PersistedContextCompaction,
+    PersistedMemory,
+    PersistedTaskState,
     RunCreationResult,
+    TaskPlanUpdate,
+    memory_content_hash,
 )
 from agent_core.domain.base import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError
@@ -333,6 +338,95 @@ class ContextRepositoryFake:
         )
 
 
+class TaskRepositoryFake:
+    def __init__(self) -> None:
+        self.values: dict[tuple[uuid.UUID, uuid.UUID], PersistedTaskState] = {}
+
+    async def get(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+    ) -> PersistedTaskState | None:
+        return self.values.get((tenant_id, run_id))
+
+    async def update(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        update: TaskPlanUpdate,
+        *,
+        plan_id: uuid.UUID,
+        created_at: datetime,
+    ) -> PersistedTaskState | None:
+        current = self.values.get((tenant_id, run_id))
+        version = current.version if current is not None else 0
+        if version != update.expected_version:
+            raise DomainOperationError(
+                code="task_plan_version_conflict",
+                message="the task plan changed since it was read",
+            )
+        state = PersistedTaskState(
+            id=plan_id,
+            run_id=run_id,
+            version=version + 1,
+            tasks=update.tasks,
+            created_at=created_at,
+        )
+        self.values[(tenant_id, run_id)] = state
+        return state
+
+
+class MemoryRepositoryFake:
+    def __init__(self, sessions: SessionRepositoryFake) -> None:
+        self.sessions = sessions
+        self.values: dict[tuple[uuid.UUID, uuid.UUID], tuple[PersistedMemory, ...]] = {}
+
+    async def set_session_enabled(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        enabled: bool,
+        updated_at: datetime,
+    ) -> bool:
+        session = await self.sessions.get(tenant_id, session_id)
+        if session is None:
+            return False
+        self.sessions.values[(tenant_id, session_id)] = session.model_copy(
+            update={"memory_enabled": enabled, "updated_at": updated_at}
+        )
+        return True
+
+    async def list_active(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        limit: int = 100,
+    ) -> tuple[PersistedMemory, ...]:
+        session = await self.sessions.get(tenant_id, session_id)
+        if session is None or not session.memory_enabled:
+            return ()
+        return self.values.get((tenant_id, session_id), ())[:limit]
+
+    async def archive(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        *,
+        archived_at: datetime,
+    ) -> PersistedMemory | None:
+        key = (tenant_id, session_id)
+        values = self.values.get(key, ())
+        for index, memory in enumerate(values):
+            if memory.id == memory_id and memory.archived_at is None:
+                archived = memory.model_copy(update={"archived_at": archived_at})
+                self.values[key] = (*values[:index], archived, *values[index + 1 :])
+                return archived
+        return None
+
+
 def services() -> tuple[ApiServices, SessionRepositoryFake, RunRepositoryFake, EventStoreFake]:
     sessions = SessionRepositoryFake()
     runs = RunRepositoryFake()
@@ -351,6 +445,8 @@ def services() -> tuple[ApiServices, SessionRepositoryFake, RunRepositoryFake, E
             events=events,
             readiness=ReadinessFake(),
             context=ContextRepositoryFake(),
+            tasks=TaskRepositoryFake(),
+            memories=MemoryRepositoryFake(sessions),
         ),
         sessions,
         runs,
@@ -492,13 +588,13 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     assert inactive.json()["error"]["code"] == "session_state_conflict"
 
 
-def test_compaction_operations_are_durable_and_tenant_scoped() -> None:
+def test_compact_task_status_and_memory_operations_are_durable_and_tenant_scoped() -> None:
     api_services, _, _, _ = services()
     client = TestClient(create_app(api_services))
     session = client.post(
         "/v1/sessions",
         headers=authorization(),
-        json={"workspace_id": str(WORKSPACE_ID)},
+        json={"workspace_id": str(WORKSPACE_ID), "memory_enabled": True},
     ).json()
     session_id = uuid.UUID(session["id"])
     compact_headers = {**authorization(), "Idempotency-Key": "compact-1"}
@@ -535,6 +631,77 @@ def test_compaction_operations_are_durable_and_tenant_scoped() -> None:
     )
     assert compaction_status.json()["id"] == first_compaction.json()["id"]
     assert hidden_compaction.status_code == 404
+
+    run = client.post(
+        f"/v1/sessions/{session_id}/runs",
+        headers={**authorization(), "Idempotency-Key": "task-run"},
+        json={},
+    ).json()["run"]
+    run_id = uuid.UUID(run["id"])
+    plan = client.put(
+        f"/v1/runs/{run_id}/task-plan",
+        headers=authorization(),
+        json={
+            "expected_version": 0,
+            "tasks": [
+                {
+                    "id": "task-1",
+                    "title": "Finish context persistence",
+                    "status": "in_progress",
+                }
+            ],
+        },
+    )
+    stale = client.put(
+        f"/v1/runs/{run_id}/task-plan",
+        headers=authorization(),
+        json={"expected_version": 0, "tasks": []},
+    )
+    status = client.get(f"/v1/runs/{run_id}/status", headers=authorization())
+    assert plan.status_code == 200
+    assert plan.json()["version"] == 1
+    assert stale.status_code == 409
+    assert status.json()["task_plan"]["tasks"][0]["id"] == "task-1"
+
+    memories = cast("MemoryRepositoryFake", api_services.memories)
+    memory = PersistedMemory(
+        id=uuid.uuid4(),
+        tenant_id=TENANT_A,
+        session_id=session_id,
+        source_run_id=run_id,
+        kind=MemoryKind.DECISION,
+        content="Use the bounded context pipeline.",
+        content_hash=memory_content_hash("Use the bounded context pipeline."),
+        extracted_at=datetime.now(UTC),
+    )
+    memories.values[(TENANT_A, session_id)] = (memory,)
+    listed = client.get(f"/v1/sessions/{session_id}/memories", headers=authorization())
+    denied_archive = client.delete(
+        f"/v1/sessions/{session_id}/memories/{memory.id}",
+        headers=authorization("token-b"),
+    )
+    archived = client.delete(
+        f"/v1/sessions/{session_id}/memories/{memory.id}",
+        headers=authorization(),
+    )
+    archived_replay = client.delete(
+        f"/v1/sessions/{session_id}/memories/{memory.id}",
+        headers=authorization(),
+    )
+    disabled = client.patch(
+        f"/v1/sessions/{session_id}/memory",
+        headers=authorization(),
+        json={"enabled": False},
+    )
+    hidden = client.get(f"/v1/sessions/{session_id}/memories", headers=authorization())
+    assert listed.json()["memories"][0]["source_run_id"] == str(run_id)
+    assert denied_archive.status_code == 404
+    assert archived.status_code == 200
+    assert archived.json()["archived_at"] is not None
+    assert archived_replay.status_code == 404
+    assert disabled.json()["memory_enabled"] is False
+    assert hidden.json()["memories"] == []
+
 
 def test_run_overload_response_is_structured_and_retryable() -> None:
     api_services, sessions, _, _ = services()

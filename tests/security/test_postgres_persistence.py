@@ -23,9 +23,14 @@ from sqlalchemy.exc import IntegrityError
 from agent_api.factory import AgentApiSettings, create_production_app
 from agent_core.control import (
     ApprovalStatus,
+    MemoryExtractionStatus,
+    MemoryKind,
     PersistedApproval,
+    PersistedMemory,
     PersistedMessage,
     PersistedTaskPlan,
+    TaskPlanUpdate,
+    memory_content_hash,
 )
 from agent_core.distributed import (
     RunExecutionResult,
@@ -81,14 +86,17 @@ from gateway_client import GatewayRequestClaimStatus
 from platform_persistence import (
     Database,
     DatabaseSettings,
+    PostgresContextRepository,
     PostgresExecutionRepository,
     PostgresGatewayCircuitBreaker,
     PostgresGatewayRateLimiter,
     PostgresGatewayRequestStore,
+    PostgresMemoryRepository,
     PostgresRecoveryStore,
     PostgresRunQueue,
     PostgresRunRepository,
     PostgresSessionRepository,
+    PostgresTaskRepository,
     PostgresWorkspaceLeaseStore,
     run_creation_hash,
 )
@@ -96,6 +104,8 @@ from platform_persistence.models import (
     AgentEventRecord,
     ApprovalRecord,
     CheckpointRecord,
+    MemoryExtractionJobRecord,
+    MemoryRecord,
     MessageRecord,
     ModelCallRecord,
     RunRecord,
@@ -765,15 +775,58 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         assert completed.status is RunStatus.COMPLETED
         assert completed.attempt == 2
 
+        memories = PostgresMemoryRepository(database.sessions)
+        memory_job = await memories.claim_pending(
+            worker_id="memory-scheduler-a",
+            occurred_at=now + timedelta(seconds=20),
+            lease_duration=timedelta(seconds=30),
+        )
+        assert memory_job is not None
+        assert memory_job.run_id == primary.id
+        assert memory_job.status is MemoryExtractionStatus.RUNNING
+        assert memory_job.lease_generation == 1
+        source = await memories.source_for_job(memory_job, max_bytes=4096)
+        assert "recover this run" in source
+        memory_content = "The recovered run keeps one durable decision."
+        duplicate_memories = tuple(
+            PersistedMemory(
+                id=uuid.uuid4(),
+                tenant_id=TENANT_ID,
+                session_id=session.id,
+                source_run_id=primary.id,
+                kind=MemoryKind.DECISION,
+                content=memory_content,
+                content_hash=memory_content_hash(memory_content),
+                extracted_at=now + timedelta(seconds=21),
+            )
+            for _ in range(2)
+        )
+        finished_job = await memories.complete(
+            memory_job,
+            duplicate_memories,
+            completed_at=now + timedelta(seconds=22),
+        )
+        assert finished_job.status is MemoryExtractionStatus.COMPLETED
+        active_memories = await memories.list_active(TENANT_ID, session.id)
+        assert len(active_memories) == 1
+        archived_memory = await memories.archive(
+            TENANT_ID,
+            session.id,
+            active_memories[0].id,
+            archived_at=now + timedelta(seconds=23),
+        )
+        assert archived_memory is not None and archived_memory.archived_at is not None
+        assert await memories.list_active(TENANT_ID, session.id) == ()
+
         await queue.set_worker_draining(
             "worker-c",
             draining=True,
-            occurred_at=now + timedelta(seconds=20),
+            occurred_at=now + timedelta(seconds=24),
         )
         assert (
             await queue.claim(
                 "worker-c",
-                occurred_at=now + timedelta(seconds=20),
+                occurred_at=now + timedelta(seconds=24),
                 lease_duration=timedelta(seconds=10),
             )
             is None
@@ -1267,6 +1320,230 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
             ]
         assert counts == [1, 1, 1, 1, 1, 1]
     finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_context_task_and_memory_state_survives_postgresql_recomposition(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    context = PostgresContextRepository(database.sessions)
+    tasks = PostgresTaskRepository(database.sessions)
+    memories = PostgresMemoryRepository(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    run = _run(session, now)
+    await sessions.create(session)
+    await runs.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key=f"phase-eight-{run.id}",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    await execution.append_message(
+        TENANT_ID,
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=run.id,
+            sequence=1,
+            role=MessageRole.USER,
+            content="Preserve this durable source message.",
+            created_at=now,
+        ),
+    )
+    try:
+        compaction_id = uuid.uuid4()
+        requested = await context.request_compaction(
+            TENANT_ID,
+            session.id,
+            compaction_id=compaction_id,
+            idempotency_key="compact-postgres-1",
+            route_name=session.model_route,
+            requested_at=now + timedelta(seconds=1),
+        )
+        replayed = await context.request_compaction(
+            TENANT_ID,
+            session.id,
+            compaction_id=uuid.uuid4(),
+            idempotency_key="compact-postgres-1",
+            route_name=session.model_route,
+            requested_at=now + timedelta(seconds=2),
+        )
+        assert requested is not None and requested.source_message_sequence == 1
+        assert replayed is not None and replayed.id == compaction_id
+        with pytest.raises(DomainOperationError) as concurrent:
+            await context.request_compaction(
+                TENANT_ID,
+                session.id,
+                compaction_id=uuid.uuid4(),
+                idempotency_key="compact-postgres-2",
+                route_name=session.model_route,
+                requested_at=now + timedelta(seconds=2),
+            )
+        assert concurrent.value.code == "context_compaction_in_progress"
+        completed = await context.complete(
+            TENANT_ID,
+            compaction_id,
+            summary="A durable bounded summary.",
+            input_tokens=20,
+            output_tokens=6,
+            completed_at=now + timedelta(seconds=3),
+        )
+        assert completed is not None and completed.summary is not None
+
+        task_state = await tasks.update(
+            TENANT_ID,
+            run.id,
+            TaskPlanUpdate.model_validate(
+                {
+                    "expected_version": 0,
+                    "tasks": [{"id": "task-1", "title": "Finish Sequence 24"}],
+                }
+            ),
+            plan_id=uuid.uuid4(),
+            created_at=now + timedelta(seconds=4),
+        )
+        assert task_state is not None and task_state.version == 1
+        with pytest.raises(DomainOperationError) as stale:
+            await tasks.update(
+                TENANT_ID,
+                run.id,
+                TaskPlanUpdate(expected_version=0, tasks=()),
+                plan_id=uuid.uuid4(),
+                created_at=now + timedelta(seconds=5),
+            )
+        assert stale.value.code == "task_plan_version_conflict"
+
+        memory_content = "Use rootless Podman for isolated execution."
+        memory = PersistedMemory(
+            id=uuid.uuid4(),
+            tenant_id=TENANT_ID,
+            session_id=session.id,
+            source_run_id=run.id,
+            kind=MemoryKind.DECISION,
+            content=memory_content,
+            content_hash=memory_content_hash(memory_content),
+            extracted_at=now + timedelta(seconds=6),
+        )
+        async with database.sessions() as transaction, transaction.begin():
+            transaction.add(
+                MemoryRecord(
+                    id=memory.id,
+                    tenant_id=TENANT_ID,
+                    session_id=memory.session_id,
+                    source_run_id=memory.source_run_id,
+                    kind=memory.kind.value,
+                    content=memory.content,
+                    content_hash=memory.content_hash,
+                    memory_metadata={},
+                    extracted_at=memory.extracted_at,
+                )
+            )
+        assert (await memories.list_active(TENANT_ID, session.id))[0] == memory
+        assert await memories.set_session_enabled(
+            TENANT_ID,
+            session.id,
+            enabled=False,
+            updated_at=now + timedelta(seconds=7),
+        )
+        assert await memories.list_active(TENANT_ID, session.id) == ()
+
+        async with database.sessions() as query:
+            message_count = await query.scalar(
+                select(func.count())
+                .select_from(MessageRecord)
+                .where(MessageRecord.session_id == session.id)
+            )
+        assert message_count == 1
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_lease_recovery_fences_stale_scheduler(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    run = _run(session, now)
+    await sessions.create(session)
+    await runs.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key=f"memory-lease-{run.id}",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    job_id = uuid.uuid4()
+    async with database.sessions() as transaction, transaction.begin():
+        transaction.add(
+            MemoryExtractionJobRecord(
+                id=job_id,
+                tenant_id=TENANT_ID,
+                session_id=session.id,
+                run_id=run.id,
+                status=MemoryExtractionStatus.PENDING.value,
+                source_message_sequence=0,
+                attempt=1,
+                created_at=now,
+            )
+        )
+    first_token = uuid.uuid4()
+    second_token = uuid.uuid4()
+    tokens = iter((first_token, second_token))
+    memories = PostgresMemoryRepository(
+        database.sessions,
+        token_factory=lambda: next(tokens),
+    )
+    try:
+        first = await memories.claim_pending(
+            worker_id="memory-scheduler-first",
+            occurred_at=now + timedelta(seconds=1),
+            lease_duration=timedelta(seconds=1),
+        )
+        assert first is not None and first.id == job_id
+        assert first.lease_token == first_token
+        recovered = await memories.claim_pending(
+            worker_id="memory-scheduler-recovered",
+            occurred_at=now + timedelta(seconds=3),
+            lease_duration=timedelta(seconds=30),
+        )
+        assert recovered is not None and recovered.id == job_id
+        assert recovered.attempt == 2
+        assert recovered.lease_generation == 2
+        assert recovered.lease_token == second_token
+
+        with pytest.raises(DomainOperationError) as stale_source:
+            await memories.source_for_job(first, max_bytes=1024)
+        assert stale_source.value.code == "memory_extraction_lease_lost"
+        with pytest.raises(DomainOperationError) as stale_finish:
+            await memories.complete(
+                first,
+                (),
+                completed_at=now + timedelta(seconds=4),
+            )
+        assert stale_finish.value.code == "memory_extraction_lease_lost"
+
+        terminal = await memories.complete(
+            recovered,
+            (),
+            completed_at=now + timedelta(seconds=4),
+        )
+        assert terminal.status is MemoryExtractionStatus.COMPLETED
+        assert terminal.lease_token is None
+    finally:
+        await runs.request_cancel(
+            TENANT_ID,
+            run.id,
+            occurred_at=now + timedelta(seconds=40),
+        )
         await database.aclose()
 
 

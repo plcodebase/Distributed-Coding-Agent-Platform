@@ -37,6 +37,8 @@ EXPECTED_TABLES = {
     "gateway_rate_limits",
     "gateway_circuits",
     "messages",
+    "memories",
+    "memory_extraction_jobs",
     "model_calls",
     "queue_admission",
     "runs",
@@ -227,6 +229,13 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
             "context_compactions",
             "source_message_sequence",
             "uq_context_compactions_one_pending",
+        ),
+        "0006_memory_and_tasks.py": (
+            'revision: str = "0006"',
+            'down_revision: str | None = "0005"',
+            "memory_enabled",
+            "memories",
+            "memory_extraction_jobs",
         ),
     }
     migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"

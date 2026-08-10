@@ -7,6 +7,8 @@ from platform_persistence.capacity import (
 )
 from platform_persistence.context_management import (
     PostgresContextRepository,
+    PostgresMemoryRepository,
+    PostgresTaskRepository,
 )
 from platform_persistence.database import Database, DatabaseSettings, PostgreSQLUrl
 from platform_persistence.distributed import (
@@ -52,10 +54,12 @@ __all__ = [
     "PostgresGatewayCircuitBreaker",
     "PostgresGatewayRateLimiter",
     "PostgresGatewayRequestStore",
+    "PostgresMemoryRepository",
     "PostgresRecoveryStore",
     "PostgresRunQueue",
     "PostgresRunRepository",
     "PostgresSessionRepository",
+    "PostgresTaskRepository",
     "PostgresTenantQuotaRepository",
     "PostgresWorkspaceLeaseStore",
     "RunCreationResult",

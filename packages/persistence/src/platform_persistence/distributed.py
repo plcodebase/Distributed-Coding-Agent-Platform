@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
-from sqlalchemy import Text, case, func, select
+from sqlalchemy import Text, case, func, literal, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
@@ -35,11 +35,13 @@ from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
     CheckpointRecord,
+    MemoryExtractionJobRecord,
     MessageRecord,
     RunLeaseRecord,
     RunRecord,
     SessionRecord,
     TaskPlanRecord,
+    TenantQuotaRecord,
     ToolCallRecord,
     WorkerRecord,
     WorkspaceLeaseRecord,
@@ -541,11 +543,80 @@ class PostgresRunQueue:
                     update={"last_checkpoint_id": result.last_checkpoint_id}
                 )
             _apply_run(run_row, transitioned)
+            if desired_status is RunStatus.COMPLETED:
+                await self._enqueue_memory_extraction(database, run_row, timestamp)
             await self._release_workspace_for_run(database, lease_row)
             await database.delete(lease_row)
             await self._return_worker_slot(database, lease.worker_id)
             await database.flush()
             return _run_domain(run_row)
+
+    async def _enqueue_memory_extraction(
+        self,
+        database: AsyncSession,
+        run: RunRecord,
+        created_at: datetime,
+    ) -> None:
+        """Atomically enqueue an enabled run's bounded memory extraction."""
+
+        source_sequence = (
+            select(func.coalesce(func.max(MessageRecord.sequence), 0))
+            .where(
+                MessageRecord.tenant_id == run.tenant_id,
+                MessageRecord.session_id == run.session_id,
+            )
+            .scalar_subquery()
+        )
+        eligible = (
+            select(
+                literal(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"agent-platform:memory:{run.tenant_id}:{run.id}",
+                    )
+                ),
+                literal(run.tenant_id),
+                literal(run.session_id),
+                literal(run.id),
+                literal("pending"),
+                source_sequence,
+                literal(1),
+                literal(created_at),
+            )
+            .select_from(SessionRecord)
+            .join(
+                TenantQuotaRecord,
+                TenantQuotaRecord.tenant_id == SessionRecord.tenant_id,
+            )
+            .where(
+                SessionRecord.tenant_id == run.tenant_id,
+                SessionRecord.id == run.session_id,
+                SessionRecord.memory_enabled.is_(True),
+                TenantQuotaRecord.memory_enabled.is_(True),
+            )
+        )
+        await database.execute(
+            insert(MemoryExtractionJobRecord)
+            .from_select(
+                (
+                    MemoryExtractionJobRecord.id,
+                    MemoryExtractionJobRecord.tenant_id,
+                    MemoryExtractionJobRecord.session_id,
+                    MemoryExtractionJobRecord.run_id,
+                    MemoryExtractionJobRecord.status,
+                    MemoryExtractionJobRecord.source_message_sequence,
+                    MemoryExtractionJobRecord.attempt,
+                    MemoryExtractionJobRecord.created_at,
+                ),
+                eligible,
+            )
+            .on_conflict_do_nothing(
+                index_elements=(
+                    MemoryExtractionJobRecord.tenant_id,
+                    MemoryExtractionJobRecord.run_id,
+                )
+            )
+        )
 
     async def recover_expired(
         self,

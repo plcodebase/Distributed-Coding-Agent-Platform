@@ -1243,6 +1243,21 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
+Implementation status through Sequence 24: the worker uses a contributor-based,
+route-budgeted context pipeline and gateway-backed compression. Explicit compaction
+requests are durable and idempotent, summaries refer to a source-message watermark,
+only one request may remain pending per session, and original messages remain
+append-only. Only unresolved task items are critical during compaction. Versioned task
+plans use compare-and-set updates. Durable run completion atomically enqueues bounded
+memory extraction jobs; source messages stream in bounded batches and extraction has a
+deadline shorter than its lease. Extracted memories carry tenant-scoped source
+session/run/time provenance, content-hash deduplication, and honor both tenant and
+session enablement. Extraction claims are expiring and generation-fenced so abandoned
+jobs can be recovered without accepting stale writes.
+Status, compact/compaction-status, rewind, new-session, task-plan, memory-control, and
+memory-archive HTTP operations are available. Shell-style command aliases remain a CLI
+concern.
+
 ---
 
 ## Phase 9 — Observability and Reliability

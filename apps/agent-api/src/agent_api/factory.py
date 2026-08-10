@@ -19,8 +19,10 @@ from platform_persistence import (
     DatabaseSettings,
     PostgresApprovalRepository,
     PostgresContextRepository,
+    PostgresMemoryRepository,
     PostgresRunRepository,
     PostgresSessionRepository,
+    PostgresTaskRepository,
 )
 
 if TYPE_CHECKING:
@@ -79,6 +81,8 @@ def create_production_app(
     )
     approvals = PostgresApprovalRepository(database.sessions)
     context = PostgresContextRepository(database.sessions)
+    tasks = PostgresTaskRepository(database.sessions)
+    memories = PostgresMemoryRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
     services = ApiServices(
         authenticator=authenticator,
@@ -88,6 +92,8 @@ def create_production_app(
         events=events,
         readiness=database,
         context=context,
+        tasks=tasks,
+        memories=memories,
     )
     return create_app(services, close=database.aclose)
 

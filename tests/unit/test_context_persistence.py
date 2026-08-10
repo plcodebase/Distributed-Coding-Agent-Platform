@@ -10,10 +10,19 @@ import pytest
 
 from agent_core.control import (
     ContextCompactionStatus,
+    MemoryExtractionJob,
+    MemoryExtractionStatus,
+    MemoryKind,
+    PersistedMemory,
+    TaskPlanUpdate,
+    TaskStatus,
+    memory_content_hash,
 )
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from platform_persistence import (
     PostgresContextRepository,
+    PostgresMemoryRepository,
+    PostgresTaskRepository,
 )
 
 if TYPE_CHECKING:
@@ -22,7 +31,11 @@ if TYPE_CHECKING:
 NOW = datetime(2026, 7, 31, 12, tzinfo=UTC)
 TENANT_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
 SESSION_ID = uuid.UUID("20000000-0000-0000-0000-000000000002")
+RUN_ID = uuid.UUID("30000000-0000-0000-0000-000000000003")
 COMPACTION_ID = uuid.UUID("40000000-0000-0000-0000-000000000004")
+JOB_ID = uuid.UUID("50000000-0000-0000-0000-000000000005")
+LEASE_TOKEN = uuid.UUID("60000000-0000-0000-0000-000000000006")
+REASSIGNED_LEASE_TOKEN = uuid.UUID("70000000-0000-0000-0000-000000000007")
 
 
 class _Scalars:
@@ -138,6 +151,47 @@ def _compaction_row(
     )
 
 
+def _memory_job_row(
+    *,
+    status: MemoryExtractionStatus = MemoryExtractionStatus.RUNNING,
+) -> SimpleNamespace:
+    running = status is MemoryExtractionStatus.RUNNING
+    return SimpleNamespace(
+        id=JOB_ID,
+        tenant_id=TENANT_ID,
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        status=status.value,
+        source_message_sequence=12,
+        attempt=1,
+        worker_id="memory-worker" if running else None,
+        lease_token=LEASE_TOKEN if running else None,
+        lease_generation=1 if running else 0,
+        lease_expires_at=NOW + timedelta(minutes=5) if running else None,
+        error=None,
+        created_at=NOW,
+        started_at=NOW + timedelta(seconds=1) if running else None,
+        completed_at=None,
+    )
+
+
+def _memory_job() -> MemoryExtractionJob:
+    return MemoryExtractionJob(
+        id=JOB_ID,
+        tenant_id=TENANT_ID,
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        status=MemoryExtractionStatus.RUNNING,
+        source_message_sequence=12,
+        worker_id="memory-worker",
+        lease_token=LEASE_TOKEN,
+        lease_generation=1,
+        lease_expires_at=NOW + timedelta(minutes=5),
+        created_at=NOW,
+        started_at=NOW + timedelta(seconds=1),
+    )
+
+
 @pytest.mark.asyncio
 async def test_context_repository_requests_replays_and_finishes_compaction() -> None:
     inserted = _compaction_row()
@@ -237,3 +291,226 @@ async def test_context_repository_reads_pending_latest_and_failed_outcomes() -> 
         completed_at=NOW + timedelta(seconds=2),
     )
     assert failed is not None and failed.status is ContextCompactionStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_task_repository_compare_and_set_round_trip() -> None:
+    update = TaskPlanUpdate.model_validate(
+        {
+            "expected_version": 0,
+            "tasks": [{"id": "task-1", "title": "Persist task state"}],
+        }
+    )
+    create_db = _Database(scalar_values=[RUN_ID, None])
+    repository = PostgresTaskRepository(_sessions(create_db))
+    state = await repository.update(
+        TENANT_ID,
+        RUN_ID,
+        update,
+        plan_id=uuid.uuid4(),
+        created_at=NOW,
+    )
+    assert state is not None and state.version == 1
+    record = create_db.added[0]
+
+    loaded = await PostgresTaskRepository(_sessions(_Database(scalar_values=[record]))).get(
+        TENANT_ID, RUN_ID
+    )
+    assert loaded is not None and loaded.tasks[0].id == "task-1"
+
+    existing = SimpleNamespace(version=2)
+    with pytest.raises(DomainOperationError) as conflict:
+        await PostgresTaskRepository(_sessions(_Database(scalar_values=[RUN_ID, existing]))).update(
+            TENANT_ID,
+            RUN_ID,
+            update,
+            plan_id=uuid.uuid4(),
+            created_at=NOW,
+        )
+    assert conflict.value.code == "task_plan_version_conflict"
+
+
+@pytest.mark.asyncio
+async def test_task_repository_exposes_legacy_step_plans_without_mutation() -> None:
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        run_id=RUN_ID,
+        version=1,
+        plan={
+            "steps": [
+                {"title": "Already done", "done": True},
+                {"text": "Still pending", "status": "pending"},
+            ]
+        },
+        created_at=NOW,
+    )
+    state = await PostgresTaskRepository(_sessions(_Database(scalar_values=[row]))).get(
+        TENANT_ID,
+        RUN_ID,
+    )
+    assert state is not None
+    assert [task.id for task in state.tasks] == ["legacy-step-1", "legacy-step-2"]
+    assert state.tasks[0].status is TaskStatus.COMPLETED
+    assert state.tasks[1].title == "Still pending"
+
+
+@pytest.mark.asyncio
+async def test_memory_repository_settings_listing_source_completion_and_failure() -> None:
+    session_row = SimpleNamespace(memory_enabled=True, updated_at=NOW)
+    settings_repository = PostgresMemoryRepository(
+        _sessions(_Database(scalar_values=[session_row]))
+    )
+    assert await settings_repository.set_session_enabled(
+        TENANT_ID,
+        SESSION_ID,
+        enabled=False,
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    assert session_row.memory_enabled is False
+
+    memory_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=TENANT_ID,
+        session_id=SESSION_ID,
+        source_run_id=RUN_ID,
+        kind=MemoryKind.FACT.value,
+        content="Uses PostgreSQL.",
+        content_hash=memory_content_hash("Uses PostgreSQL."),
+        memory_metadata={},
+        extracted_at=NOW,
+        archived_at=None,
+    )
+    listed = await PostgresMemoryRepository(
+        _sessions(_Database(scalar_values=[True, True], scalar_sets=[[memory_row]]))
+    ).list_active(TENANT_ID, SESSION_ID)
+    assert listed[0].source_run_id == RUN_ID
+
+    archive_row = SimpleNamespace(**memory_row.__dict__)
+    archived = await PostgresMemoryRepository(
+        _sessions(_Database(scalar_values=[archive_row]))
+    ).archive(
+        TENANT_ID,
+        SESSION_ID,
+        archive_row.id,
+        archived_at=NOW + timedelta(seconds=1),
+    )
+    assert archived is not None and archived.archived_at == NOW + timedelta(seconds=1)
+
+    job = _memory_job()
+    running_row = _memory_job_row()
+    messages = [
+        SimpleNamespace(sequence=2, role="assistant", content="new"),
+        SimpleNamespace(sequence=1, role="user", content="old"),
+    ]
+    source = await PostgresMemoryRepository(
+        _sessions(
+            _Database(
+                scalar_values=[running_row],
+                scalar_sets=[cast("list[object]", messages)],
+            )
+        )
+    ).source_for_job(job, max_bytes=100)
+    assert source == "[user] old\n[assistant] new"
+
+    many_messages = [
+        SimpleNamespace(sequence=index, role="user", content="x" * 90)
+        for index in range(100, 0, -1)
+    ]
+    bounded_db = _Database(
+        scalar_values=[_memory_job_row()],
+        scalar_sets=[cast("list[object]", many_messages)],
+    )
+    bounded_source = await PostgresMemoryRepository(_sessions(bounded_db)).source_for_job(
+        job,
+        max_bytes=120,
+    )
+    assert len(bounded_source.encode("utf-8")) <= 120
+    assert bounded_db.streams[0].consumed == 2
+    assert bounded_db.streams[0].closed is True
+
+    memory = PersistedMemory(
+        id=uuid.uuid4(),
+        tenant_id=TENANT_ID,
+        session_id=SESSION_ID,
+        source_run_id=RUN_ID,
+        kind=MemoryKind.DECISION,
+        content="Use Podman.",
+        content_hash=memory_content_hash("Use Podman."),
+        extracted_at=NOW + timedelta(seconds=2),
+    )
+    complete_db = _Database(scalar_values=[running_row, True, True])
+    completed = await PostgresMemoryRepository(_sessions(complete_db)).complete(
+        job,
+        (memory,),
+        completed_at=NOW + timedelta(seconds=3),
+    )
+    assert completed.status is MemoryExtractionStatus.COMPLETED
+    assert complete_db.executed == 1
+
+    failed_row = _memory_job_row()
+    failed = await PostgresMemoryRepository(_sessions(_Database(scalar_values=[failed_row]))).fail(
+        job,
+        error=ErrorDetail(code="memory_failed", message="failed", retryable=True),
+        completed_at=NOW + timedelta(seconds=3),
+    )
+    assert failed.status is MemoryExtractionStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_memory_claim_honors_disable_policy_and_limits() -> None:
+    disabled_row = _memory_job_row(status=MemoryExtractionStatus.PENDING)
+    disabled_row.started_at = None
+    disabled = await PostgresMemoryRepository(
+        _sessions(_Database(scalar_values=[disabled_row, False]))
+    ).claim_pending(
+        worker_id="memory-worker",
+        occurred_at=NOW + timedelta(seconds=1),
+        lease_duration=timedelta(minutes=5),
+    )
+    assert disabled is not None and disabled.status is MemoryExtractionStatus.COMPLETED
+
+    with pytest.raises(ValueError):
+        await PostgresMemoryRepository(_sessions()).list_active(
+            TENANT_ID,
+            SESSION_ID,
+            limit=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_claim_recovers_expired_job_and_fences_stale_owner() -> None:
+    pending_row = _memory_job_row(status=MemoryExtractionStatus.PENDING)
+    databases = (
+        _Database(scalar_values=[pending_row, True, True]),
+        _Database(scalar_values=[pending_row, True, True]),
+        _Database(scalar_values=[pending_row]),
+    )
+    tokens = iter((LEASE_TOKEN, REASSIGNED_LEASE_TOKEN))
+    repository = PostgresMemoryRepository(
+        _sessions(*databases),
+        token_factory=lambda: next(tokens),
+    )
+    first = await repository.claim_pending(
+        worker_id="memory-worker-a",
+        occurred_at=NOW + timedelta(seconds=1),
+        lease_duration=timedelta(seconds=1),
+    )
+    assert first is not None
+    assert first.lease_generation == 1
+    recovered = await repository.claim_pending(
+        worker_id="memory-worker-b",
+        occurred_at=NOW + timedelta(seconds=3),
+        lease_duration=timedelta(seconds=10),
+    )
+    assert recovered is not None
+    assert recovered.attempt == 2
+    assert recovered.lease_generation == 2
+    assert recovered.lease_token == REASSIGNED_LEASE_TOKEN
+
+    with pytest.raises(DomainOperationError) as stale:
+        await repository.complete(
+            first,
+            (),
+            completed_at=NOW + timedelta(seconds=4),
+        )
+    assert stale.value.code == "memory_extraction_lease_lost"

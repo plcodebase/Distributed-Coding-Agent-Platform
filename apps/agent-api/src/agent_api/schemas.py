@@ -7,7 +7,12 @@ from typing import Annotated
 
 from pydantic import Field, StringConstraints
 
-from agent_core.control import PersistedApproval
+from agent_core.control import (
+    PersistedApproval,
+    PersistedContextCompaction,
+    PersistedMemory,
+    PersistedTaskState,
+)
 from agent_core.domain.base import DomainModel, FrozenJsonObject
 from agent_core.domain.models import Run, Session
 from agent_core.domain.status import ApprovalMode
@@ -28,6 +33,21 @@ class CreateSessionRequest(DomainModel):
     workspace_id: uuid.UUID
     approval_mode: ApprovalMode = ApprovalMode.REQUIRE_SENSITIVE
     model_route: ModelRoute = "coding-default"
+    memory_enabled: bool = True
+
+
+class MemorySettingRequest(DomainModel):
+    enabled: bool
+
+
+class MemoryListResponse(DomainModel):
+    memories: tuple[PersistedMemory, ...] = Field(max_length=500)
+
+
+class RunStatusResponse(DomainModel):
+    run: Run
+    task_plan: PersistedTaskState | None = None
+    latest_compaction: PersistedContextCompaction | None = None
 
 
 class CreateRunRequest(DomainModel):
@@ -75,9 +95,12 @@ __all__ = [
     "ErrorResponse",
     "EventListResponse",
     "HealthResponse",
+    "MemoryListResponse",
+    "MemorySettingRequest",
     "ModelRoute",
     "RewindRequest",
     "RunCreationResponse",
     "RunResponse",
+    "RunStatusResponse",
     "SessionResponse",
 ]

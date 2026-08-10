@@ -381,6 +381,20 @@ creates at most one pending request per session at a message watermark and recor
 actual `summarization` route; workers record summary usage without updating or deleting
 the source transcript.
 
+### Sequence 24: long-term memory and task tracking
+
+Sequence 24 provides versioned compare-and-set task plans, task/status HTTP operations,
+per-session memory controls, tenant/session-filtered memory reads, and asynchronous
+post-run memory extraction through the shared `summarization` route. Run completion
+is the sole path that atomically creates a recoverable, expiring, generation-fenced
+extraction job. Source rows stream in bounded batches, and extraction has a deadline
+strictly shorter than its lease.
+Gateway-produced memory JSON is byte-bounded and validated before content-hash
+deduplication. Every memory records its source tenant/session/run, kind, extraction
+time, and optional closed metadata. Tenant or session disablement suppresses extraction
+and context retrieval. Direct compaction status and tenant-scoped memory archival APIs
+complete the control surface.
+
 ## Local setup
 
 ```shell

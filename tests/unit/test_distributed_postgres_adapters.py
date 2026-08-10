@@ -155,6 +155,7 @@ def _worker_row(
         last_heartbeat_at=NOW,
     )
 
+
 def _quota_row(*, max_active_runs: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         tenant_id=TENANT_ID,
@@ -382,6 +383,9 @@ async def test_postgres_queue_claim_start_heartbeat_and_finish() -> None:
     assert finish_database.deleted == [running_lease_row]
     assert owned_workspace.lease_token is None
     assert finishing_worker.available_slots == 2
+    assert any(
+        "memory_extraction_jobs" in str(statement) for statement in finish_database.statements
+    )
 
 
 @pytest.mark.asyncio

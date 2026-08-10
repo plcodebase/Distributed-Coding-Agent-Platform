@@ -15,7 +15,10 @@ if TYPE_CHECKING:
         ApprovalDecision,
         PersistedApproval,
         PersistedContextCompaction,
+        PersistedMemory,
+        PersistedTaskState,
         RunCreationResult,
+        TaskPlanUpdate,
     )
     from agent_core.domain.models import Run, Session
     from agent_core.event_store import EventPage, StoredEvent
@@ -127,6 +130,55 @@ class ContextRepository(Protocol):
     ) -> PersistedContextCompaction | None: ...
 
 
+class TaskRepository(Protocol):
+    """Versioned task state used by status and task-plan operations."""
+
+    async def get(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+    ) -> PersistedTaskState | None: ...
+
+    async def update(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        update: TaskPlanUpdate,
+        *,
+        plan_id: uuid.UUID,
+        created_at: datetime,
+    ) -> PersistedTaskState | None: ...
+
+
+class MemoryRepository(Protocol):
+    """Tenant/session-filtered long-term memory control boundary."""
+
+    async def set_session_enabled(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        enabled: bool,
+        updated_at: datetime,
+    ) -> bool: ...
+
+    async def list_active(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        limit: int = 100,
+    ) -> tuple[PersistedMemory, ...]: ...
+
+    async def archive(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        *,
+        archived_at: datetime,
+    ) -> PersistedMemory | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ApiServices:
@@ -139,6 +191,8 @@ class ApiServices:
     events: EventStore
     readiness: ReadinessProbe
     context: ContextRepository | None = None
+    tasks: TaskRepository | None = None
+    memories: MemoryRepository | None = None
 
 
 __all__ = [
@@ -146,7 +200,9 @@ __all__ = [
     "ApprovalRepository",
     "ContextRepository",
     "EventStore",
+    "MemoryRepository",
     "ReadinessProbe",
     "RunRepository",
     "SessionRepository",
+    "TaskRepository",
 ]

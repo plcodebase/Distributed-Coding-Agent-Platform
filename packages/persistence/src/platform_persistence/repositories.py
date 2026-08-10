@@ -782,6 +782,7 @@ def _session_record(session: Session) -> SessionRecord:
         status=session.status.value,
         approval_mode=session.approval_mode.value,
         model_route=session.model_route,
+        memory_enabled=session.memory_enabled,
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -795,6 +796,7 @@ def _session_domain(record: SessionRecord) -> Session:
         status=SessionStatus(record.status),
         approval_mode=ApprovalMode(record.approval_mode),
         model_route=record.model_route,
+        memory_enabled=record.memory_enabled,
         created_at=record.created_at,
         updated_at=record.updated_at,
     )

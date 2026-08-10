@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
     from agent_core.distributed import RunQueue
     from agent_core.loop import Clock
+    from agent_scheduler.memory import MemoryExtractionProcessor
 
 type Sleep = Callable[[float], Awaitable[None]]
 
@@ -35,11 +36,13 @@ class SchedulerService:
         clock: Clock,
         config: SchedulerConfig | None = None,
         sleep: Sleep = asyncio.sleep,
+        memory_processor: MemoryExtractionProcessor | None = None,
     ) -> None:
         self._queue = queue
         self._clock = clock
         self._config = config or SchedulerConfig()
         self._sleep = sleep
+        self._memory_processor = memory_processor
 
     async def recover_once(self) -> int:
         recovered = await self._queue.recover_expired(
@@ -51,7 +54,12 @@ class SchedulerService:
     async def serve(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             recovered = await self.recover_once()
-            if recovered == 0:
+            memory_processed = (
+                await self._memory_processor.process_once()
+                if self._memory_processor is not None
+                else False
+            )
+            if recovered == 0 and not memory_processed:
                 await self._sleep(self._config.poll_seconds)
 
 

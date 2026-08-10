@@ -56,6 +56,11 @@ class SessionRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     approval_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     model_route: Mapped[str] = mapped_column(String(255), nullable=False)
+    memory_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("true"),
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -319,6 +324,143 @@ class TaskPlanRecord(Base):
         nullable=False,
         server_default=_UTC_NOW,
     )
+
+
+class MemoryRecord(Base):
+    """Tenant-owned long-term memory with mandatory source provenance."""
+
+    __tablename__ = "memories"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "session_id"),
+            ("sessions.tenant_id", "sessions.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "source_run_id", "session_id"),
+            ("runs.tenant_id", "runs.id", "runs.session_id"),
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "kind IN ('fact', 'preference', 'decision', 'constraint')",
+            name="kind",
+        ),
+        CheckConstraint(
+            "octet_length(content) > 0 AND octet_length(content) <= 65536",
+            name="content_bytes",
+        ),
+        CheckConstraint("content_hash ~ '^[0-9a-f]{64}$'", name="content_hash"),
+        CheckConstraint("jsonb_typeof(metadata) = 'object'", name="metadata_object"),
+        UniqueConstraint(
+            "tenant_id",
+            "session_id",
+            "kind",
+            "content_hash",
+            name="uq_memories_memory_identity",
+        ),
+        CheckConstraint(
+            "archived_at IS NULL OR archived_at >= extracted_at",
+            name="archive_timestamp",
+        ),
+        Index(
+            "ix_memories_tenant_session_active",
+            "tenant_id",
+            "session_id",
+            "extracted_at",
+            postgresql_where=text("archived_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    memory_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        server_default=_EMPTY_JSON,
+    )
+    extracted_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    archived_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MemoryExtractionJobRecord(Base):
+    """One idempotent asynchronous extraction job per completed run."""
+
+    __tablename__ = "memory_extraction_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id", "session_id"),
+            ("runs.tenant_id", "runs.id", "runs.session_id"),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "run_id"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed')",
+            name="status",
+        ),
+        CheckConstraint("attempt >= 1 AND attempt <= 100", name="attempt"),
+        CheckConstraint("lease_generation >= 0", name="lease_generation"),
+        CheckConstraint("source_message_sequence >= 0", name="source_message_sequence"),
+        CheckConstraint(
+            "error IS NULL OR jsonb_typeof(error) = 'object'",
+            name="error_object",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND started_at IS NULL AND completed_at IS NULL "
+            "AND error IS NULL AND worker_id IS NULL AND lease_token IS NULL "
+            "AND lease_generation = 0 AND lease_expires_at IS NULL) "
+            "OR (status = 'running' AND started_at >= created_at "
+            "AND completed_at IS NULL AND error IS NULL AND worker_id IS NOT NULL "
+            "AND lease_token IS NOT NULL AND lease_generation >= 1 "
+            "AND lease_expires_at > started_at) "
+            "OR (status = 'completed' AND started_at >= created_at "
+            "AND completed_at >= started_at AND error IS NULL AND worker_id IS NULL "
+            "AND lease_token IS NULL AND lease_expires_at IS NULL) "
+            "OR (status = 'failed' AND started_at >= created_at "
+            "AND completed_at >= started_at AND error IS NOT NULL AND worker_id IS NULL "
+            "AND lease_token IS NULL AND lease_expires_at IS NULL)",
+            name="lifecycle",
+        ),
+        Index("ix_memory_jobs_status_lease_created", "status", "lease_expires_at", "created_at"),
+        Index(
+            "uq_memory_jobs_active_lease_token",
+            "lease_token",
+            unique=True,
+            postgresql_where=text("lease_token IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_message_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ToolCallRecord(Base):
@@ -987,6 +1129,8 @@ __all__ = [
     "GatewayProviderCapacityRecord",
     "GatewayRateLimitRecord",
     "GatewayRequestRecord",
+    "MemoryExtractionJobRecord",
+    "MemoryRecord",
     "MessageRecord",
     "ModelCallRecord",
     "QueueAdmissionRecord",

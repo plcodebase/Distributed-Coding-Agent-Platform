@@ -35,14 +35,20 @@ from agent_api.schemas import (
     CreateSessionRequest,
     EventListResponse,
     HealthResponse,
+    MemoryListResponse,
+    MemorySettingRequest,
     RewindRequest,
     RunCreationResponse,
+    RunStatusResponse,
 )
 from agent_core.context import CONTEXT_COMPACTION_ROUTE
 from agent_core.control import (
     ApprovalDecision,
     PersistedApproval,
     PersistedContextCompaction,
+    PersistedMemory,
+    PersistedTaskState,
+    TaskPlanUpdate,
     run_creation_hash,
 )
 from agent_core.domain.errors import DomainOperationError
@@ -170,6 +176,7 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             status=SessionStatus.ACTIVE,
             approval_mode=body.approval_mode,
             model_route=body.model_route,
+            memory_enabled=body.memory_enabled,
             created_at=now,
             updated_at=now,
         )
@@ -237,6 +244,67 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             raise _not_found("context compaction", compaction_id)
         return compaction
 
+    @app.patch("/v1/sessions/{session_id}/memory", response_model=Session)
+    async def set_session_memory(
+        session_id: uuid.UUID,
+        body: MemorySettingRequest,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> Session:
+        memories = _require_service(services.memories, "long-term memory")
+        changed = await memories.set_session_enabled(
+            identity.tenant_id,
+            session_id,
+            enabled=body.enabled,
+            updated_at=datetime.now(UTC),
+        )
+        if not changed:
+            raise _not_found("session", session_id)
+        session = await services.sessions.get(identity.tenant_id, session_id)
+        if session is None:
+            raise _not_found("session", session_id)
+        return session
+
+    @app.get("/v1/sessions/{session_id}/memories", response_model=MemoryListResponse)
+    async def list_memories(
+        session_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> MemoryListResponse:
+        session = await services.sessions.get(identity.tenant_id, session_id)
+        if session is None:
+            raise _not_found("session", session_id)
+        memories = _require_service(services.memories, "long-term memory")
+        return MemoryListResponse(
+            memories=await memories.list_active(
+                identity.tenant_id,
+                session_id,
+                limit=limit,
+            )
+        )
+
+    @app.delete(
+        "/v1/sessions/{session_id}/memories/{memory_id}",
+        response_model=PersistedMemory,
+    )
+    async def archive_memory(
+        session_id: uuid.UUID,
+        memory_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> PersistedMemory:
+        session = await services.sessions.get(identity.tenant_id, session_id)
+        if session is None:
+            raise _not_found("session", session_id)
+        memories = _require_service(services.memories, "long-term memory")
+        memory = await memories.archive(
+            identity.tenant_id,
+            session_id,
+            memory_id,
+            archived_at=datetime.now(UTC),
+        )
+        if memory is None:
+            raise _not_found("memory", memory_id)
+        return memory
+
     @app.post("/v1/sessions/{session_id}/runs", response_model=RunCreationResponse)
     async def create_run(
         session_id: uuid.UUID,
@@ -288,6 +356,59 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         identity: Annotated[Principal, Depends(principal)],
     ) -> Run:
         return await _require_run(services, identity, run_id)
+
+    @app.get("/v1/runs/{run_id}/status", response_model=RunStatusResponse)
+    async def run_status(
+        run_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> RunStatusResponse:
+        run = await _require_run(services, identity, run_id)
+        task_plan = (
+            await services.tasks.get(identity.tenant_id, run_id)
+            if services.tasks is not None
+            else None
+        )
+        latest_compaction = (
+            await services.context.latest_completed(identity.tenant_id, run.session_id)
+            if services.context is not None
+            else None
+        )
+        return RunStatusResponse(
+            run=run,
+            task_plan=task_plan,
+            latest_compaction=latest_compaction,
+        )
+
+    @app.get("/v1/runs/{run_id}/task-plan", response_model=PersistedTaskState)
+    async def get_task_plan(
+        run_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> PersistedTaskState:
+        _ = await _require_run(services, identity, run_id)
+        tasks = _require_service(services.tasks, "task tracking")
+        state = await tasks.get(identity.tenant_id, run_id)
+        if state is None:
+            raise _not_found("task plan", run_id)
+        return state
+
+    @app.put("/v1/runs/{run_id}/task-plan", response_model=PersistedTaskState)
+    async def update_task_plan(
+        run_id: uuid.UUID,
+        body: TaskPlanUpdate,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> PersistedTaskState:
+        _ = await _require_run(services, identity, run_id)
+        tasks = _require_service(services.tasks, "task tracking")
+        state = await tasks.update(
+            identity.tenant_id,
+            run_id,
+            body,
+            plan_id=uuid.uuid4(),
+            created_at=datetime.now(UTC),
+        )
+        if state is None:
+            raise _not_found("run", run_id)
+        return state
 
     @app.post("/v1/runs/{run_id}/cancel", response_model=Run)
     async def cancel_run(

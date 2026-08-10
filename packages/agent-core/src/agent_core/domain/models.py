@@ -85,6 +85,7 @@ class Session(DomainModel):
     status: SessionStatus
     approval_mode: ApprovalMode
     model_route: IdentifierString
+    memory_enabled: bool = True
     created_at: AwareTimestamp
     updated_at: AwareTimestamp
 
