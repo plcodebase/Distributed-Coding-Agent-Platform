@@ -442,6 +442,91 @@ async def test_idempotent_worker_event_delivery_reuses_one_sequence(
 
 
 @pytest.mark.asyncio
+async def test_reassigned_run_fences_stale_worker_event_and_tool_writes(
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    events = PostgresEventStore(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    run = _run(session, now).model_copy(update={"priority": 100})
+    await sessions.create(session)
+    await runs.create_idempotent(
+        TENANT_ID,
+        run,
+        idempotency_key=f"fenced-worker-writes-{run.id}",
+        creation_hash=run_creation_hash(priority=run.priority),
+    )
+    for worker_id in ("fenced-worker-a", "fenced-worker-b"):
+        await queue.register_worker(
+            WorkerRegistration(
+                worker_id=worker_id,
+                supported_sandbox_types=("podman",),
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+    draft = EventDraft(
+        event_type="context.build_started",
+        payload={"message_count": 1, "checkpoint_id": None},
+        created_at=now,
+    )
+    arguments = FrozenJsonObject({"path": "README.md"})
+    tool_call = ToolCall(
+        id="fenced-call",
+        run_id=run.id,
+        turn_number=1,
+        tool_name="read_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.RECEIVED,
+    )
+    try:
+        worker_a = await queue.claim(
+            "fenced-worker-a",
+            occurred_at=now,
+            lease_duration=timedelta(seconds=2),
+        )
+        assert worker_a is not None and worker_a.run_id == run.id
+        worker_a = await queue.start(worker_a, occurred_at=now + timedelta(milliseconds=1))
+        first = await events.append_idempotent_fenced(worker_a, "a1.g1.e1", draft)
+        assert await execution.save_tool_call_fenced(worker_a, tool_call) == tool_call
+
+        recovered = await queue.recover_expired(
+            occurred_at=now + timedelta(seconds=3),
+            limit=10,
+        )
+        assert [item.id for item in recovered] == [run.id]
+        worker_b = await queue.claim(
+            "fenced-worker-b",
+            occurred_at=now + timedelta(seconds=4),
+            lease_duration=timedelta(seconds=30),
+        )
+        assert worker_b is not None and worker_b.run_id == run.id
+        worker_b = await queue.start(worker_b, occurred_at=now + timedelta(seconds=5))
+
+        with pytest.raises(DomainOperationError) as stale_event:
+            await events.append_idempotent_fenced(worker_a, "a1.g1.e1", draft)
+        assert stale_event.value.code == "run_lease_lost"
+        with pytest.raises(DomainOperationError) as stale_tool:
+            await execution.save_tool_call_fenced(worker_a, tool_call)
+        assert stale_tool.value.code == "run_lease_lost"
+
+        replay = await events.append_idempotent_fenced(worker_b, "a2.g2.e1", draft)
+        assert replay.sequence == first.sequence + 1
+        assert await execution.save_tool_call_fenced(worker_b, tool_call) == tool_call
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
 async def test_three_workers_claim_distinct_runs_without_overlap(
     postgres_url: str,
 ) -> None:

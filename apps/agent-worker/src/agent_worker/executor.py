@@ -36,8 +36,12 @@ if TYPE_CHECKING:
 class ToolCallStore(Protocol):
     """Minimal durable tool-call boundary required for recovery replay."""
 
-    async def save_tool_call(self, tenant_id: uuid.UUID, tool_call: ToolCall) -> ToolCall:
-        """Create or monotonically advance one logical tool invocation."""
+    async def save_tool_call_fenced(
+        self,
+        lease: RunLease,
+        tool_call: ToolCall,
+    ) -> ToolCall:
+        """Create or advance one logical invocation only for the active run lease."""
 
 
 type AgentLoopFactory = Callable[[RunLease, RunRecoveryState], AgentLoop | Awaitable[AgentLoop]]
@@ -137,9 +141,8 @@ class AgentLoopRunExecutor:
                 observed=observed,
                 turn_number=turn_number,
             )
-            await self._events.append_idempotent(
-                lease.tenant_id,
-                lease.run_id,
+            await self._events.append_idempotent_fenced(
+                lease,
                 self._delivery_key(lease, event),
                 EventDraft(
                     event_type=event.event_type,
@@ -221,7 +224,7 @@ class AgentLoopRunExecutor:
             argument_hash=payload.argument_hash,
             status=ToolCallStatus.RECEIVED,
         )
-        durable = await self._tool_calls.save_tool_call(lease.tenant_id, call)
+        durable = await self._tool_calls.save_tool_call_fenced(lease, call)
         observed[call.id] = _ObservedTool(call=durable)
 
     async def _persist_approval(
@@ -235,7 +238,7 @@ class AgentLoopRunExecutor:
         if item is None or item.call.status is not ToolCallStatus.RECEIVED:
             return
         call = item.call.model_copy(update={"status": ToolCallStatus.WAITING_APPROVAL})
-        item.call = await self._tool_calls.save_tool_call(lease.tenant_id, call)
+        item.call = await self._tool_calls.save_tool_call_fenced(lease, call)
 
     async def _persist_started(
         self,
@@ -256,7 +259,7 @@ class AgentLoopRunExecutor:
                 "started_at": event.created_at,
             }
         )
-        item.call = await self._tool_calls.save_tool_call(lease.tenant_id, call)
+        item.call = await self._tool_calls.save_tool_call_fenced(lease, call)
 
     async def _persist_completed(
         self,
@@ -289,7 +292,7 @@ class AgentLoopRunExecutor:
                 "completed_at": event.created_at,
             }
         )
-        item.call = await self._tool_calls.save_tool_call(lease.tenant_id, call)
+        item.call = await self._tool_calls.save_tool_call_fenced(lease, call)
 
     @staticmethod
     def _delivery_key(lease: RunLease, event: AnyAgentEvent) -> str:

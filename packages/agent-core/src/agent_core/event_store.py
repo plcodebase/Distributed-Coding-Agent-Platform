@@ -6,7 +6,7 @@ import json
 import uuid
 from datetime import UTC, datetime
 from itertools import pairwise
-from typing import Annotated, Protocol, Self
+from typing import TYPE_CHECKING, Annotated, Protocol, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -17,6 +17,9 @@ from agent_core.events import (
     EventType,
     parse_agent_event,
 )
+
+if TYPE_CHECKING:
+    from agent_core.distributed import RunLease
 
 MAX_EVENT_PAGE_SIZE = 1000
 MAX_EVENT_PAGE_BYTES = 4 * 1024 * 1024
@@ -113,14 +116,13 @@ class EventPage(DomainModel):
 class IdempotentEventStore(Protocol):
     """Append worker events once under at-least-once delivery."""
 
-    async def append_idempotent(
+    async def append_idempotent_fenced(
         self,
-        tenant_id: uuid.UUID,
-        run_id: uuid.UUID,
+        lease: RunLease,
         delivery_key: EventDeliveryKey,
         draft: EventDraft,
     ) -> StoredEvent:
-        """Return the existing identical event when a delivery is repeated."""
+        """Append only for the active run lease, or return its identical prior event."""
 
 
 __all__ = [

@@ -28,6 +28,7 @@ from agent_core.domain.status import (
     ToolCallStatus,
 )
 from agent_core.domain.transitions import transition_run
+from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
     ApprovalRecord,
     CheckpointRecord,
@@ -102,6 +103,8 @@ _TOOL_CALL_PREDECESSORS: dict[ToolCallStatus, frozenset[ToolCallStatus]] = {
 if TYPE_CHECKING:
     from datetime import datetime
 
+
+    from agent_core.distributed import RunLease
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -418,73 +421,96 @@ class PostgresExecutionRepository:
 
     async def save_tool_call(self, tenant_id: uuid.UUID, tool_call: ToolCall) -> ToolCall:
         async with self._sessions() as database, database.begin():
-            row = await database.scalar(
-                select(ToolCallRecord)
-                .where(
-                    ToolCallRecord.tenant_id == tenant_id,
-                    ToolCallRecord.run_id == tool_call.run_id,
-                    ToolCallRecord.tool_call_id == tool_call.id,
-                )
-                .with_for_update()
+            return await self._save_tool_call(database, tenant_id, tool_call)
+
+    async def save_tool_call_fenced(
+        self,
+        lease: RunLease,
+        tool_call: ToolCall,
+    ) -> ToolCall:
+        """Persist worker-owned tool state under the exact active run fence."""
+
+        if tool_call.run_id != lease.run_id:
+            raise DomainOperationError(
+                code="tool_call_run_mismatch",
+                message="the tool call does not belong to the fenced run",
+                details={"run_id": str(lease.run_id), "tool_call_id": tool_call.id},
             )
-            if row is None:
-                row = ToolCallRecord(
-                    id=uuid.uuid4(),
-                    tenant_id=tenant_id,
-                    run_id=tool_call.run_id,
-                    tool_call_id=tool_call.id,
-                    turn_number=tool_call.turn_number,
-                    tool_name=tool_call.tool_name,
-                    arguments=tool_call.arguments.to_json_object(),
-                    argument_hash=tool_call.argument_hash,
-                    status=tool_call.status.value,
-                    workspace_version=tool_call.workspace_version,
-                    result=(
-                        tool_call.result.to_json_object() if tool_call.result is not None else None
-                    ),
-                    error=tool_call.error.model_dump(mode="json") if tool_call.error else None,
-                    started_at=tool_call.started_at,
-                    completed_at=tool_call.completed_at,
-                )
-                database.add(row)
-            elif (
-                row.argument_hash != tool_call.argument_hash
-                or row.tool_name != tool_call.tool_name
-                or row.turn_number != tool_call.turn_number
-                or row.arguments != tool_call.arguments.to_json_object()
-            ):
-                raise DomainOperationError(
-                    code="tool_call_id_conflict",
-                    message="the tool-call ID belongs to a different logical invocation",
-                    details={"run_id": str(tool_call.run_id), "tool_call_id": tool_call.id},
-                )
-            elif _tool_call_row_matches(row, tool_call):
-                return _tool_call_domain(row)
-            else:
-                current_status = ToolCallStatus(row.status)
-                if tool_call.status in _TOOL_CALL_PREDECESSORS[current_status]:
-                    return _tool_call_domain(row)
-                if tool_call.status not in _TOOL_CALL_TRANSITIONS[current_status]:
-                    raise DomainOperationError(
-                        code="tool_call_state_conflict",
-                        message="the durable tool-call state cannot be overwritten",
-                        details={
-                            "run_id": str(tool_call.run_id),
-                            "tool_call_id": tool_call.id,
-                            "current_status": current_status.value,
-                            "requested_status": tool_call.status.value,
-                        },
-                    )
-                row.status = tool_call.status.value
-                row.workspace_version = tool_call.workspace_version
-                row.result = (
+        async with self._sessions() as database, database.begin():
+            await assert_active_run_lease(database, lease)
+            return await self._save_tool_call(database, lease.tenant_id, tool_call)
+
+    @staticmethod
+    async def _save_tool_call(
+        database: AsyncSession,
+        tenant_id: uuid.UUID,
+        tool_call: ToolCall,
+    ) -> ToolCall:
+        row = await database.scalar(
+            select(ToolCallRecord)
+            .where(
+                ToolCallRecord.tenant_id == tenant_id,
+                ToolCallRecord.run_id == tool_call.run_id,
+                ToolCallRecord.tool_call_id == tool_call.id,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            row = ToolCallRecord(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                run_id=tool_call.run_id,
+                tool_call_id=tool_call.id,
+                turn_number=tool_call.turn_number,
+                tool_name=tool_call.tool_name,
+                arguments=tool_call.arguments.to_json_object(),
+                argument_hash=tool_call.argument_hash,
+                status=tool_call.status.value,
+                workspace_version=tool_call.workspace_version,
+                result=(
                     tool_call.result.to_json_object() if tool_call.result is not None else None
+                ),
+                error=tool_call.error.model_dump(mode="json") if tool_call.error else None,
+                started_at=tool_call.started_at,
+                completed_at=tool_call.completed_at,
+            )
+            database.add(row)
+        elif (
+            row.argument_hash != tool_call.argument_hash
+            or row.tool_name != tool_call.tool_name
+            or row.turn_number != tool_call.turn_number
+            or row.arguments != tool_call.arguments.to_json_object()
+        ):
+            raise DomainOperationError(
+                code="tool_call_id_conflict",
+                message="the tool-call ID belongs to a different logical invocation",
+                details={"run_id": str(tool_call.run_id), "tool_call_id": tool_call.id},
+            )
+        elif _tool_call_row_matches(row, tool_call):
+            return _tool_call_domain(row)
+        else:
+            current_status = ToolCallStatus(row.status)
+            if tool_call.status in _TOOL_CALL_PREDECESSORS[current_status]:
+                return _tool_call_domain(row)
+            if tool_call.status not in _TOOL_CALL_TRANSITIONS[current_status]:
+                raise DomainOperationError(
+                    code="tool_call_state_conflict",
+                    message="the durable tool-call state cannot be overwritten",
+                    details={
+                        "run_id": str(tool_call.run_id),
+                        "tool_call_id": tool_call.id,
+                        "current_status": current_status.value,
+                        "requested_status": tool_call.status.value,
+                    },
                 )
-                row.error = (
-                    tool_call.error.model_dump(mode="json") if tool_call.error is not None else None
-                )
-                row.started_at = tool_call.started_at
-                row.completed_at = tool_call.completed_at
+            row.status = tool_call.status.value
+            row.workspace_version = tool_call.workspace_version
+            row.result = tool_call.result.to_json_object() if tool_call.result is not None else None
+            row.error = (
+                tool_call.error.model_dump(mode="json") if tool_call.error is not None else None
+            )
+            row.started_at = tool_call.started_at
+            row.completed_at = tool_call.completed_at
         return tool_call
 
     async def create_approval(

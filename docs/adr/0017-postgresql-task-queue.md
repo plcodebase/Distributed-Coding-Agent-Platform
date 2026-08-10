@@ -28,9 +28,11 @@ exactly-once delivery.
 - Bound one claim operation to 32 workspace-lock-contention skips. Persistently owned
   workspaces are filtered in SQL, so this bound applies only to transient concurrent
   locks and does not permanently hide later eligible work.
-- Fence every subsequent operation with the run ID, tenant ID, worker ID, random lease
-  token, and monotonic generation. Database uniqueness permits only one active lease
-  row for a run.
+- Fence every worker event append and tool-state write with the run ID, tenant ID,
+  worker ID, random lease token, and monotonic generation. The fenced persistence
+  methods lock and validate the unexpired lease and mirrored `LEASED`/`RUNNING` run in
+  the same transaction as the write. An unfenced idempotent event method remains only
+  for explicitly non-worker producers.
 - Keep the queue behind the provider-neutral `RunQueue` protocol. The API never imports
   the worker, scheduler, or PostgreSQL queue adapter.
 
@@ -51,6 +53,8 @@ exactly-once delivery.
   claims three distinct runs, proving `SKIP LOCKED` behavior and non-overlap.
 - The worker-loss acceptance test proves that an expired claim becomes eligible for a
   different worker without losing the durable task.
+- The reassignment test proves the expired Worker A token cannot create, replay, or
+  advance worker events/tool rows after Worker B owns the run.
 
 ## Operational impact
 
@@ -62,7 +66,8 @@ metrics are added in the observability phase.
 
 Every run lookup and lease relationship is tenant-scoped. Claim construction accepts
 no SQL fragments or executable input. Random UUID lease tokens and generations prevent
-a stale process from finishing a successor's run.
+a stale process from finishing a successor's run or writing worker-owned durable
+execution state.
 
 ## Migration
 

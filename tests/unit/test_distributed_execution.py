@@ -220,21 +220,19 @@ class MemoryEventStore:
     def __init__(self) -> None:
         self.events: dict[str, StoredEvent] = {}
 
-    async def append_idempotent(
+    async def append_idempotent_fenced(
         self,
-        tenant_id: uuid.UUID,
-        run_id: uuid.UUID,
+        lease: RunLease,
         delivery_key: str,
         draft: EventDraft,
     ) -> StoredEvent:
-        del tenant_id
         existing = self.events.get(delivery_key)
         if existing is not None:
             assert existing.event_type is draft.event_type
             assert existing.payload == draft.payload
             return existing
         stored = StoredEvent(
-            run_id=run_id,
+            run_id=lease.run_id,
             sequence=len(self.events) + 1,
             event_type=draft.event_type,
             payload=draft.payload,
@@ -248,12 +246,12 @@ class MemoryToolStore:
     def __init__(self) -> None:
         self.calls: list[ToolCall] = []
 
-    async def save_tool_call(
+    async def save_tool_call_fenced(
         self,
-        tenant_id: uuid.UUID,
+        lease: RunLease,
         tool_call: ToolCall,
     ) -> ToolCall:
-        del tenant_id
+        assert tool_call.run_id == lease.run_id
         self.calls.append(tool_call)
         return tool_call
 
@@ -263,12 +261,12 @@ class PreloadedToolStore(MemoryToolStore):
         super().__init__()
         self.durable = durable
 
-    async def save_tool_call(
+    async def save_tool_call_fenced(
         self,
-        tenant_id: uuid.UUID,
+        lease: RunLease,
         tool_call: ToolCall,
     ) -> ToolCall:
-        del tenant_id
+        assert tool_call.run_id == lease.run_id
         self.calls.append(tool_call)
         return self.durable
 

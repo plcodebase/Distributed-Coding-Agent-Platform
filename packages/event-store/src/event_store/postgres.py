@@ -23,6 +23,7 @@ from agent_core.event_store import (
     StoredEvent,
 )
 from agent_core.events import EventType
+from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import AgentEventRecord, RunRecord
 
 if TYPE_CHECKING:
@@ -31,10 +32,22 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+    from agent_core.distributed import RunLease
+
 _EVENT_TYPE_ADAPTER: TypeAdapter[EventType] = TypeAdapter(EventType)
 _DELIVERY_KEY_ADAPTER: TypeAdapter[EventDeliveryKey] = TypeAdapter(EventDeliveryKey)
 MIN_POLL_INTERVAL_SECONDS = 0.01
 MAX_POLL_INTERVAL_SECONDS = 10.0
+
+
+def _validate_delivery_key(delivery_key: EventDeliveryKey) -> EventDeliveryKey:
+    try:
+        return _DELIVERY_KEY_ADAPTER.validate_python(delivery_key)
+    except ValidationError:
+        raise DomainOperationError(
+            code="event_delivery_key_invalid",
+            message="the event delivery key is invalid",
+        ) from None
 
 
 class PostgresEventStore:
@@ -119,13 +132,7 @@ class PostgresEventStore:
     ) -> StoredEvent:
         """Append once for a stable worker delivery key."""
 
-        try:
-            validated_key = _DELIVERY_KEY_ADAPTER.validate_python(delivery_key)
-        except ValidationError:
-            raise DomainOperationError(
-                code="event_delivery_key_invalid",
-                message="the event delivery key is invalid",
-            ) from None
+        validated_key = _validate_delivery_key(delivery_key)
         async with self._sessions() as database, database.begin():
             run_row = await database.scalar(
                 select(RunRecord)
@@ -141,38 +148,77 @@ class PostgresEventStore:
                     message="the run does not exist for this tenant",
                     details={"run_id": str(run_id)},
                 )
-            existing = await database.scalar(
-                select(AgentEventRecord).where(
-                    AgentEventRecord.tenant_id == tenant_id,
-                    AgentEventRecord.run_id == run_id,
-                    AgentEventRecord.delivery_key == validated_key,
-                )
-            )
-            if existing is not None:
-                if (
-                    existing.event_type != draft.event_type.value
-                    or existing.payload != draft.payload.to_json_object()
-                ):
-                    raise DomainOperationError(
-                        code="event_delivery_conflict",
-                        message="the event delivery key belongs to different event data",
-                        details={"run_id": str(run_id), "delivery_key": validated_key},
-                    )
-                return _stored_event(existing)
-            sequence = run_row.next_event_sequence
-            run_row.next_event_sequence += 1
-            row = AgentEventRecord(
+            return await self._append_idempotent(
+                database,
+                run_row,
                 tenant_id=tenant_id,
                 run_id=run_id,
-                sequence=sequence,
                 delivery_key=validated_key,
-                event_type=draft.event_type.value,
-                payload=draft.payload.to_json_object(),
-                created_at=draft.created_at,
+                draft=draft,
             )
-            database.add(row)
-            await database.flush()
-            return _stored_event(row)
+
+    async def append_idempotent_fenced(
+        self,
+        lease: RunLease,
+        delivery_key: EventDeliveryKey,
+        draft: EventDraft,
+    ) -> StoredEvent:
+        """Append a worker delivery only while its exact run lease is active."""
+
+        validated_key = _validate_delivery_key(delivery_key)
+        async with self._sessions() as database, database.begin():
+            run_row = await assert_active_run_lease(database, lease)
+            return await self._append_idempotent(
+                database,
+                run_row,
+                tenant_id=lease.tenant_id,
+                run_id=lease.run_id,
+                delivery_key=validated_key,
+                draft=draft,
+            )
+
+    @staticmethod
+    async def _append_idempotent(
+        database: AsyncSession,
+        run_row: RunRecord,
+        *,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        delivery_key: EventDeliveryKey,
+        draft: EventDraft,
+    ) -> StoredEvent:
+        existing = await database.scalar(
+            select(AgentEventRecord).where(
+                AgentEventRecord.tenant_id == tenant_id,
+                AgentEventRecord.run_id == run_id,
+                AgentEventRecord.delivery_key == delivery_key,
+            )
+        )
+        if existing is not None:
+            if (
+                existing.event_type != draft.event_type.value
+                or existing.payload != draft.payload.to_json_object()
+            ):
+                raise DomainOperationError(
+                    code="event_delivery_conflict",
+                    message="the event delivery key belongs to different event data",
+                    details={"run_id": str(run_id), "delivery_key": delivery_key},
+                )
+            return _stored_event(existing)
+        sequence = run_row.next_event_sequence
+        run_row.next_event_sequence += 1
+        row = AgentEventRecord(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=sequence,
+            delivery_key=delivery_key,
+            event_type=draft.event_type.value,
+            payload=draft.payload.to_json_object(),
+            created_at=draft.created_at,
+        )
+        database.add(row)
+        await database.flush()
+        return _stored_event(row)
 
     async def read_page(
         self,
