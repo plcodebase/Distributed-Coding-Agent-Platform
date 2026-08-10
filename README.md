@@ -371,6 +371,16 @@ responses with `Retry-After`; and bounded queue snapshots containing class depth
 oldest wait. Global admission settings reconcile under the singleton lock. Worker
 claims stop at configured capacity instead of accumulating unbounded in-process work.
 
+### Sequence 23: context pipeline and compact
+
+Sequence 23 provides all eight design contributors, conservative UTF-8 token
+estimation, per-route input/output reservations, gateway-backed compression, and
+explicit preservation of recent conversation/tool pairs, active files, unresolved task
+items, and errors. Completed/cancelled task history is compressible. The compaction API
+creates at most one pending request per session at a message watermark and records the
+actual `summarization` route; workers record summary usage without updating or deleting
+the source transcript.
+
 ## Local setup
 
 ```shell

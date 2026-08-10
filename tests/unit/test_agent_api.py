@@ -22,7 +22,9 @@ from agent_api.factory import AgentApiSettings, _credentials
 from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
+    ContextCompactionStatus,
     PersistedApproval,
+    PersistedContextCompaction,
     RunCreationResult,
 )
 from agent_core.domain.base import FrozenJsonObject
@@ -135,6 +137,24 @@ class BrokenRunRepository(RunRepositoryFake):
         )
 
 
+class OverloadedRunRepository(RunRepositoryFake):
+    async def create_idempotent(
+        self,
+        tenant_id: uuid.UUID,
+        run: Run,
+        *,
+        idempotency_key: str,
+        creation_hash: str,
+    ) -> RunCreationResult:
+        del tenant_id, run, idempotency_key, creation_hash
+        raise DomainOperationError(
+            code="queue_overloaded",
+            message="the global run queue has reached its admission threshold",
+            retryable=True,
+            details={"retry_after_seconds": 2.25, "scope": "global_queue"},
+        )
+
+
 class ApprovalRepositoryFake:
     def __init__(self) -> None:
         self.values: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], PersistedApproval] = {}
@@ -229,6 +249,90 @@ class ReadinessFake:
         return self.value
 
 
+class ContextRepositoryFake:
+    def __init__(self) -> None:
+        self.values: dict[tuple[uuid.UUID, uuid.UUID, str], PersistedContextCompaction] = {}
+
+    async def request_compaction(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        compaction_id: uuid.UUID,
+        idempotency_key: str,
+        route_name: str,
+        requested_at: datetime,
+    ) -> PersistedContextCompaction | None:
+        key = (tenant_id, session_id, idempotency_key)
+        existing = self.values.get(key)
+        if existing is not None:
+            if existing.route_name != route_name:
+                raise DomainOperationError(
+                    code="context_compaction_idempotency_conflict",
+                    message="the key belongs to another request",
+                )
+            return existing
+        pending = next(
+            (
+                value
+                for (stored_tenant, stored_session, _), value in self.values.items()
+                if stored_tenant == tenant_id
+                and stored_session == session_id
+                and value.status is ContextCompactionStatus.PENDING
+            ),
+            None,
+        )
+        if pending is not None:
+            raise DomainOperationError(
+                code="context_compaction_in_progress",
+                message="the session already has a pending context compaction",
+                retryable=True,
+                details={"compaction_id": str(pending.id)},
+            )
+        value = PersistedContextCompaction(
+            id=compaction_id,
+            session_id=session_id,
+            status=ContextCompactionStatus.PENDING,
+            idempotency_key=idempotency_key,
+            source_message_sequence=0,
+            route_name=route_name,
+            requested_at=requested_at,
+        )
+        self.values[key] = value
+        return value
+
+    async def latest_completed(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None:
+        matches = [
+            value
+            for (stored_tenant, stored_session, _), value in self.values.items()
+            if stored_tenant == tenant_id
+            and stored_session == session_id
+            and value.status is ContextCompactionStatus.COMPLETED
+        ]
+        return matches[-1] if matches else None
+
+    async def get(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        compaction_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None:
+        return next(
+            (
+                value
+                for (stored_tenant, stored_session, _), value in self.values.items()
+                if stored_tenant == tenant_id
+                and stored_session == session_id
+                and value.id == compaction_id
+            ),
+            None,
+        )
+
+
 def services() -> tuple[ApiServices, SessionRepositoryFake, RunRepositoryFake, EventStoreFake]:
     sessions = SessionRepositoryFake()
     runs = RunRepositoryFake()
@@ -246,6 +350,7 @@ def services() -> tuple[ApiServices, SessionRepositoryFake, RunRepositoryFake, E
             approvals=ApprovalRepositoryFake(),
             events=events,
             readiness=ReadinessFake(),
+            context=ContextRepositoryFake(),
         ),
         sessions,
         runs,
@@ -385,6 +490,78 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     )
     assert inactive.status_code == 409
     assert inactive.json()["error"]["code"] == "session_state_conflict"
+
+
+def test_compaction_operations_are_durable_and_tenant_scoped() -> None:
+    api_services, _, _, _ = services()
+    client = TestClient(create_app(api_services))
+    session = client.post(
+        "/v1/sessions",
+        headers=authorization(),
+        json={"workspace_id": str(WORKSPACE_ID)},
+    ).json()
+    session_id = uuid.UUID(session["id"])
+    compact_headers = {**authorization(), "Idempotency-Key": "compact-1"}
+    first_compaction = client.post(
+        f"/v1/sessions/{session_id}/compact",
+        headers=compact_headers,
+    )
+    replay = client.post(
+        f"/v1/sessions/{session_id}/compact",
+        headers=compact_headers,
+    )
+    denied = client.post(
+        f"/v1/sessions/{session_id}/compact",
+        headers={**authorization("token-b"), "Idempotency-Key": "compact-1"},
+    )
+    assert first_compaction.status_code == 202
+    assert first_compaction.json()["status"] == "pending"
+    assert first_compaction.json()["route_name"] == "summarization"
+    assert replay.json()["id"] == first_compaction.json()["id"]
+    assert denied.status_code == 404
+    concurrent = client.post(
+        f"/v1/sessions/{session_id}/compact",
+        headers={**authorization(), "Idempotency-Key": "compact-2"},
+    )
+    assert concurrent.status_code == 409
+    assert concurrent.json()["error"]["code"] == "context_compaction_in_progress"
+    compaction_status = client.get(
+        f"/v1/sessions/{session_id}/compactions/{first_compaction.json()['id']}",
+        headers=authorization(),
+    )
+    hidden_compaction = client.get(
+        f"/v1/sessions/{session_id}/compactions/{first_compaction.json()['id']}",
+        headers=authorization("token-b"),
+    )
+    assert compaction_status.json()["id"] == first_compaction.json()["id"]
+    assert hidden_compaction.status_code == 404
+
+def test_run_overload_response_is_structured_and_retryable() -> None:
+    api_services, sessions, _, _ = services()
+    overloaded = ApiServices(
+        authenticator=api_services.authenticator,
+        sessions=sessions,
+        runs=OverloadedRunRepository(),
+        approvals=api_services.approvals,
+        events=api_services.events,
+        readiness=api_services.readiness,
+    )
+    client = TestClient(create_app(overloaded))
+    session = client.post(
+        "/v1/sessions",
+        headers=authorization(),
+        json={"workspace_id": str(WORKSPACE_ID)},
+    ).json()
+
+    response = client.post(
+        f"/v1/sessions/{session['id']}/runs",
+        headers={**authorization(), "Idempotency-Key": "overload-1"},
+        json={},
+    )
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "3"
+    assert response.json()["error"]["code"] == "queue_overloaded"
+    assert response.json()["error"]["details"]["scope"] == "global_queue"
 
 
 def test_request_body_limit_rejects_declared_oversize_and_invalid_configuration() -> None:

@@ -228,6 +228,72 @@ class MessageRecord(Base):
     )
 
 
+class ContextCompactionRecord(Base):
+    """Explicit summary request referencing, but never replacing, source messages."""
+
+    __tablename__ = "context_compactions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "session_id"),
+            ("sessions.tenant_id", "sessions.id"),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "session_id", "idempotency_key"),
+        CheckConstraint("source_message_sequence >= 0", name="source_message_sequence"),
+        CheckConstraint(
+            "status IN ('pending', 'completed', 'failed')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND summary IS NULL AND input_tokens IS NULL "
+            "AND output_tokens IS NULL AND error IS NULL AND completed_at IS NULL) "
+            "OR (status = 'completed' AND summary IS NOT NULL "
+            "AND octet_length(summary) > 0 AND octet_length(summary) <= 262144 "
+            "AND input_tokens >= 0 AND output_tokens >= 0 AND error IS NULL "
+            "AND completed_at >= requested_at) "
+            "OR (status = 'failed' AND summary IS NULL AND input_tokens IS NULL "
+            "AND output_tokens IS NULL AND error IS NOT NULL "
+            "AND completed_at >= requested_at)",
+            name="terminal_outcome",
+        ),
+        CheckConstraint(
+            "error IS NULL OR jsonb_typeof(error) = 'object'",
+            name="error_object",
+        ),
+        Index(
+            "ix_context_compactions_tenant_session_requested",
+            "tenant_id",
+            "session_id",
+            "requested_at",
+        ),
+        Index(
+            "uq_context_compactions_one_pending",
+            "tenant_id",
+            "session_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_message_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    route_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    requested_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class TaskPlanRecord(Base):
     """Versioned durable structured task plan."""
 
@@ -915,6 +981,7 @@ __all__ = [
     "AgentEventRecord",
     "ApprovalRecord",
     "CheckpointRecord",
+    "ContextCompactionRecord",
     "GatewayCapacityLeaseRecord",
     "GatewayCircuitRecord",
     "GatewayProviderCapacityRecord",

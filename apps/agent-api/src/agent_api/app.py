@@ -38,7 +38,13 @@ from agent_api.schemas import (
     RewindRequest,
     RunCreationResponse,
 )
-from agent_core.control import ApprovalDecision, PersistedApproval, run_creation_hash
+from agent_core.context import CONTEXT_COMPACTION_ROUTE
+from agent_core.control import (
+    ApprovalDecision,
+    PersistedApproval,
+    PersistedContextCompaction,
+    run_creation_hash,
+)
 from agent_core.domain.errors import DomainOperationError
 from agent_core.domain.models import Run, Session
 from agent_core.domain.status import RunStatus, SessionStatus
@@ -178,6 +184,58 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         if session is None:
             raise _not_found("session", session_id)
         return session
+
+    @app.post(
+        "/v1/sessions/{session_id}/compact",
+        response_model=PersistedContextCompaction,
+        status_code=202,
+    )
+    async def compact_session(
+        session_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=255,
+                pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+            ),
+        ],
+    ) -> PersistedContextCompaction:
+        session = await services.sessions.get(identity.tenant_id, session_id)
+        if session is None:
+            raise _not_found("session", session_id)
+        context = _require_service(services.context, "context compaction")
+        compaction = await context.request_compaction(
+            identity.tenant_id,
+            session_id,
+            compaction_id=uuid.uuid4(),
+            idempotency_key=idempotency_key,
+            route_name=CONTEXT_COMPACTION_ROUTE,
+            requested_at=datetime.now(UTC),
+        )
+        if compaction is None:
+            raise _not_found("session", session_id)
+        return compaction
+
+    @app.get(
+        "/v1/sessions/{session_id}/compactions/{compaction_id}",
+        response_model=PersistedContextCompaction,
+    )
+    async def get_compaction(
+        session_id: uuid.UUID,
+        compaction_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> PersistedContextCompaction:
+        session = await services.sessions.get(identity.tenant_id, session_id)
+        if session is None:
+            raise _not_found("session", session_id)
+        context = _require_service(services.context, "context compaction")
+        compaction = await context.get(identity.tenant_id, session_id, compaction_id)
+        if compaction is None:
+            raise _not_found("context compaction", compaction_id)
+        return compaction
 
     @app.post("/v1/sessions/{session_id}/runs", response_model=RunCreationResponse)
     async def create_run(
@@ -370,6 +428,16 @@ def _not_found(resource: str, identifier: uuid.UUID) -> DomainOperationError:
         message=f"{resource} was not found",
         details={"id": str(identifier)},
     )
+
+
+def _require_service[T](service: T | None, feature: str) -> T:
+    if service is None:
+        raise DomainOperationError(
+            code="feature_unavailable",
+            message=f"{feature} is not configured",
+            retryable=True,
+        )
+    return service
 
 
 def _error_status(error: DomainOperationError) -> int:

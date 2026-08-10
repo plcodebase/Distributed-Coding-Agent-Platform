@@ -18,6 +18,7 @@ from platform_persistence import (
     Database,
     DatabaseSettings,
     PostgresApprovalRepository,
+    PostgresContextRepository,
     PostgresRunRepository,
     PostgresSessionRepository,
 )
@@ -77,6 +78,7 @@ def create_production_app(
         ),
     )
     approvals = PostgresApprovalRepository(database.sessions)
+    context = PostgresContextRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
     services = ApiServices(
         authenticator=authenticator,
@@ -85,6 +87,7 @@ def create_production_app(
         approvals=approvals,
         events=events,
         readiness=database,
+        context=context,
     )
     return create_app(services, close=database.aclose)
 

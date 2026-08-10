@@ -30,6 +30,7 @@ EXPECTED_TABLES = {
     "agent_events",
     "approvals",
     "checkpoints",
+    "context_compactions",
     "gateway_requests",
     "gateway_capacity_leases",
     "gateway_provider_capacity",
@@ -219,6 +220,13 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
             'down_revision: str | None = "0003"',
             "priority_class",
             "queue_admission",
+        ),
+        "0005_context_compaction.py": (
+            'revision: str = "0005"',
+            'down_revision: str | None = "0004"',
+            "context_compactions",
+            "source_message_sequence",
+            "uq_context_compactions_one_pending",
         ),
     }
     migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"

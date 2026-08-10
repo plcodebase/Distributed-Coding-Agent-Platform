@@ -11,7 +11,10 @@ from typing import Annotated, Self
 from pydantic import Field, StringConstraints, model_validator
 
 from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject
-from agent_core.domain.models import Run  # noqa: TC001 - Pydantic resolves run at runtime
+from agent_core.domain.models import (
+    IdentifierString,  # noqa: TC001 - runtime Pydantic field
+    Run,  # noqa: TC001 - Pydantic resolves run at runtime
+)
 from agent_core.gateway import MessageRole  # noqa: TC001 - Pydantic resolves role at runtime
 from agent_core.scheduling import RunPriorityClass
 
@@ -98,6 +101,68 @@ class PersistedTaskPlan(DomainModel):
     created_at: AwareTimestamp
 
 
+class ContextCompactionStatus(StrEnum):
+    """Durable lifecycle for an explicit transcript compaction request."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class PersistedContextCompaction(DomainModel):
+    """Append-only compaction metadata; the source transcript remains untouched."""
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    status: ContextCompactionStatus
+    idempotency_key: IdempotencyKey
+    source_message_sequence: int = Field(ge=0)
+    route_name: IdentifierString
+    summary: str | None = None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    error: FrozenJsonObject | None = None
+    requested_at: AwareTimestamp
+    completed_at: AwareTimestamp | None = None
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if self.summary is not None and len(self.summary.encode("utf-8")) > 256 * 1024:
+            raise ValueError("compaction summary exceeds its UTF-8 byte limit")
+        if self.status is ContextCompactionStatus.PENDING:
+            if any(
+                value is not None
+                for value in (
+                    self.summary,
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.error,
+                    self.completed_at,
+                )
+            ):
+                raise ValueError("pending compaction may not contain a terminal outcome")
+        elif self.status is ContextCompactionStatus.COMPLETED:
+            if (
+                not self.summary
+                or self.input_tokens is None
+                or self.output_tokens is None
+                or self.error is not None
+                or self.completed_at is None
+            ):
+                raise ValueError("completed compaction requires summary, usage, and timestamp")
+        elif (
+            self.error is None
+            or self.summary is not None
+            or self.input_tokens is not None
+            or self.output_tokens is not None
+            or self.completed_at is None
+        ):
+            raise ValueError("failed compaction requires only an error and timestamp")
+        if self.completed_at is not None and self.completed_at < self.requested_at:
+            raise ValueError("compaction completion may not precede its request")
+        return self
+
+
 def run_creation_hash(
     *,
     priority: int,
@@ -117,8 +182,10 @@ def run_creation_hash(
 __all__ = [
     "ApprovalDecision",
     "ApprovalStatus",
+    "ContextCompactionStatus",
     "IdempotencyKey",
     "PersistedApproval",
+    "PersistedContextCompaction",
     "PersistedMessage",
     "PersistedTaskPlan",
     "RunCreationResult",

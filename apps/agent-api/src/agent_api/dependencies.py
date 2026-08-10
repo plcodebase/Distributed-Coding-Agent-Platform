@@ -11,7 +11,12 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from agent_api.auth import Authenticator
-    from agent_core.control import ApprovalDecision, PersistedApproval, RunCreationResult
+    from agent_core.control import (
+        ApprovalDecision,
+        PersistedApproval,
+        PersistedContextCompaction,
+        RunCreationResult,
+    )
     from agent_core.domain.models import Run, Session
     from agent_core.event_store import EventPage, StoredEvent
 
@@ -94,6 +99,35 @@ class ReadinessProbe(Protocol):
     async def ready(self) -> bool: ...
 
 
+class ContextRepository(Protocol):
+    """Tenant-scoped explicit context compaction requests."""
+
+    async def request_compaction(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        compaction_id: uuid.UUID,
+        idempotency_key: str,
+        route_name: str,
+        requested_at: datetime,
+    ) -> PersistedContextCompaction | None: ...
+
+    async def latest_completed(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None: ...
+
+    async def get(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        compaction_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None: ...
+
+
+
 @dataclass(frozen=True, slots=True)
 class ApiServices:
     """Complete dependency graph for one API application instance."""
@@ -104,11 +138,13 @@ class ApiServices:
     approvals: ApprovalRepository
     events: EventStore
     readiness: ReadinessProbe
+    context: ContextRepository | None = None
 
 
 __all__ = [
     "ApiServices",
     "ApprovalRepository",
+    "ContextRepository",
     "EventStore",
     "ReadinessProbe",
     "RunRepository",

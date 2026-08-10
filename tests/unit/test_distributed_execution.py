@@ -8,6 +8,17 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from pydantic import ValidationError
 
+from agent_core.context import (
+    ContextBudgetRegistry,
+    ContextBuildRequest,
+    ContextBuildResult,
+    ContextCompressionRequest,
+    ContextCompressionResult,
+    ContextMemorySnippet,
+    ContextPipeline,
+    ContextRouteBudget,
+)
+from agent_core.control import ContextCompactionStatus, PersistedContextCompaction
 from agent_core.distributed import (
     DurableToolOutcome,
     RunExecutionResult,
@@ -45,6 +56,7 @@ from agent_scheduler.process import load_scheduler_factory
 from agent_worker import (
     DEFAULT_LOCAL_WORKER_PROCESSES,
     AgentLoopRunExecutor,
+    DurableRunContextBuilder,
     WorkerConfig,
     WorkerService,
 )
@@ -346,6 +358,134 @@ class PreloadedToolStore(MemoryToolStore):
         return self.durable
 
 
+class ContextBuilderFake:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def build(
+        self,
+        lease: RunLease,
+        workspace_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+    ) -> ContextBuildResult:
+        assert workspace_lease.run_id == lease.run_id
+        assert recovery.messages
+        self.calls += 1
+        return ContextBuildResult(
+            messages=(GatewayMessage(role=MessageRole.USER, content="bounded context"),),
+            estimated_tokens=20,
+            budget_tokens=100,
+            compressed=True,
+            summary="durable compacted context",
+            compression_input_tokens=10,
+            compression_output_tokens=4,
+        )
+
+
+class WorkerContextSourceFake:
+    def __init__(self) -> None:
+        self.watermark: int | None = None
+        self.previous_summary: str | None = None
+
+    async def load(
+        self,
+        lease: RunLease,
+        workspace_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+        *,
+        source_message_sequence: int | None,
+        previous_summary: str | None,
+        force_compaction: bool,
+    ) -> ContextBuildRequest:
+        assert workspace_lease.run_id == lease.run_id
+        self.watermark = source_message_sequence
+        self.previous_summary = previous_summary
+        return ContextBuildRequest(
+            tenant_id=lease.tenant_id,
+            session_id=lease.session_id,
+            run_id=lease.run_id,
+            route_name=lease.route_name,
+            system_instructions="preserve active work",
+            conversation=recovery.messages,
+            memories=(ContextMemorySnippet(memory_id=uuid.uuid4(), content="historical detail"),),
+            previous_summary=previous_summary,
+            force_compaction=force_compaction,
+        )
+
+
+class WorkerContextCompressorFake:
+    async def compress(self, request: ContextCompressionRequest) -> ContextCompressionResult:
+        assert "historical detail" in request.source_text
+        return ContextCompressionResult(
+            summary="new durable summary",
+            input_tokens=8,
+            output_tokens=3,
+        )
+
+
+class WorkerCompactionStoreFake:
+    def __init__(self) -> None:
+        self.pending = PersistedContextCompaction(
+            id=uuid.uuid4(),
+            session_id=SESSION_ID,
+            status=ContextCompactionStatus.PENDING,
+            idempotency_key="compact-1",
+            source_message_sequence=7,
+            route_name="coding-default",
+            requested_at=NOW,
+        )
+        self.completed: tuple[str, int, int] | None = None
+
+    async def pending_for_session(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None:
+        assert tenant_id == TENANT_ID and session_id == SESSION_ID
+        return self.pending
+
+    async def latest_completed(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ) -> PersistedContextCompaction | None:
+        assert tenant_id == TENANT_ID and session_id == SESSION_ID
+        return None
+
+    async def complete(
+        self,
+        tenant_id: uuid.UUID,
+        compaction_id: uuid.UUID,
+        *,
+        summary: str,
+        input_tokens: int,
+        output_tokens: int,
+        completed_at: datetime,
+    ) -> PersistedContextCompaction | None:
+        assert tenant_id == TENANT_ID and compaction_id == self.pending.id
+        assert completed_at >= NOW
+        self.completed = (summary, input_tokens, output_tokens)
+        return self.pending.model_copy(
+            update={
+                "status": ContextCompactionStatus.COMPLETED,
+                "summary": summary,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "completed_at": completed_at,
+            }
+        )
+
+    async def fail(
+        self,
+        tenant_id: uuid.UUID,
+        compaction_id: uuid.UUID,
+        *,
+        error: ErrorDetail,
+        completed_at: datetime,
+    ) -> PersistedContextCompaction | None:
+        raise AssertionError((tenant_id, compaction_id, error, completed_at))
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_executor_idempotently_persists_attempt_events() -> None:
     event_store = MemoryEventStore()
@@ -377,6 +517,57 @@ async def test_agent_loop_executor_idempotently_persists_attempt_events() -> Non
     assert second == first
     assert len(event_store.events) == event_count
     assert set(event_store.events).issuperset({"a1.g1.e1", "a1.g1.e2"})
+
+
+@pytest.mark.asyncio
+async def test_executor_uses_bounded_context_without_precommit_side_effects() -> None:
+    gateway = ScriptedModelGateway((ScriptedGatewayTurn.text("complete"),))
+    context = ContextBuilderFake()
+
+    executor = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: AgentLoop(
+            gateway=gateway,
+            tools=ToolRegistry(()),
+            clock=SteppingClock(NOW),
+            id_generator=SequentialIdGenerator(),
+        ),
+        events=MemoryEventStore(),
+        tool_calls=MemoryToolStore(),
+        context_builder=context,
+    )
+    result = await executor.execute(run_lease(), writer_lease(), recovery_state())
+
+    assert result.status is RunStatus.COMPLETED
+    assert context.calls == 1
+    assert gateway.requests[0].messages[0].content == "bounded context"
+
+
+@pytest.mark.asyncio
+async def test_durable_context_builder_honors_watermark_and_completes_request() -> None:
+    source = WorkerContextSourceFake()
+    compactions = WorkerCompactionStoreFake()
+    builder = DurableRunContextBuilder(
+        pipeline=ContextPipeline(
+            budgets=ContextBudgetRegistry(
+                (
+                    ContextRouteBudget(
+                        route_name="coding-default",
+                        max_context_tokens=10_000,
+                        reserved_output_tokens=1_000,
+                    ),
+                )
+            ),
+            compressor=WorkerContextCompressorFake(),
+        ),
+        source=source,
+        compactions=compactions,
+        clock=SteppingClock(NOW + timedelta(seconds=1)),
+    )
+    result = await builder.build(run_lease(), writer_lease(), recovery_state())
+
+    assert source.watermark == 7
+    assert result.summary == "new durable summary"
+    assert compactions.completed == ("new durable summary", 8, 3)
 
 
 @pytest.mark.asyncio

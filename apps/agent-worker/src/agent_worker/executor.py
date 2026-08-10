@@ -35,7 +35,19 @@ if TYPE_CHECKING:
     import uuid
     from collections.abc import Awaitable, Callable
 
+    from agent_core.context import ContextBuildResult
     from agent_core.event_store import IdempotentEventStore
+
+
+class RunContextBuilder(Protocol):
+    """Build one bounded run context from durable recovery and workspace state."""
+
+    async def build(
+        self,
+        lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+    ) -> ContextBuildResult: ...
 
 
 class ToolCallStore(Protocol):
@@ -69,12 +81,14 @@ class AgentLoopRunExecutor:
         loop_factory: AgentLoopFactory,
         events: IdempotentEventStore,
         tool_calls: ToolCallStore,
+        context_builder: RunContextBuilder | None = None,
     ) -> None:
         if not callable(loop_factory):
             raise TypeError("loop_factory must be callable")
         self._loop_factory = loop_factory
         self._events = events
         self._tool_calls = tool_calls
+        self._context_builder = context_builder
         self._active: dict[uuid.UUID, asyncio.Task[object]] = {}
         self._cancel_requested: set[uuid.UUID] = set()
         self._lock = asyncio.Lock()
@@ -99,7 +113,12 @@ class AgentLoopRunExecutor:
                 loop = await loop
             if not isinstance(loop, AgentLoop):
                 raise TypeError("loop_factory must return AgentLoop")
-            return await self._run_loop(loop, lease, recovery)
+            context = (
+                await self._context_builder.build(lease, writer_lease, recovery)
+                if self._context_builder is not None
+                else None
+            )
+            return await self._run_loop(loop, lease, recovery, context=context)
         except asyncio.CancelledError:
             async with self._lock:
                 distributed_cancel = lease.lease_token in self._cancel_requested
@@ -124,6 +143,8 @@ class AgentLoopRunExecutor:
         loop: AgentLoop,
         lease: RunLease,
         recovery: RunRecoveryState,
+        *,
+        context: ContextBuildResult | None,
     ) -> RunExecutionResult:
         observed: dict[str, _ObservedTool] = {}
         turn_number = 0
@@ -136,10 +157,14 @@ class AgentLoopRunExecutor:
             attempt=lease.attempt,
             worker_id=lease.worker_id,
             route_name=lease.route_name,
-            messages=recovery.messages,
+            messages=context.messages if context is not None else recovery.messages,
             checkpoint_id=last_checkpoint_id,
             task_plan=recovery.task_plan,
-            context_summary=recovery.context_summary,
+            context_summary=(
+                context.summary
+                if context is not None and context.summary is not None
+                else recovery.context_summary
+            ),
             prior_tool_outcomes=recovery.prior_tool_outcomes,
         )
         async for event in loop.run(loop_input):
@@ -329,4 +354,9 @@ class AgentLoopRunExecutor:
             )
 
 
-__all__ = ["AgentLoopFactory", "AgentLoopRunExecutor", "ToolCallStore"]
+__all__ = [
+    "AgentLoopFactory",
+    "AgentLoopRunExecutor",
+    "RunContextBuilder",
+    "ToolCallStore",
+]

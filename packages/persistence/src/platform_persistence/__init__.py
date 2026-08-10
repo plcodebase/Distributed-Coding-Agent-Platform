@@ -5,6 +5,9 @@ from platform_persistence.capacity import (
     PostgresGatewayCapacityStore,
     PostgresTenantQuotaRepository,
 )
+from platform_persistence.context_management import (
+    PostgresContextRepository,
+)
 from platform_persistence.database import Database, DatabaseSettings, PostgreSQLUrl
 from platform_persistence.distributed import (
     PostgresRecoveryStore,
@@ -43,9 +46,9 @@ __all__ = [
     "PersistedTaskPlan",
     "PostgreSQLUrl",
     "PostgresApprovalRepository",
+    "PostgresContextRepository",
     "PostgresExecutionRepository",
     "PostgresGatewayCapacityStore",
-    "PostgresTenantQuotaRepository",
     "PostgresGatewayCircuitBreaker",
     "PostgresGatewayRateLimiter",
     "PostgresGatewayRequestStore",
@@ -53,6 +56,7 @@ __all__ = [
     "PostgresRunQueue",
     "PostgresRunRepository",
     "PostgresSessionRepository",
+    "PostgresTenantQuotaRepository",
     "PostgresWorkspaceLeaseStore",
     "RunCreationResult",
     "run_creation_hash",
