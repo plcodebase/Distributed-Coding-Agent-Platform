@@ -25,9 +25,14 @@ failure and reassignment.
   - bounded acquisition and expiry timestamps.
 - Cap writer expiry at the owning run lease. Renewal validates both lease records under
   row locks.
-- Release only the exact token/generation. A stale worker may not clear a successor's
-  lease; scheduler recovery and normal run completion target the writer associated with
-  the old run-lease token.
+- Replaying acquisition for the exact same owner renews the writer up to the active run
+  expiry instead of returning a stale local expiry.
+- Release only the complete matching identity and token/generation. An exact repeated
+  release is idempotent only while the retained unowned row has the same generation.
+  Missing rows and stale/successor generations fail closed. Scheduler recovery and
+  normal run completion target the writer associated with the old run-lease token.
+- Pass the exact writer token/generation through the worker restore, execution, and
+  loop-composition boundaries.
 - Keep an unowned row after release so its generation remains monotonic.
 - Enforce relational ownership with a composite foreign key from
   `(tenant_id, run_id, workspace_id)` to the matching run. An application bug cannot
@@ -44,8 +49,9 @@ failure and reassignment.
 
 ## Verification
 
-- Unit tests cover acquire, same-owner replay, contention, heartbeat expiry capping,
-  stale heartbeat/release fencing, token validation, and scheduler cleanup.
+- Unit tests cover acquire/renewed same-owner replay, contention, heartbeat expiry
+  capping, complete-identity stale heartbeat/release fencing, repeated release, token
+  validation, and scheduler cleanup.
 - Real PostgreSQL tests prove a second run for the same workspace is not claimable,
   replacement ownership receives a higher generation, and a mismatched run/workspace
   relation violates the composite foreign key.

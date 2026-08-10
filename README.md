@@ -302,6 +302,8 @@ Sequence 17 provides:
 - `FOR UPDATE SKIP LOCKED` claims ordered by priority, age, and stable run ID;
 - SQL exclusion of cancelled runs and actively owned workspaces;
 - random lease tokens plus monotonic generations for stale-owner fencing;
+- active-lease-fenced worker event and tool-state writes using database-time expiry
+  checks;
 - transactionally returned capacity and ownership on completion or recovery;
 - real PostgreSQL concurrency coverage with three independent worker identities.
 
@@ -310,9 +312,13 @@ Sequence 17 provides:
 Sequence 18 provides:
 
 - durable worker identity, sandbox capabilities, slots, status, and heartbeat records;
-- bounded run leases with periodic run and workspace renewal;
+- bounded run leases with periodic run and workspace renewal across recovery,
+  restoration, and execution;
 - a worker service that runs model/tool orchestration outside FastAPI;
-- immediate pre-execution and heartbeat-observed distributed cancellation;
+- immediate pre-execution and heartbeat-observed cancellation of whichever worker phase
+  is active;
+- exact workspace-writer token/generation propagation into restoration, execution, and
+  loop composition;
 - graceful draining that rejects new claims while owned work finishes;
 - surfaced background task failures instead of unobserved asyncio exceptions;
 - a trusted composition-factory CLI that starts three spawned worker processes by
@@ -325,12 +331,12 @@ Sequence 19 provides:
 
 - bounded scheduler recovery of expired leases through `LOST` and back to `QUEUED`;
 - attempt increments and complete stale run/workspace lease cleanup;
-- active-lease-fenced loading of checkpoint conversation, plan, summary, and terminal
-  tool outcomes;
+- active-lease-fenced, aggregate-byte-bounded streaming of checkpoint session
+  conversation, plan, summary, and terminal tool outcomes;
 - restoration at the latest durable post-tool workspace revision;
 - monotonic tool-call persistence that accepts predecessor replay but rejects identity
   or terminal-outcome divergence;
-- reuse of matching terminal tool results without another handler invocation;
+- reuse only when terminal tool-call ID, name, and argument hash all match;
 - stable event delivery keys with database-enforced identical replay;
 - real PostgreSQL Worker A loss / Worker B restoration and completion coverage.
 
@@ -343,6 +349,7 @@ Sequence 20 provides:
 - distinct random writer tokens and monotonic writer generations;
 - renewal bounded by the owning run lease;
 - stale heartbeat and release rejection;
+- renewed same-owner acquisition and generation-aware idempotent release;
 - a composite database foreign key proving the writer's run targets the same workspace;
 - conservative serialization of all runs for a workspace until measured read sharing is
   introduced.

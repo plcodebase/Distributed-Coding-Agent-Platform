@@ -1089,18 +1089,22 @@ Implementation status through Sequences 17–20:
 * Sequence 17 uses the run row as the PostgreSQL queue and atomically claims with
   `FOR UPDATE SKIP LOCKED`. Claim also reserves worker capacity, a token/generation
   fenced run lease, and the workspace writer; cancelled and already-owned workspaces
-  are excluded before selection.
+  are excluded before selection. Worker event/tool writes revalidate that exact active
+  fence with database-time expiry in the write transaction.
 * Sequence 18 persists worker identity, supported sandbox types, slots, status, and
-  heartbeat. A provider-neutral worker service starts, renews, cancels, finishes, and
-  gracefully drains run attempts. Its local fleet CLI starts three spawned processes
-  by default, and the API contains no execution loop.
+  heartbeat. A provider-neutral worker service supervises recovery, restoration, and
+  execution with the same heartbeat, propagates the exact writer fence, cancels the
+  active phase, finishes, and gracefully drains run attempts. Its local fleet CLI
+  starts three spawned processes by default, and the API contains no execution loop.
 * Sequence 19 requeues matching expired attempts through `LOST`, increments the attempt,
-  and loads bounded checkpoint state only for the replacement lease. Tool states are
-  monotonic, event delivery keys are idempotent, and recovery restores the latest
-  durable post-tool workspace revision before reusing a terminal outcome.
+  and incrementally loads count/byte-bounded session checkpoint state only for the
+  replacement lease. Tool states are monotonic, event delivery keys are idempotent, and
+  recovery restores the latest durable post-tool workspace revision before reusing a
+  terminal outcome with the same call ID, name, and argument hash.
 * Sequence 20 enforces one `(tenant_id, workspace_id)` writer with an independent token
-  and monotonic generation. Renewal cannot outlive its run lease, stale releases fail
-  closed, and a composite foreign key proves the writer's run owns the same workspace.
+  and monotonic generation. Same-owner replay renews up to the active run expiry,
+  identity-complete stale releases fail closed, and a composite foreign key proves the
+  writer's run owns the same workspace.
 * Real PostgreSQL acceptance covers three concurrent claimers and an abandoned Worker A
   lease recovered by Worker B through the actual worker restore/completion boundary
   without another mutating tool record.

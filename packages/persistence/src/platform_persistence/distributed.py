@@ -688,7 +688,11 @@ class PostgresWorkspaceLeaseStore:
                     row.run_lease_token == run_lease.lease_token
                     and row.run_id == run_lease.run_id
                     and row.worker_id == run_lease.worker_id
+                    and row.tenant_id == run_lease.tenant_id
+                    and row.workspace_id == run_lease.workspace_id
                 ):
+                    row.expires_at = expires_at
+                    await database.flush()
                     return _workspace_lease_domain(row)
                 return None
             token = self._new_token()
@@ -731,10 +735,15 @@ class PostgresWorkspaceLeaseStore:
             )
             if (
                 run_lease is None
+                or run_lease.tenant_id != lease.tenant_id
                 or run_lease.worker_id != lease.worker_id
                 or run_lease.run_id != lease.run_id
                 or run_lease.expires_at <= timestamp
                 or row is None
+                or row.tenant_id != lease.tenant_id
+                or row.workspace_id != lease.workspace_id
+                or row.run_id != lease.run_id
+                or row.worker_id != lease.worker_id
                 or row.lease_token != lease.lease_token
                 or row.generation != lease.generation
                 or row.run_lease_token != lease.run_lease_token
@@ -766,9 +775,28 @@ class PostgresWorkspaceLeaseStore:
                 )
                 .with_for_update()
             )
-            if row is None or row.lease_token is None:
-                return
-            if row.lease_token != lease.lease_token or row.generation != lease.generation:
+            if row is None:
+                raise _workspace_lease_lost(lease)
+            if row.lease_token is None:
+                if (
+                    row.generation == lease.generation
+                    and row.run_id is None
+                    and row.worker_id is None
+                    and row.run_lease_token is None
+                    and row.acquired_at is None
+                    and row.expires_at is None
+                ):
+                    return
+                raise _workspace_lease_lost(lease)
+            if (
+                row.lease_token != lease.lease_token
+                or row.generation != lease.generation
+                or row.tenant_id != lease.tenant_id
+                or row.workspace_id != lease.workspace_id
+                or row.run_id != lease.run_id
+                or row.worker_id != lease.worker_id
+                or row.run_lease_token != lease.run_lease_token
+            ):
                 raise DomainOperationError(
                     code="workspace_lease_lost",
                     message="a stale worker may not release a successor workspace lease",
@@ -1081,6 +1109,15 @@ def _workspace_lease_domain(record: WorkspaceLeaseRecord) -> WorkspaceWriterLeas
         generation=record.generation,
         acquired_at=record.acquired_at,
         expires_at=record.expires_at,
+    )
+
+
+def _workspace_lease_lost(lease: WorkspaceWriterLease) -> DomainOperationError:
+    return DomainOperationError(
+        code="workspace_lease_lost",
+        message="the workspace writer lease is no longer owned",
+        retryable=True,
+        details={"workspace_id": str(lease.workspace_id)},
     )
 
 

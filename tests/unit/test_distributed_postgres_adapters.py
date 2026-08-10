@@ -561,6 +561,45 @@ async def test_postgres_workspace_lease_rejects_stale_owners() -> None:
 
 
 @pytest.mark.asyncio
+async def test_postgres_workspace_lease_replay_renews_and_release_is_fenced() -> None:
+    active_run = _run_lease_row()
+    row = _workspace_row(owned=True)
+    row.expires_at = NOW + timedelta(seconds=2)
+    store = PostgresWorkspaceLeaseStore(
+        _sessions(
+            _Database(
+                scalar_values=[active_run, row],
+                execute_results=[_ExecuteResult()],
+            ),
+            _Database(scalar_values=[row]),
+            _Database(scalar_values=[row]),
+        )
+    )
+
+    replay = await store.acquire(
+        _lease(),
+        occurred_at=NOW + timedelta(seconds=5),
+        lease_duration=timedelta(seconds=10),
+    )
+    assert replay is not None
+    assert replay.expires_at == NOW + timedelta(seconds=15)
+    await store.release(replay)
+    await store.release(replay)
+
+    missing = PostgresWorkspaceLeaseStore(_sessions(_Database(scalar_values=[None])))
+    with pytest.raises(DomainOperationError) as missing_release:
+        await missing.release(replay)
+    assert missing_release.value.code == "workspace_lease_lost"
+
+    successor = _workspace_row()
+    successor.generation = replay.generation + 1
+    stale = PostgresWorkspaceLeaseStore(_sessions(_Database(scalar_values=[successor])))
+    with pytest.raises(DomainOperationError) as stale_release:
+        await stale.release(replay)
+    assert stale_release.value.code == "workspace_lease_lost"
+
+
+@pytest.mark.asyncio
 async def test_postgres_recovery_loads_messages_plan_and_terminal_tool_outcomes() -> None:
     message = SimpleNamespace(
         sequence=1,
