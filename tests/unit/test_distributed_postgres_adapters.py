@@ -151,6 +151,18 @@ def _worker_row(
         last_heartbeat_at=NOW,
     )
 
+def _quota_row(*, max_active_runs: int = 4) -> SimpleNamespace:
+    return SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=max_active_runs,
+        max_queued_runs=100,
+        max_gateway_requests=4,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
 
 def _run_row(
     *,
@@ -158,12 +170,13 @@ def _run_row(
     cancellation_requested: bool = False,
     run_id: uuid.UUID = RUN_ID,
     workspace_id: uuid.UUID = WORKSPACE_ID,
+    tenant_id: uuid.UUID = TENANT_ID,
 ) -> SimpleNamespace:
     assigned = "worker-1" if status in {RunStatus.LEASED, RunStatus.RUNNING} else None
     started_at = NOW if status is RunStatus.RUNNING else None
     return SimpleNamespace(
         id=run_id,
-        tenant_id=TENANT_ID,
+        tenant_id=tenant_id,
         session_id=SESSION_ID,
         workspace_id=workspace_id,
         status=status.value,
@@ -296,7 +309,7 @@ async def test_postgres_queue_claim_start_heartbeat_and_finish() -> None:
     queued = _run_row()
     workspace = _workspace_row()
     claim_database = _Database(
-        scalar_values=[worker, workspace],
+        scalar_values=[worker, _quota_row(), 0, workspace],
         execute_results=[_ExecuteResult((queued, "coding-default")), _ExecuteResult()],
     )
     lease_row = _run_lease_row()
@@ -359,6 +372,52 @@ async def test_postgres_queue_claim_start_heartbeat_and_finish() -> None:
     )
     assert completed.status is RunStatus.COMPLETED
     assert finish_database.deleted == [running_lease_row]
+
+
+@pytest.mark.asyncio
+async def test_postgres_queue_skips_tenant_at_active_run_quota() -> None:
+    other_tenant = uuid.UUID("10000000-0000-0000-0000-000000000009")
+    other_run = _run_row(
+        run_id=uuid.UUID("30000000-0000-0000-0000-000000000009"),
+        workspace_id=uuid.UUID("40000000-0000-0000-0000-000000000009"),
+        tenant_id=other_tenant,
+    )
+    other_quota = _quota_row(max_active_runs=1)
+    other_quota.tenant_id = other_tenant
+    workspace = _workspace_row()
+    workspace.tenant_id = other_tenant
+    workspace.workspace_id = other_run.workspace_id
+    database = _Database(
+        scalar_values=[
+            _worker_row(),
+            _quota_row(max_active_runs=1),
+            1,
+            other_quota,
+            0,
+            workspace,
+        ],
+        execute_results=[
+            _ExecuteResult((_run_row(), "coding-default")),
+            _ExecuteResult(),
+            _ExecuteResult((other_run, "coding-default")),
+            _ExecuteResult(),
+            _ExecuteResult(),
+        ],
+    )
+    tokens = iter((RUN_TOKEN, WORKSPACE_TOKEN))
+    queue = PostgresRunQueue(
+        _sessions(database),
+        token_factory=lambda: next(tokens),
+    )
+
+    lease = await queue.claim(
+        "worker-1",
+        occurred_at=NOW,
+        lease_duration=timedelta(seconds=30),
+    )
+    assert lease is not None
+    assert lease.tenant_id == other_tenant
+    assert lease.run_id == other_run.id
     assert owned_workspace.lease_token is None
     assert finishing_worker.available_slots == 2
 
@@ -409,7 +468,7 @@ async def test_postgres_queue_claim_contention_and_fencing_fail_closed() -> None
     invalid_token = PostgresRunQueue(
         _sessions(
             _Database(
-                scalar_values=[_worker_row(), _workspace_row()],
+                scalar_values=[_worker_row(), _quota_row(), 0, _workspace_row()],
                 execute_results=[
                     _ExecuteResult((_run_row(), "route")),
                     _ExecuteResult(),

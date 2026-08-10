@@ -19,6 +19,7 @@ from agent_core.gateway import (
 from agent_core.settings import PlatformSettings
 from gateway_client import (
     GatewayClientConfig,
+    InMemoryGatewayCapacityStore,
     InMemoryGatewayCircuitBreaker,
     InMemoryGatewayRateLimiter,
     InMemoryGatewayRequestStore,
@@ -206,6 +207,12 @@ async def test_typed_gateway_client_normalizes_live_litellm_stream() -> None:
         rate_limiter=InMemoryGatewayRateLimiter(
             requests_per_window=config.rate_limit_requests,
             window_seconds=config.rate_limit_window_seconds,
+        ),
+        capacity_store=InMemoryGatewayCapacityStore(
+            tenant_request_limit=config.tenant_concurrent_requests,
+            provider_request_limit=config.provider_concurrent_requests,
+            provider_token_limit=config.provider_tokens_per_window,
+            token_window_seconds=config.provider_token_window_seconds,
         ),
         circuit_breaker=InMemoryGatewayCircuitBreaker(
             failure_threshold=config.circuit_failure_threshold,

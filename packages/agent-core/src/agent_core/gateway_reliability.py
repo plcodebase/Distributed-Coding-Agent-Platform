@@ -6,6 +6,11 @@ import uuid  # noqa: TC003 - Pydantic resolves tenant identifiers at runtime
 from enum import StrEnum
 from typing import Protocol
 
+from agent_core.capacity import (
+    GatewayCapacityClaim,
+    GatewayCapacityLease,
+    GatewayCapacityStore,
+)
 from agent_core.domain.base import DomainModel
 from agent_core.domain.errors import ErrorDetail  # noqa: TC001 - Pydantic resolves at runtime
 from agent_core.domain.models import Sha256Hex  # noqa: TC001 - Pydantic resolves at runtime
@@ -116,6 +121,9 @@ class GatewayCircuitBreaker(Protocol):
 
 
 __all__ = [
+    "GatewayCapacityClaim",
+    "GatewayCapacityLease",
+    "GatewayCapacityStore",
     "GatewayCircuitBreaker",
     "GatewayRateLimiter",
     "GatewayRequestClaim",

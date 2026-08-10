@@ -7,8 +7,9 @@ import hashlib
 import json
 import math
 import random
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING, Annotated, Self
 
 from pydantic import Field, StringConstraints, model_validator
@@ -28,6 +29,7 @@ from gateway_client.reliability import (
     GatewayRequestClaim,
     GatewayRequestClaimStatus,
     GatewayRequestStore,
+    InMemoryGatewayCapacityStore,
     InMemoryGatewayCircuitBreaker,
     InMemoryGatewayRateLimiter,
     InMemoryGatewayRequestStore,
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from types import TracebackType
 
+    from agent_core.capacity import GatewayCapacityLease, GatewayCapacityStore
     from agent_core.domain.models import Sha256Hex
 
 
@@ -66,6 +69,12 @@ class _ExecutionState:
     durable_completion: bool = False
 
 
+@dataclass(slots=True)
+class _CapacityHeartbeatState:
+    lease: GatewayCapacityLease
+    failure: Exception | None = None
+
+
 class GatewayClientConfig(DomainModel):
     """Closed limits and route allowlist for one gateway client."""
 
@@ -93,6 +102,14 @@ class GatewayClientConfig(DomainModel):
     circuit_recovery_seconds: float = Field(default=30, gt=0, le=3600)
     rate_limit_requests: int = Field(default=60, ge=1, le=1_000_000)
     rate_limit_window_seconds: float = Field(default=60, gt=0, le=3600)
+    max_concurrent_requests: int = Field(default=32, ge=1, le=10_000)
+    tenant_concurrent_requests: int = Field(default=8, ge=1, le=10_000)
+    provider_concurrent_requests: int = Field(default=32, ge=1, le=10_000)
+    provider_tokens_per_window: int = Field(default=1_000_000, ge=1, le=1_000_000_000)
+    provider_token_window_seconds: float = Field(default=60, gt=0, le=3600)
+    provider_output_token_reservation: int = Field(default=8192, ge=1, le=10_000_000)
+    capacity_lease_seconds: float = Field(default=300, gt=0, le=3600)
+    capacity_heartbeat_seconds: float = Field(default=60, gt=0, le=1200)
 
     @model_validator(mode="after")
     def validate_configuration(self) -> Self:
@@ -100,6 +117,8 @@ class GatewayClientConfig(DomainModel):
             raise ValueError("gateway route names must be unique")
         if self.retry_base_delay_seconds > self.retry_max_delay_seconds:
             raise ValueError("retry base delay may not exceed maximum delay")
+        if self.capacity_heartbeat_seconds >= self.capacity_lease_seconds:
+            raise ValueError("capacity heartbeat must be shorter than the capacity lease")
         return self
 
 
@@ -114,8 +133,10 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         close: Callable[[], Awaitable[None]] | None = None,
         request_store: GatewayRequestStore | None = None,
         rate_limiter: GatewayRateLimiter | None = None,
+        capacity_store: GatewayCapacityStore | None = None,
         circuit_breaker: GatewayCircuitBreaker | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        capacity_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_value: Callable[[], float] = random.random,
     ) -> None:
         self._gateway = gateway
@@ -127,11 +148,19 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
             requests_per_window=self._config.rate_limit_requests,
             window_seconds=self._config.rate_limit_window_seconds,
         )
+        self._capacity_store = capacity_store or InMemoryGatewayCapacityStore(
+            tenant_request_limit=self._config.tenant_concurrent_requests,
+            provider_request_limit=self._config.provider_concurrent_requests,
+            provider_token_limit=self._config.provider_tokens_per_window,
+            token_window_seconds=self._config.provider_token_window_seconds,
+        )
+        self._request_slots = asyncio.BoundedSemaphore(self._config.max_concurrent_requests)
         self._circuit_breaker = circuit_breaker or InMemoryGatewayCircuitBreaker(
             failure_threshold=self._config.circuit_failure_threshold,
             recovery_seconds=self._config.circuit_recovery_seconds,
         )
         self._sleep = sleep
+        self._capacity_sleep = capacity_sleep
         self._random_value = random_value
         self._close_lock = asyncio.Lock()
         self._closing = False
@@ -181,7 +210,10 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
             self._cleanup_required = False
             self._closed = True
 
-    async def stream(self, request: GatewayRequest) -> AsyncIterator[GatewayEvent]:
+    async def stream(  # noqa: PLR0912, PLR0915 - one auditable resource lifecycle
+        self,
+        request: GatewayRequest,
+    ) -> AsyncIterator[GatewayEvent]:
         """Execute or replay one bounded, attributed, idempotent logical request."""
 
         self._require_available(request=request)
@@ -196,9 +228,23 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
 
         provider_contacted = False
         completed = False
+        local_slot = False
+        capacity_state: _CapacityHeartbeatState | None = None
+        capacity_heartbeat: asyncio.Task[None] | None = None
         execution_state = _ExecutionState()
         try:
             await self._enforce_rate_limit(request)
+            await self._request_slots.acquire()
+            local_slot = True
+            self._require_available(request=request)
+            capacity_state = _CapacityHeartbeatState(lease=await self._acquire_capacity(request))
+            owner_task = asyncio.current_task()
+            if owner_task is None:
+                raise RuntimeError("gateway streaming requires an asyncio task")
+            capacity_heartbeat = asyncio.create_task(
+                self._heartbeat_capacity(capacity_state, owner_task),
+                name=f"gateway-capacity-{request.request_id}",
+            )
             await self._require_closed_circuit(request)
             provider_contacted = True
             execution = self._execute_with_retries(
@@ -214,23 +260,145 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                         # before handing control to a consumer that may immediately
                         # close the async generator.
                         completed = True
+                        if capacity_state is None:
+                            raise AssertionError("provider contact requires a capacity lease")
+                        await self._stop_capacity_heartbeat(capacity_heartbeat)
+                        capacity_heartbeat = None
+                        await self._release_capacity(
+                            capacity_state.lease,
+                            consumed_tokens=event.input_tokens + event.output_tokens,
+                        )
+                        capacity_state = None
+                        self._request_slots.release()
+                        local_slot = False
                     yield event
             finally:
                 await _close_stream(execution, request=request)
             completed = True
+        except asyncio.CancelledError:
+            if capacity_state is not None and capacity_state.failure is not None:
+                raise DomainOperationError(
+                    code="gateway_capacity_lease_lost",
+                    message="the live gateway request lost its distributed capacity lease",
+                    retryable=True,
+                    details={"request_id": request.request_id},
+                ) from capacity_state.failure
+            raise
         finally:
-            if provider_contacted and not completed and not execution_state.durable_completion:
-                await self._fail_request(
-                    request,
-                    request_hash,
-                    ErrorDetail(
-                        code="gateway_request_aborted",
-                        message="the gateway request did not complete",
-                        retryable=True,
-                    ),
+            try:
+                await self._stop_capacity_heartbeat(capacity_heartbeat)
+                capacity_heartbeat = None
+                if capacity_state is not None:
+                    await self._release_capacity(
+                        capacity_state.lease,
+                        consumed_tokens=(
+                            capacity_state.lease.reserved_tokens if provider_contacted else 0
+                        ),
+                    )
+                    capacity_state = None
+            finally:
+                if local_slot:
+                    self._request_slots.release()
+                if provider_contacted and not completed and not execution_state.durable_completion:
+                    await self._fail_request(
+                        request,
+                        request_hash,
+                        ErrorDetail(
+                            code="gateway_request_aborted",
+                            message="the gateway request did not complete",
+                            retryable=True,
+                        ),
+                    )
+                elif not provider_contacted:
+                    await self._release_request(request, request_hash)
+
+    async def _acquire_capacity(self, request: GatewayRequest) -> GatewayCapacityLease:
+        reserved_tokens = _request_size(request) + self._config.provider_output_token_reservation
+        try:
+            claim = await self._capacity_store.acquire(
+                request.tenant_id,
+                request.route_name,
+                request.request_id,
+                reserved_tokens=reserved_tokens,
+                lease_duration=timedelta(seconds=self._config.capacity_lease_seconds),
+            )
+        except Exception as error:
+            raise DomainOperationError(
+                code="gateway_capacity_unavailable",
+                message="the gateway capacity policy is unavailable",
+                retryable=True,
+                details={"request_id": request.request_id},
+            ) from error
+        if claim.rejection is not None:
+            raise DomainOperationError(
+                code="gateway_capacity_exhausted",
+                message="gateway or provider capacity is exhausted",
+                retryable=True,
+                details={
+                    "request_id": request.request_id,
+                    "route_name": request.route_name,
+                    "scope": claim.rejection.scope.value,
+                    "retry_after_seconds": claim.rejection.retry_after_seconds,
+                },
+            )
+        if claim.lease is None:
+            raise AssertionError("validated gateway capacity claim must contain a lease")
+        return claim.lease
+
+    async def _release_capacity(
+        self,
+        lease: GatewayCapacityLease,
+        *,
+        consumed_tokens: int,
+    ) -> None:
+        operation = asyncio.create_task(
+            self._capacity_store.release(lease, consumed_tokens=consumed_tokens)
+        )
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            try:
+                await operation
+            except Exception:
+                self._cleanup_required = True
+            raise
+        except Exception as error:
+            self._cleanup_required = True
+            raise DomainOperationError(
+                code="gateway_capacity_unavailable",
+                message="the gateway capacity lease could not be released",
+                retryable=True,
+                details={"request_id": lease.request_id},
+            ) from error
+
+    async def _heartbeat_capacity(
+        self,
+        state: _CapacityHeartbeatState,
+        owner_task: asyncio.Task[object],
+    ) -> None:
+        while True:
+            await self._capacity_sleep(self._config.capacity_heartbeat_seconds)
+            try:
+                renewed = await self._capacity_store.renew(
+                    state.lease,
+                    lease_duration=timedelta(seconds=self._config.capacity_lease_seconds),
                 )
-            elif not provider_contacted:
-                await self._release_request(request, request_hash)
+                _require_valid_capacity_renewal(state.lease, renewed)
+                state.lease = renewed
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                state.failure = error
+                owner_task.cancel()
+                return
+
+    @staticmethod
+    async def _stop_capacity_heartbeat(task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     @staticmethod
     def _stored_events_or_raise(
@@ -609,6 +777,29 @@ def _request_hash(request: GatewayRequest) -> Sha256Hex:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _valid_capacity_renewal(
+    previous: GatewayCapacityLease,
+    renewed: GatewayCapacityLease,
+) -> bool:
+    return (
+        renewed.id == previous.id
+        and renewed.tenant_id == previous.tenant_id
+        and renewed.route_name == previous.route_name
+        and renewed.request_id == previous.request_id
+        and renewed.reserved_tokens == previous.reserved_tokens
+        and renewed.acquired_at == previous.acquired_at
+        and renewed.expires_at > previous.expires_at
+    )
+
+
+def _require_valid_capacity_renewal(
+    previous: GatewayCapacityLease,
+    renewed: GatewayCapacityLease,
+) -> None:
+    if not _valid_capacity_renewal(previous, renewed):
+        raise ValueError("capacity renewal returned mismatched ownership")
 
 
 def _require_terminal_event(

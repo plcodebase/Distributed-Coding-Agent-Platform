@@ -3,11 +3,13 @@ from __future__ import annotations
 import uuid
 from collections import deque
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import MethodType, SimpleNamespace
 from typing import Any, Self, cast
 
 import pytest
 
+from agent_core.capacity import TenantQuota
 from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
@@ -40,11 +42,13 @@ from event_store import PostgresEventStore
 from platform_persistence import (
     PostgresApprovalRepository,
     PostgresExecutionRepository,
+    PostgresGatewayCapacityStore,
     PostgresGatewayCircuitBreaker,
     PostgresGatewayRateLimiter,
     PostgresGatewayRequestStore,
     PostgresRunRepository,
     PostgresSessionRepository,
+    PostgresTenantQuotaRepository,
 )
 
 TENANT_ID = uuid.uuid4()
@@ -84,7 +88,9 @@ class _FakeDatabase:
         self.scalar_values = deque(scalars or [])
         self.row_pages = deque(row_pages or [])
         self.added: list[object] = []
+        self.deleted: list[object] = []
         self.executed = 0
+        self.flushes = 0
 
     async def __aenter__(self) -> Self:
         return self
@@ -110,6 +116,12 @@ class _FakeDatabase:
 
     def add(self, value: object) -> None:
         self.added.append(value)
+
+    async def delete(self, value: object) -> None:
+        self.deleted.append(value)
+
+    async def flush(self) -> None:
+        self.flushes += 1
 
 
 class _SessionFactory:
@@ -303,6 +315,119 @@ async def test_postgres_rate_limiter_enforces_and_resets_shared_window() -> None
     )
     with pytest.raises(ValueError, match="route"):
         await invalid_route.acquire(TENANT_ID, " ")
+
+
+@pytest.mark.asyncio
+async def test_postgres_capacity_store_acquires_reconciles_and_releases_atomically() -> None:
+    quota = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=2,
+        max_queued_runs=10,
+        max_gateway_requests=2,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    route = SimpleNamespace(
+        route_name="coding-default",
+        request_limit=9,
+        token_limit=999,
+        token_window_seconds=Decimal("30.000"),
+        token_window_started_at=NOW,
+        accounted_tokens=10,
+        updated_at=NOW,
+    )
+    lease_id = uuid.UUID("40000000-0000-0000-0000-000000000001")
+    acquire_database = _FakeDatabase(scalars=[quota, route, None, 0, 0])
+    release_route = SimpleNamespace(**vars(route))
+    store = PostgresGatewayCapacityStore(
+        _sessions(
+            acquire_database,
+            _FakeDatabase(scalars=[None]),
+        ),
+        provider_request_limit=3,
+        provider_token_limit=100,
+        token_window_seconds=60,
+        clock=lambda: NOW,
+        id_factory=lambda: lease_id,
+    )
+
+    claim = await store.acquire(
+        TENANT_ID,
+        "coding-default",
+        "request-capacity-1",
+        reserved_tokens=20,
+        lease_duration=timedelta(seconds=30),
+    )
+    assert claim.lease is not None
+    assert claim.lease.id == lease_id
+    assert route.accounted_tokens == 30
+    assert route.request_limit == 3
+    assert route.token_limit == 100
+    assert route.token_window_seconds == Decimal("60.0")
+    assert len(acquire_database.added) == 1
+
+    lease_row = acquire_database.added[0]
+    renewal_database = _FakeDatabase(scalars=[lease_row])
+    renewing = PostgresGatewayCapacityStore(
+        _sessions(renewal_database),
+        provider_request_limit=3,
+        provider_token_limit=100,
+        token_window_seconds=60,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    renewed = await renewing.renew(claim.lease, lease_duration=timedelta(seconds=30))
+    assert renewed.expires_at == NOW + timedelta(seconds=31)
+    assert renewal_database.flushes == 1
+
+    release_route.accounted_tokens = route.accounted_tokens
+    release_database = _FakeDatabase(scalars=[lease_row, release_route])
+    releasing = PostgresGatewayCapacityStore(
+        _sessions(release_database),
+        provider_request_limit=3,
+        provider_token_limit=100,
+        token_window_seconds=60,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    await releasing.release(renewed, consumed_tokens=7)
+    assert release_route.accounted_tokens == 17
+    assert release_database.deleted == [lease_row]
+
+    await store.release(claim.lease, consumed_tokens=7)
+
+
+@pytest.mark.asyncio
+async def test_postgres_tenant_quota_repository_persists_validated_overrides() -> None:
+    row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=4,
+        max_queued_runs=100,
+        max_gateway_requests=4,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    repository = PostgresTenantQuotaRepository(
+        _sessions(_FakeDatabase(scalars=[row]), _FakeDatabase(scalars=[row])),
+        clock=lambda: NOW,
+    )
+    assert await repository.get(TENANT_ID) == TenantQuota()
+    updated = TenantQuota(
+        max_active_runs=2,
+        max_queued_runs=20,
+        max_gateway_requests=3,
+        memory_enabled=False,
+    )
+    assert (
+        await repository.set(
+            TENANT_ID,
+            updated,
+            occurred_at=NOW + timedelta(seconds=1),
+        )
+        == updated
+    )
+    assert row.max_active_runs == 2
+    assert row.memory_enabled is False
 
 
 @pytest.mark.parametrize(

@@ -354,6 +354,15 @@ Sequence 20 provides:
 - conservative serialization of all runs for a workspace until measured read sharing is
   introduced.
 
+### Sequence 21: bounded concurrency and tenant quotas
+
+Sequence 21 provides independent worker run/sandbox semaphores, PostgreSQL-backed
+tenant active/queued-run limits, shared gateway request slots, provider-route request
+and token-window limits, renewable expiring capacity claims, cancellation-safe release,
+and structured capacity errors. Platform-owned route settings reconcile after restart.
+All admission state is injected behind typed interfaces; no process-local fallback is
+used in production composition.
+
 ## Local setup
 
 ```shell

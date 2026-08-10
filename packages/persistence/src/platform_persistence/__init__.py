@@ -1,6 +1,10 @@
 """PostgreSQL system-of-record adapters for the agent platform."""
 
 from platform_persistence.base import Base
+from platform_persistence.capacity import (
+    PostgresGatewayCapacityStore,
+    PostgresTenantQuotaRepository,
+)
 from platform_persistence.database import Database, DatabaseSettings, PostgreSQLUrl
 from platform_persistence.distributed import (
     PostgresRecoveryStore,
@@ -40,6 +44,8 @@ __all__ = [
     "PostgreSQLUrl",
     "PostgresApprovalRepository",
     "PostgresExecutionRepository",
+    "PostgresGatewayCapacityStore",
+    "PostgresTenantQuotaRepository",
     "PostgresGatewayCircuitBreaker",
     "PostgresGatewayRateLimiter",
     "PostgresGatewayRequestStore",

@@ -11,6 +11,7 @@ from sqlalchemy import Text, func, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
+from agent_core.capacity import TenantQuota
 from agent_core.distributed import (
     MAX_RECOVERY_STATE_BYTES,
     DurableToolOutcome,
@@ -28,6 +29,7 @@ from agent_core.domain.models import Checkpoint, Run
 from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.domain.transitions import transition_run
 from agent_core.gateway import GatewayMessage
+from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
     CheckpointRecord,
@@ -54,6 +56,7 @@ MAX_RECOVERY_MESSAGES = 4096
 MAX_RECOVERY_TOOL_OUTCOMES = 100
 MAX_RECOVERY_CONTEXT_BYTES = 8 * 1024 * 1024
 MAX_RECOVERY_TOOL_BYTES = 8 * 1024 * 1024
+MAX_CLAIM_CANDIDATES = 1000
 
 
 def _operation_time(value: datetime, *, code: str) -> datetime:
@@ -139,12 +142,14 @@ class PostgresRunQueue:
         sessions: async_sessionmaker[AsyncSession],
         *,
         token_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+        default_quota: TenantQuota | None = None,
     ) -> None:
         if not callable(token_factory):
             raise TypeError("token_factory must be callable")
         self._sessions = sessions
         self._token_factory = token_factory
 
+        self._default_quota = default_quota or TenantQuota()
     async def register_worker(self, registration: WorkerRegistration) -> WorkerRegistration:
         async with self._sessions() as database, database.begin():
             row = await database.scalar(
@@ -278,7 +283,7 @@ class PostgresRunQueue:
             claimed: tuple[RunRecord, str] | None = None
             workspace_row: WorkspaceLeaseRecord | None = None
             skipped_run_ids: list[uuid.UUID] = []
-            for _ in range(32):
+            for _ in range(MAX_CLAIM_CANDIDATES):
                 statement = (
                     select(RunRecord, SessionRecord.model_route)
                     .join(
@@ -311,6 +316,24 @@ class PostgresRunQueue:
                 if candidate is None:
                     break
                 candidate_run, candidate_route = candidate
+                quota = await ensure_tenant_quota(
+                    database,
+                    candidate_run.tenant_id,
+                    default=self._default_quota,
+                    occurred_at=timestamp,
+                    lock=True,
+                )
+                tenant_active = int(
+                    await database.scalar(
+                        select(func.count())
+                        .select_from(RunLeaseRecord)
+                        .where(RunLeaseRecord.tenant_id == candidate_run.tenant_id)
+                    )
+                    or 0
+                )
+                if tenant_active >= quota.max_active_runs:
+                    skipped_run_ids.append(candidate_run.id)
+                    continue
                 await database.execute(
                     insert(WorkspaceLeaseRecord)
                     .values(

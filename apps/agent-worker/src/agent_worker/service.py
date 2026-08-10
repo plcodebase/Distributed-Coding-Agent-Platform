@@ -48,6 +48,7 @@ class WorkerConfig(DomainModel):
         max_length=32,
     )
     total_slots: int = Field(default=1, ge=1, le=128)
+    sandbox_slots: int = Field(default=1, ge=1, le=128)
     lease_seconds: float = Field(default=30, gt=1, le=3600)
     heartbeat_seconds: float = Field(default=5, gt=0.1, le=300)
     poll_seconds: float = Field(default=0.25, ge=0.01, le=10)
@@ -56,6 +57,8 @@ class WorkerConfig(DomainModel):
     def validate_timing(self) -> Self:
         if self.heartbeat_seconds * 2 >= self.lease_seconds:
             raise ValueError("heartbeat_seconds must be less than half lease_seconds")
+        if self.sandbox_slots > self.total_slots:
+            raise ValueError("sandbox_slots may not exceed total_slots")
         if len(set(self.supported_sandbox_types)) != len(self.supported_sandbox_types):
             raise ValueError("supported_sandbox_types must be unique")
         return self
@@ -85,6 +88,7 @@ class WorkerService:
         self._clock = clock
         self._sleep = sleep
         self._active: set[asyncio.Task[None]] = set()
+        self._sandbox_slots = asyncio.BoundedSemaphore(config.sandbox_slots)
         self._fatal_error: BaseException | None = None
         self._draining = False
         self._registered = False
@@ -190,6 +194,7 @@ class WorkerService:
         lease = original_lease
         heartbeat: asyncio.Task[None] | None = None
         workspace_lease: WorkspaceWriterLease | None = None
+        sandbox_slot = False
         try:
             lease = await self._queue.start(lease, occurred_at=self._clock.now())
             if lease.cancellation_requested:
@@ -218,6 +223,14 @@ class WorkerService:
                 ),
                 heartbeat,
             )
+            await self._wait_phase_or_heartbeat(
+                asyncio.create_task(
+                    self._sandbox_slots.acquire(),
+                    name=f"sandbox-capacity-{lease.run_id}",
+                ),
+                heartbeat,
+            )
+            sandbox_slot = True
             if recovery.checkpoint is not None:
                 await self._wait_phase_or_heartbeat(
                     asyncio.create_task(
@@ -265,6 +278,8 @@ class WorkerService:
             )
             raise failure from None
         finally:
+            if sandbox_slot:
+                self._sandbox_slots.release()
             if heartbeat is not None:
                 heartbeat.cancel()
                 with suppress(asyncio.CancelledError, DomainOperationError):

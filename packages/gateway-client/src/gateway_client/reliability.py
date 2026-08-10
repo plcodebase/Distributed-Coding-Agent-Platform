@@ -5,10 +5,20 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from agent_core.capacity import (
+    CapacityRejection,
+    CapacityScope,
+    GatewayCapacityClaim,
+    GatewayCapacityLease,
+    GatewayCapacityStore,
+)
+from agent_core.domain.errors import DomainOperationError
 from agent_core.gateway_reliability import (
     GatewayCircuitBreaker,
     GatewayRateLimiter,
@@ -18,7 +28,6 @@ from agent_core.gateway_reliability import (
 )
 
 if TYPE_CHECKING:
-    import uuid
     from collections.abc import Callable
 
     from agent_core.domain.errors import ErrorDetail
@@ -30,6 +39,8 @@ MAX_LOCAL_POLICY_KEYS = 100_000
 MAX_LOCAL_CIRCUIT_ROUTES = 1000
 MAX_RATE_LIMIT_REQUESTS = 1_000_000
 MAX_CIRCUIT_FAILURE_THRESHOLD = 100
+MAX_PROVIDER_TOKENS_PER_WINDOW = 1_000_000_000
+MAX_CONCURRENT_GATEWAY_REQUESTS = 10_000
 
 
 @dataclass(slots=True)
@@ -38,6 +49,204 @@ class _StoredRequest:
     status: GatewayRequestClaimStatus
     events: tuple[GatewayEvent, ...] = ()
     error: ErrorDetail | None = None
+
+
+@dataclass(slots=True)
+class _CapacityLeaseState:
+    lease: GatewayCapacityLease
+    token_window_started_at: datetime
+
+
+@dataclass(slots=True)
+class _TokenWindow:
+    started_at: datetime
+    tokens: int = 0
+
+
+class InMemoryGatewayCapacityStore:
+    """Deterministic all-or-nothing local gateway/provider capacity policy."""
+
+    def __init__(
+        self,
+        *,
+        tenant_request_limit: int,
+        provider_request_limit: int,
+        provider_token_limit: int,
+        token_window_seconds: float,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+    ) -> None:
+        self._tenant_limit = _bounded_integer(
+            "tenant_request_limit",
+            tenant_request_limit,
+            maximum=MAX_CONCURRENT_GATEWAY_REQUESTS,
+        )
+        self._provider_limit = _bounded_integer(
+            "provider_request_limit",
+            provider_request_limit,
+            maximum=MAX_CONCURRENT_GATEWAY_REQUESTS,
+        )
+        self._token_limit = _bounded_integer(
+            "provider_token_limit",
+            provider_token_limit,
+            maximum=MAX_PROVIDER_TOKENS_PER_WINDOW,
+        )
+        self._window = _bounded_seconds("token_window_seconds", token_window_seconds)
+        if not callable(clock) or not callable(id_factory):
+            raise TypeError("capacity clock and id_factory must be callable")
+        self._clock = clock
+        self._id_factory = id_factory
+        self._lock = asyncio.Lock()
+        self._leases: dict[uuid.UUID, _CapacityLeaseState] = {}
+        self._requests: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
+        self._tokens: dict[str, _TokenWindow] = {}
+
+    async def acquire(
+        self,
+        tenant_id: uuid.UUID,
+        route_name: str,
+        request_id: str,
+        *,
+        reserved_tokens: int,
+        lease_duration: timedelta,
+    ) -> GatewayCapacityClaim:
+        reserved_tokens = _bounded_integer(
+            "reserved_tokens",
+            reserved_tokens,
+            maximum=MAX_PROVIDER_TOKENS_PER_WINDOW,
+        )
+        duration = _bounded_seconds("lease_duration", lease_duration.total_seconds())
+        now = _aware_clock_value(self._clock())
+        async with self._lock:
+            self._prune(now)
+            request_key = (tenant_id, request_id)
+            existing_id = self._requests.get(request_key)
+            if existing_id is not None:
+                existing = self._leases[existing_id].lease
+                if existing.route_name != route_name or existing.reserved_tokens != reserved_tokens:
+                    raise ValueError("gateway capacity request identity is already in use")
+                return GatewayCapacityClaim(lease=existing)
+
+            tenant_leases = tuple(
+                state.lease for state in self._leases.values() if state.lease.tenant_id == tenant_id
+            )
+            if len(tenant_leases) >= self._tenant_limit:
+                return GatewayCapacityClaim(
+                    rejection=CapacityRejection(
+                        scope=CapacityScope.TENANT_GATEWAY_REQUESTS,
+                        retry_after_seconds=_retry_after(tenant_leases, now),
+                    )
+                )
+            route_leases = tuple(
+                state.lease
+                for state in self._leases.values()
+                if state.lease.route_name == route_name
+            )
+            if len(route_leases) >= self._provider_limit:
+                return GatewayCapacityClaim(
+                    rejection=CapacityRejection(
+                        scope=CapacityScope.PROVIDER_REQUESTS,
+                        retry_after_seconds=_retry_after(route_leases, now),
+                    )
+                )
+
+            window = self._token_window(route_name, now)
+            if window.tokens + reserved_tokens > self._token_limit:
+                return GatewayCapacityClaim(
+                    rejection=CapacityRejection(
+                        scope=CapacityScope.PROVIDER_TOKENS,
+                        retry_after_seconds=max(
+                            0.001,
+                            self._window - (now - window.started_at).total_seconds(),
+                        ),
+                    )
+                )
+
+            lease_id = self._id_factory()
+            if not isinstance(lease_id, uuid.UUID):
+                raise TypeError("capacity id_factory must return UUID values")
+            lease = GatewayCapacityLease(
+                id=lease_id,
+                tenant_id=tenant_id,
+                route_name=route_name,
+                request_id=request_id,
+                reserved_tokens=reserved_tokens,
+                acquired_at=now,
+                expires_at=now + timedelta(seconds=duration),
+            )
+            window.tokens += reserved_tokens
+            self._leases[lease.id] = _CapacityLeaseState(
+                lease=lease,
+                token_window_started_at=window.started_at,
+            )
+            self._requests[request_key] = lease.id
+            return GatewayCapacityClaim(lease=lease)
+
+    async def release(
+        self,
+        lease: GatewayCapacityLease,
+        *,
+        consumed_tokens: int,
+    ) -> None:
+        if (
+            type(consumed_tokens) is not int
+            or not 0 <= consumed_tokens <= MAX_PROVIDER_TOKENS_PER_WINDOW
+        ):
+            raise ValueError("consumed_tokens must be in [0, 1000000000]")
+        now = _aware_clock_value(self._clock())
+        async with self._lock:
+            state = self._leases.pop(lease.id, None)
+            if state is None:
+                return
+            if state.lease != lease:
+                self._leases[lease.id] = state
+                raise ValueError("gateway capacity lease does not match durable ownership")
+            self._requests.pop((lease.tenant_id, lease.request_id), None)
+            window = self._token_window(lease.route_name, now)
+            if window.started_at == state.token_window_started_at:
+                window.tokens = max(
+                    0,
+                    window.tokens - lease.reserved_tokens + consumed_tokens,
+                )
+
+    async def renew(
+        self,
+        lease: GatewayCapacityLease,
+        *,
+        lease_duration: timedelta,
+    ) -> GatewayCapacityLease:
+        if not isinstance(lease, GatewayCapacityLease):
+            raise TypeError("lease must be a GatewayCapacityLease")
+        duration = _bounded_seconds("lease_duration", lease_duration.total_seconds())
+        now = _aware_clock_value(self._clock())
+        async with self._lock:
+            self._prune(now)
+            state = self._leases.get(lease.id)
+            if state is None or state.lease != lease:
+                raise DomainOperationError(
+                    code="gateway_capacity_lease_lost",
+                    message="the gateway capacity lease is no longer owned",
+                    retryable=True,
+                )
+            renewed = lease.model_copy(update={"expires_at": now + timedelta(seconds=duration)})
+            state.lease = renewed
+            return renewed
+
+    def _prune(self, now: datetime) -> None:
+        for lease_id, state in tuple(self._leases.items()):
+            if state.lease.expires_at <= now:
+                del self._leases[lease_id]
+                self._requests.pop(
+                    (state.lease.tenant_id, state.lease.request_id),
+                    None,
+                )
+
+    def _token_window(self, route_name: str, now: datetime) -> _TokenWindow:
+        window = self._tokens.get(route_name)
+        if window is None or (now - window.started_at).total_seconds() >= self._window:
+            window = _TokenWindow(started_at=now)
+            self._tokens[route_name] = window
+        return window
 
 
 class InMemoryGatewayRequestStore:
@@ -280,12 +489,41 @@ def _finite_clock_value(value: float) -> float:
     return float(value)
 
 
+def _aware_clock_value(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("gateway capacity clock must return an aware datetime")
+    return value.astimezone(UTC)
+
+
+def _bounded_integer(name: str, value: int, *, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be in [1, {maximum}]")
+    return value
+
+
+def _bounded_seconds(name: str, value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 < value <= MAX_POLICY_SECONDS
+    ):
+        raise ValueError(f"{name} must be in (0, {MAX_POLICY_SECONDS:g}]")
+    return float(value)
+
+
+def _retry_after(leases: tuple[GatewayCapacityLease, ...], now: datetime) -> float:
+    return max(0.001, min((lease.expires_at - now).total_seconds() for lease in leases))
+
+
 __all__ = [
+    "GatewayCapacityStore",
     "GatewayCircuitBreaker",
     "GatewayRateLimiter",
     "GatewayRequestClaim",
     "GatewayRequestClaimStatus",
     "GatewayRequestStore",
+    "InMemoryGatewayCapacityStore",
     "InMemoryGatewayCircuitBreaker",
     "InMemoryGatewayRateLimiter",
     "InMemoryGatewayRequestStore",

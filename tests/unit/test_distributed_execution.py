@@ -640,6 +640,40 @@ class FakeQueue:
         return ()
 
 
+class MultiRunQueue(FakeQueue):
+    def __init__(self, leases: tuple[RunLease, ...]) -> None:
+        super().__init__(None)
+        self._leases = list(leases)
+
+    async def heartbeat_worker(
+        self,
+        worker_id: str,
+        *,
+        occurred_at: datetime,
+        available_slots: int,
+    ) -> WorkerRegistration:
+        return WorkerRegistration(
+            worker_id=worker_id,
+            supported_sandbox_types=("podman",),
+            total_slots=2,
+            available_slots=available_slots,
+            status=WorkerStatus.ACTIVE,
+            registered_at=NOW,
+            last_heartbeat_at=occurred_at,
+        )
+
+    async def claim(
+        self,
+        worker_id: str,
+        *,
+        occurred_at: datetime,
+        lease_duration: timedelta,
+    ) -> RunLease | None:
+        del worker_id, occurred_at, lease_duration
+        self.claims += 1
+        return self._leases.pop(0) if self._leases else None
+
+
 class FakeWorkspaceLeases:
     def __init__(self) -> None:
         self.released = False
@@ -823,6 +857,35 @@ class BlockingExecutor:
         self.release.set()
 
 
+class ConcurrencyExecutor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def execute(
+        self,
+        lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+    ) -> RunExecutionResult:
+        del lease, writer_lease, recovery
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.started.set()
+        if self.calls == 1:
+            await self.release.wait()
+        self.active -= 1
+        return RunExecutionResult(status=RunStatus.COMPLETED)
+
+    async def cancel(self, lease: RunLease) -> None:
+        del lease
+        self.release.set()
+
+
 async def wait_for_idle(worker: WorkerService) -> None:
     for _ in range(100):
         if worker.active_count == 0:
@@ -853,6 +916,41 @@ async def test_worker_claims_restores_completes_and_releases_workspace() -> None
     assert workspace.released is True
     assert executor.cancelled is False
     assert executor.writer_tokens == [WORKSPACE_TOKEN]
+
+
+@pytest.mark.asyncio
+async def test_worker_bounds_sandbox_phases_separately_from_agent_run_slots() -> None:
+    first = run_lease()
+    second = first.model_copy(
+        update={
+            "run_id": uuid.UUID("30000000-0000-0000-0000-000000000004"),
+            "workspace_id": uuid.UUID("40000000-0000-0000-0000-000000000005"),
+            "lease_token": uuid.UUID("50000000-0000-0000-0000-000000000006"),
+        }
+    )
+    queue = MultiRunQueue((first, second))
+    executor = ConcurrencyExecutor()
+    worker = WorkerService(
+        config=WorkerConfig(worker_id="worker-1", total_slots=2, sandbox_slots=1),
+        queue=queue,
+        workspace_leases=FakeWorkspaceLeases(),
+        recovery=FakeRecovery(),
+        restorer=FakeRestorer(),
+        executor=executor,
+        clock=MutableClock(),
+    )
+
+    assert await worker.run_once() is True
+    await asyncio.wait_for(executor.started.wait(), timeout=1)
+    assert await worker.run_once() is True
+    await asyncio.sleep(0)
+    assert worker.active_count == 2
+    assert executor.calls == 1
+
+    executor.release.set()
+    await asyncio.wait_for(wait_for_idle(worker), timeout=1)
+    assert executor.calls == 2
+    assert executor.max_active == 1
 
 
 @pytest.mark.asyncio
@@ -1124,6 +1222,8 @@ def test_worker_and_scheduler_configuration_reject_unsafe_values() -> None:
         )
     with pytest.raises(ValidationError):
         WorkerConfig(worker_id="worker-1", total_slots=0)
+    with pytest.raises(ValidationError, match="sandbox_slots"):
+        WorkerConfig(worker_id="worker-1", total_slots=1, sandbox_slots=2)
     with pytest.raises(ValidationError):
         SchedulerConfig(recovery_batch_size=1001)
     with pytest.raises(ValueError, match="module:attribute"):

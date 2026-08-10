@@ -684,6 +684,175 @@ class GatewayRequestRecord(Base):
     )
 
 
+class TenantQuotaRecord(Base):
+    """Platform-controlled per-tenant execution and gateway ceilings."""
+
+    __tablename__ = "tenant_quotas"
+    __table_args__ = (
+        CheckConstraint(
+            "max_active_runs >= 1 AND max_active_runs <= 10000",
+            name="max_active_runs",
+        ),
+        CheckConstraint(
+            "max_queued_runs >= 1 AND max_queued_runs <= 100000",
+            name="max_queued_runs",
+        ),
+        CheckConstraint(
+            "max_gateway_requests >= 1 AND max_gateway_requests <= 10000",
+            name="max_gateway_requests",
+        ),
+        CheckConstraint("updated_at >= created_at", name="timestamp_order"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    max_active_runs: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_queued_runs: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_gateway_requests: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("true"),
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+
+
+class QueueAdmissionRecord(Base):
+    """Singleton lock row and durable global queue threshold."""
+
+    __tablename__ = "queue_admission"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="singleton"),
+        CheckConstraint(
+            "global_queue_limit >= 1 AND global_queue_limit <= 1000000",
+            name="global_queue_limit",
+        ),
+        CheckConstraint(
+            "retry_after_seconds > 0 AND retry_after_seconds <= 3600",
+            name="retry_after_seconds",
+        ),
+        CheckConstraint("updated_at >= created_at", name="timestamp_order"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    global_queue_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    retry_after_seconds: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(10, 3),
+        nullable=False,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+
+
+class GatewayProviderCapacityRecord(Base):
+    """Shared route/provider request slots and fixed token-window state."""
+
+    __tablename__ = "gateway_provider_capacity"
+    __table_args__ = (
+        CheckConstraint(
+            "request_limit >= 1 AND request_limit <= 10000",
+            name="request_limit",
+        ),
+        CheckConstraint(
+            "token_limit >= 1 AND token_limit <= 1000000000",
+            name="token_limit",
+        ),
+        CheckConstraint(
+            "token_window_seconds > 0 AND token_window_seconds <= 3600",
+            name="token_window_seconds",
+        ),
+        CheckConstraint("accounted_tokens >= 0", name="accounted_tokens"),
+        CheckConstraint("updated_at >= token_window_started_at", name="timestamp_order"),
+    )
+
+    route_name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    request_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    token_limit: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_window_seconds: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(10, 3),
+        nullable=False,
+    )
+    token_window_started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    accounted_tokens: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
+class GatewayCapacityLeaseRecord(Base):
+    """Expiring all-or-nothing tenant and provider gateway admission lease."""
+
+    __tablename__ = "gateway_capacity_leases"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id",),
+            ("tenant_quotas.tenant_id",),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("route_name",),
+            ("gateway_provider_capacity.route_name",),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "request_id"),
+        CheckConstraint("reserved_tokens >= 1", name="reserved_tokens"),
+        CheckConstraint("expires_at > acquired_at", name="expiry_order"),
+        Index("ix_gateway_capacity_leases_expiry", "expires_at"),
+        Index(
+            "ix_gateway_capacity_leases_tenant_expiry",
+            "tenant_id",
+            "expires_at",
+        ),
+        Index(
+            "ix_gateway_capacity_leases_route_expiry",
+            "route_name",
+            "expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    route_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_window_started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    acquired_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+
 class GatewayRateLimitRecord(Base):
     """Shared fixed-window tenant-and-route request counter."""
 
@@ -735,13 +904,17 @@ __all__ = [
     "AgentEventRecord",
     "ApprovalRecord",
     "CheckpointRecord",
+    "GatewayCapacityLeaseRecord",
     "GatewayCircuitRecord",
+    "GatewayProviderCapacityRecord",
     "GatewayRateLimitRecord",
     "GatewayRequestRecord",
     "MessageRecord",
     "ModelCallRecord",
+    "QueueAdmissionRecord",
     "RunRecord",
     "SessionRecord",
     "TaskPlanRecord",
+    "TenantQuotaRecord",
     "ToolCallRecord",
 ]

@@ -6,10 +6,11 @@ import uuid
 from typing import TYPE_CHECKING
 
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.control import (
+from agent_core.capacity import CapacityScope, TenantQuota
     ApprovalDecision,
     ApprovalStatus,
     IdempotencyKey,
@@ -30,6 +31,7 @@ from agent_core.domain.status import (
 from agent_core.domain.transitions import transition_run
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
+from platform_persistence.capacity import ensure_tenant_quota
     ApprovalRecord,
     CheckpointRecord,
     MessageRecord,
@@ -147,8 +149,14 @@ class PostgresSessionRepository:
 class PostgresRunRepository:
     """Tenant-scoped run storage with compare-and-set lifecycle operations."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        default_quota: TenantQuota | None = None,
+    ) -> None:
         self._sessions = sessions
+        self._default_quota = default_quota or TenantQuota()
 
     async def create_idempotent(
         self,
@@ -178,6 +186,42 @@ class PostgresRunRepository:
             creation_hash=creation_hash,
         )
         async with self._sessions() as database, database.begin():
+            quota = await ensure_tenant_quota(
+                database,
+                tenant_id,
+                default=self._default_quota,
+                occurred_at=run.created_at,
+                lock=True,
+            )
+            queued_count = int(
+                await database.scalar(
+                    select(func.count())
+                    .select_from(RunRecord)
+                    .where(
+                        RunRecord.tenant_id == tenant_id,
+                        RunRecord.status.in_(
+                            (
+                                RunStatus.QUEUED.value,
+                                RunStatus.WAITING_APPROVAL.value,
+                                RunStatus.RETRY_PENDING.value,
+                                RunStatus.LOST.value,
+                            )
+                        ),
+                    )
+                )
+                or 0
+            )
+            if queued_count >= quota.max_queued_runs:
+                raise DomainOperationError(
+                    code="tenant_queue_quota_exceeded",
+                    message="the tenant queued-run quota is exhausted",
+                    retryable=True,
+                    details={
+                        "limit": quota.max_queued_runs,
+                        "scope": CapacityScope.TENANT_QUEUED_RUNS.value,
+                        "retry_after_seconds": 1.0,
+                    },
+                )
             inserted = await database.scalar(
                 insert(RunRecord)
                 .values(**values)

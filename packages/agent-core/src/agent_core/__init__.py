@@ -1,5 +1,15 @@
 """Provider-independent domain contracts for the agent platform."""
 
+from agent_core.capacity import (
+    CapacityRejection,
+    CapacityScope,
+    GatewayCapacityClaim,
+    GatewayCapacityLease,
+    GatewayCapacityStore,
+    QueueDepth,
+    QueueSnapshot,
+    TenantQuota,
+)
 from agent_core.checkpoints import CheckpointCoordinator, RewindState
 from agent_core.control import (
     ApprovalDecision,
@@ -122,6 +132,14 @@ __all__ = [
     "MAX_EVENT_PAYLOAD_BYTES",
     "MAX_GATEWAY_REQUEST_BYTES",
     "MAX_LOOP_VALUE_BYTES",
+    "CapacityRejection",
+    "CapacityScope",
+    "GatewayCapacityClaim",
+    "GatewayCapacityLease",
+    "GatewayCapacityStore",
+    "QueueDepth",
+    "QueueSnapshot",
+    "TenantQuota",
     "AgentEvent",
     "AgentLoop",
     "AgentLoopConfig",
