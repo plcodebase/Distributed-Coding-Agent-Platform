@@ -106,6 +106,7 @@ class AgentLoop:
         semantic_retry_count = 0
         outcomes = {
             outcome.tool_call_id: ToolOutcome(
+                tool_name=outcome.tool_name,
                 argument_hash=outcome.argument_hash,
                 status=outcome.status,
                 result=outcome.result,

@@ -17,10 +17,18 @@ completed logical mutation merely because its event was not delivered.
   ownership, releases the writer, returns worker capacity, and deletes the old lease.
   A cancellation observed during recovery commits `CANCELLED` instead.
 - Fence recovery-state reads to the active replacement lease.
-- Load at most 4,096 ordered messages and 100 terminal tool outcomes. Invalid durable
-  messages, reserved metadata overrides, missing selected checkpoints, and exceeded
-  bounds fail closed. When a checkpoint is selected, exclude tool outcomes completed
-  before it so an older workspace revision cannot override the newer snapshot.
+- Load at most 4,096 ordered messages and 100 terminal tool outcomes. Apply aggregate
+  PostgreSQL byte preflights before incrementally streaming either collection, then
+  defensively cap the complete serialized recovery state. Invalid durable messages,
+  reserved metadata overrides, missing selected checkpoints, and exceeded bounds fail
+  closed.
+- Recover messages by tenant/session sequence. A checkpoint supplies the upper sequence;
+  without one, the current run's maximum message sequence is the cutoff, retaining
+  prior session context without including later work.
+- When a checkpoint is selected, exclude tool outcomes completed before it so an older
+  workspace revision cannot override the newer snapshot. Completion timestamps are not
+  treated as a total ordering; explicit checkpoint/tool association remains a
+  compatible future schema improvement.
 - Restore the selected checkpoint's conversation, task plan, and summary. Restore its
   pre-tool workspace snapshot at the latest durable post-tool workspace revision when
   one or more terminal mutations completed after that checkpoint.
@@ -36,8 +44,9 @@ completed logical mutation merely because its event was not delivered.
   - the same call ID with different name, arguments, hash, or turn fails closed;
   - a different terminal status or result fails closed.
 - Persist approval waits as `WAITING_APPROVAL`.
-- Inject terminal durable outcomes into `AgentLoop`. The loop reuses a matching stable
-  tool-call ID and argument hash instead of invoking its handler again.
+- Inject terminal durable outcomes into `AgentLoop`. The loop reuses only a matching
+  stable tool-call ID, tool name, and argument hash instead of invoking its handler
+  again.
 - Append worker events with a stable attempt/generation/local-sequence delivery key.
   The event store returns an identical prior event and rejects key/data conflicts.
 
@@ -63,13 +72,13 @@ The relevant crash windows therefore resolve as follows:
 
 ## Verification
 
-- Unit tests cover predecessor replay, terminal timestamp replay, conflicting outcomes,
-  approval states, missing checkpoints, recovery bounds, post-tool revision selection,
-  executor reuse, scheduler batches, and fatal worker bookkeeping failures.
+- Unit tests cover predecessor replay, terminal timestamp replay, name/hash conflicts,
+  approval states, missing checkpoints, count/byte recovery bounds, post-tool revision
+  selection, executor reuse, scheduler batches, and fatal worker bookkeeping failures.
 - The real PostgreSQL acceptance suite abandons Worker A's live lease, expires it,
-  reclaims it with Worker B, invokes the actual `WorkerService` restore boundary with
-  the post-tool revision, completes at attempt two, and proves only one mutating
-  tool-call row exists.
+  rejects Worker A's stale event/tool writes, reclaims it with Worker B, restores
+  session context through the actual `WorkerService` boundary at the post-tool
+  revision, completes at attempt two, and proves only one mutating tool-call row exists.
 
 ## Operational impact
 
@@ -84,10 +93,10 @@ scheduler rather than acknowledging ambiguous recovery.
 
 ## Security impact
 
-All recovery queries are tenant/run scoped and require the current lease fence.
-Persisted tool arguments and error details remain validated immutable JSON. Rejected
-raw provider arguments and unexpected exception text are never reconstructed during
-replay.
+All recovery queries are tenant-scoped, bound to the leased run/session and an
+authoritative sequence cutoff, and require the current lease fence. Persisted tool
+arguments and error details remain validated immutable JSON. Rejected raw provider
+arguments and unexpected exception text are never reconstructed during replay.
 
 ## Migration
 

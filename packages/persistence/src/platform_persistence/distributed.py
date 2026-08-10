@@ -7,10 +7,12 @@ import uuid
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import Text, func, select
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.distributed import (
+    MAX_RECOVERY_STATE_BYTES,
     DurableToolOutcome,
     RunExecutionResult,
     RunLease,
@@ -26,6 +28,7 @@ from agent_core.domain.models import Checkpoint, Run
 from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.domain.transitions import transition_run
 from agent_core.gateway import GatewayMessage
+from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
     CheckpointRecord,
     MessageRecord,
@@ -49,6 +52,8 @@ MAX_RECOVERY_RUNS = 1000
 MAX_LEASE_SECONDS = 3600.0
 MAX_RECOVERY_MESSAGES = 4096
 MAX_RECOVERY_TOOL_OUTCOMES = 100
+MAX_RECOVERY_CONTEXT_BYTES = 8 * 1024 * 1024
+MAX_RECOVERY_TOOL_BYTES = 8 * 1024 * 1024
 
 
 def _operation_time(value: datetime, *, code: str) -> datetime:
@@ -790,22 +795,7 @@ class PostgresRecoveryStore:
 
     async def load(self, lease: RunLease) -> RunRecoveryState:
         async with self._sessions() as database:
-            active = await database.scalar(
-                select(RunLeaseRecord).where(
-                    RunLeaseRecord.tenant_id == lease.tenant_id,
-                    RunLeaseRecord.run_id == lease.run_id,
-                    RunLeaseRecord.lease_token == lease.lease_token,
-                    RunLeaseRecord.generation == lease.generation,
-                    RunLeaseRecord.worker_id == lease.worker_id,
-                )
-            )
-            if active is None:
-                raise DomainOperationError(
-                    code="run_lease_lost",
-                    message="recovery state may only be loaded by the active run owner",
-                    retryable=True,
-                    details={"run_id": str(lease.run_id)},
-                )
+            await assert_active_run_lease(database, lease)
             checkpoint_row = await self._checkpoint(database, lease)
             if lease.checkpoint_id is not None and checkpoint_row is None:
                 raise DomainOperationError(
@@ -895,44 +885,80 @@ class PostgresRecoveryStore:
         *,
         message_limit: int | None,
     ) -> tuple[GatewayMessage, ...]:
-        statement = select(MessageRecord).where(
-            MessageRecord.tenant_id == lease.tenant_id,
-            MessageRecord.run_id == lease.run_id,
-        )
-        if message_limit is not None:
-            statement = statement.where(MessageRecord.sequence <= message_limit)
-        rows = (
-            await database.scalars(
-                statement.order_by(MessageRecord.sequence).limit(MAX_RECOVERY_MESSAGES + 1)
+        cutoff: object
+        if message_limit is None:
+            cutoff = (
+                select(func.max(MessageRecord.sequence))
+                .where(
+                    MessageRecord.tenant_id == lease.tenant_id,
+                    MessageRecord.run_id == lease.run_id,
+                )
+                .scalar_subquery()
             )
-        ).all()
-        if len(rows) > MAX_RECOVERY_MESSAGES:
+        else:
+            cutoff = message_limit
+        filters = (
+            MessageRecord.tenant_id == lease.tenant_id,
+            MessageRecord.session_id == lease.session_id,
+            MessageRecord.sequence <= cutoff,
+        )
+        serialized_bytes = await database.scalar(
+            select(
+                func.coalesce(
+                    func.sum(
+                        func.octet_length(MessageRecord.content)
+                        + func.octet_length(sql_cast(MessageRecord.metadata_json, Text))
+                    ),
+                    0,
+                )
+            ).where(*filters)
+        )
+        if int(serialized_bytes or 0) > MAX_RECOVERY_CONTEXT_BYTES:
             raise DomainOperationError(
                 code="recovery_context_limit",
-                message="durable recovery context exceeds the message limit",
-                details={"run_id": str(lease.run_id)},
+                message="durable recovery context exceeds the byte limit",
+                details={
+                    "run_id": str(lease.run_id),
+                    "limit_bytes": MAX_RECOVERY_CONTEXT_BYTES,
+                },
             )
+        result = await database.stream_scalars(
+            select(MessageRecord)
+            .where(*filters)
+            .order_by(MessageRecord.sequence)
+            .limit(MAX_RECOVERY_MESSAGES + 1)
+            .execution_options(yield_per=1)
+        )
         converted: list[GatewayMessage] = []
-        for row in rows:
-            if "role" in row.metadata_json or "content" in row.metadata_json:
-                raise DomainOperationError(
-                    code="recovery_message_invalid",
-                    message="durable message metadata contains a reserved field",
-                    details={"run_id": str(lease.run_id), "sequence": row.sequence},
-                )
-            values: dict[str, object] = {
-                **row.metadata_json,
-                "role": row.role,
-                "content": row.content,
-            }
-            try:
-                converted.append(GatewayMessage.model_validate(values))
-            except ValidationError as error:
-                raise DomainOperationError(
-                    code="recovery_message_invalid",
-                    message="a durable recovery message is invalid",
-                    details={"run_id": str(lease.run_id), "sequence": row.sequence},
-                ) from error
+        try:
+            async for row in result:
+                if len(converted) >= MAX_RECOVERY_MESSAGES:
+                    raise DomainOperationError(
+                        code="recovery_context_limit",
+                        message="durable recovery context exceeds the message limit",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                if "role" in row.metadata_json or "content" in row.metadata_json:
+                    raise DomainOperationError(
+                        code="recovery_message_invalid",
+                        message="durable message metadata contains a reserved field",
+                        details={"run_id": str(lease.run_id), "sequence": row.sequence},
+                    )
+                values: dict[str, object] = {
+                    **row.metadata_json,
+                    "role": row.role,
+                    "content": row.content,
+                }
+                try:
+                    converted.append(GatewayMessage.model_validate(values))
+                except ValidationError as error:
+                    raise DomainOperationError(
+                        code="recovery_message_invalid",
+                        message="a durable recovery message is invalid",
+                        details={"run_id": str(lease.run_id), "sequence": row.sequence},
+                    ) from error
+        finally:
+            await result.close()
         return tuple(converted)
 
     @staticmethod
@@ -942,7 +968,7 @@ class PostgresRecoveryStore:
         *,
         completed_at_or_after: datetime | None,
     ) -> tuple[DurableToolOutcome, ...]:
-        statement = select(ToolCallRecord).where(
+        filters = (
             ToolCallRecord.tenant_id == lease.tenant_id,
             ToolCallRecord.run_id == lease.run_id,
             ToolCallRecord.status.in_(
@@ -953,36 +979,74 @@ class PostgresRecoveryStore:
                 )
             ),
         )
+        statement = select(ToolCallRecord).where(*filters)
+        size_statement = select(
+            func.coalesce(
+                func.sum(
+                    func.octet_length(ToolCallRecord.tool_call_id)
+                    + func.octet_length(ToolCallRecord.tool_name)
+                    + func.coalesce(
+                        func.octet_length(sql_cast(ToolCallRecord.result, Text)),
+                        0,
+                    )
+                    + func.coalesce(
+                        func.octet_length(sql_cast(ToolCallRecord.error, Text)),
+                        0,
+                    )
+                ),
+                0,
+            )
+        ).where(*filters)
         if completed_at_or_after is not None:
             statement = statement.where(ToolCallRecord.completed_at >= completed_at_or_after)
-        rows = (
-            await database.scalars(
-                statement.order_by(
-                    ToolCallRecord.completed_at,
-                    ToolCallRecord.turn_number,
-                    ToolCallRecord.tool_call_id,
-                ).limit(MAX_RECOVERY_TOOL_OUTCOMES + 1)
+            size_statement = size_statement.where(
+                ToolCallRecord.completed_at >= completed_at_or_after
             )
-        ).all()
-        if len(rows) > MAX_RECOVERY_TOOL_OUTCOMES:
+        serialized_bytes = await database.scalar(size_statement)
+        if int(serialized_bytes or 0) > MAX_RECOVERY_TOOL_BYTES:
             raise DomainOperationError(
                 code="recovery_tool_limit",
-                message="durable recovery state exceeds the tool-call limit",
-                details={"run_id": str(lease.run_id)},
+                message="durable recovery state exceeds the tool-outcome byte limit",
+                details={
+                    "run_id": str(lease.run_id),
+                    "limit_bytes": MAX_RECOVERY_TOOL_BYTES,
+                },
             )
-        return tuple(
-            DurableToolOutcome(
-                tool_call_id=row.tool_call_id,
-                tool_name=row.tool_name,
-                turn_number=row.turn_number,
-                argument_hash=row.argument_hash,
-                status=ToolCallStatus(row.status),
-                workspace_version=row.workspace_version,
-                result=row.result,
-                error=ErrorDetail.model_validate(row.error) if row.error is not None else None,
+        result = await database.stream_scalars(
+            statement.order_by(
+                ToolCallRecord.completed_at,
+                ToolCallRecord.turn_number,
+                ToolCallRecord.tool_call_id,
             )
-            for row in rows
+            .limit(MAX_RECOVERY_TOOL_OUTCOMES + 1)
+            .execution_options(yield_per=1)
         )
+        outcomes: list[DurableToolOutcome] = []
+        try:
+            async for row in result:
+                if len(outcomes) >= MAX_RECOVERY_TOOL_OUTCOMES:
+                    raise DomainOperationError(
+                        code="recovery_tool_limit",
+                        message="durable recovery state exceeds the tool-call limit",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                outcomes.append(
+                    DurableToolOutcome(
+                        tool_call_id=row.tool_call_id,
+                        tool_name=row.tool_name,
+                        turn_number=row.turn_number,
+                        argument_hash=row.argument_hash,
+                        status=ToolCallStatus(row.status),
+                        workspace_version=row.workspace_version,
+                        result=row.result,
+                        error=(
+                            ErrorDetail.model_validate(row.error) if row.error is not None else None
+                        ),
+                    )
+                )
+        finally:
+            await result.close()
+        return tuple(outcomes)
 
 
 def _latest_workspace_revision(
@@ -1045,8 +1109,11 @@ def _checkpoint_domain(record: CheckpointRecord) -> Checkpoint:
 
 __all__ = [
     "MAX_LEASE_SECONDS",
+    "MAX_RECOVERY_CONTEXT_BYTES",
     "MAX_RECOVERY_MESSAGES",
     "MAX_RECOVERY_RUNS",
+    "MAX_RECOVERY_STATE_BYTES",
+    "MAX_RECOVERY_TOOL_BYTES",
     "MAX_RECOVERY_TOOL_OUTCOMES",
     "PostgresRecoveryStore",
     "PostgresRunQueue",

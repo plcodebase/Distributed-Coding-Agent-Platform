@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from datetime import datetime, timedelta
 
 
+MAX_RECOVERY_STATE_BYTES = 16 * 1024 * 1024
+
 class WorkerStatus(StrEnum):
     """Scheduler-visible worker lifecycle."""
 
@@ -165,6 +167,10 @@ class RunRecoveryState(DomainModel):
         identifiers = [outcome.tool_call_id for outcome in self.prior_tool_outcomes]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("prior durable tool-call IDs must be unique")
+        if len(self.model_dump_json().encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
+            raise ValueError(
+                f"serialized recovery state exceeds {MAX_RECOVERY_STATE_BYTES}-byte limit"
+            )
         return self
 
 
@@ -318,6 +324,7 @@ class RunExecutor(Protocol):
 
 __all__ = [
     "DurableToolOutcome",
+    "MAX_RECOVERY_STATE_BYTES",
     "RecoveryStore",
     "RunExecutionResult",
     "RunExecutor",

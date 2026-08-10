@@ -21,6 +21,10 @@ from platform_persistence import (
     PostgresRunQueue,
     PostgresWorkspaceLeaseStore,
 )
+from platform_persistence.distributed import (
+    MAX_RECOVERY_CONTEXT_BYTES,
+    MAX_RECOVERY_TOOL_BYTES,
+)
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=UTC)
 TENANT_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -34,12 +38,23 @@ WORKSPACE_TOKEN = uuid.UUID("60000000-0000-0000-0000-000000000006")
 class _Scalars:
     def __init__(self, values: list[object]) -> None:
         self._values = values
+        self.closed = False
 
     def all(self) -> list[object]:
         return self._values
 
     def __iter__(self) -> object:
         return iter(self._values)
+
+    def __aiter__(self) -> object:
+        async def iterate() -> Any:
+            for value in self._values:
+                yield value
+
+        return iterate()
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class _ExecuteResult:
@@ -64,6 +79,7 @@ class _Database:
         self.added: list[object] = []
         self.deleted: list[object] = []
         self.flushes = 0
+        self.streams: list[_Scalars] = []
 
     async def __aenter__(self) -> Self:
         return self
@@ -83,6 +99,13 @@ class _Database:
         if not self.scalar_sets:
             raise AssertionError("unexpected scalars query")
         return _Scalars(self.scalar_sets.popleft())
+
+    async def stream_scalars(self, _statement: object) -> _Scalars:
+        if not self.scalar_sets:
+            raise AssertionError("unexpected streamed scalars query")
+        result = _Scalars(self.scalar_sets.popleft())
+        self.streams.append(result)
+        return result
 
     async def execute(self, _statement: object) -> object:
         if not self.execute_results:
@@ -556,7 +579,14 @@ async def test_postgres_recovery_loads_messages_plan_and_terminal_tool_outcomes(
         error=None,
     )
     database = _Database(
-        scalar_values=[_run_lease_row(), None, SimpleNamespace(plan={"steps": []})],
+        scalar_values=[
+            _run_lease_row(),
+            _run_row(status=RunStatus.RUNNING),
+            None,
+            8,
+            SimpleNamespace(plan={"steps": []}),
+            64,
+        ],
         scalar_sets=[[message], [tool]],
     )
     state = await PostgresRecoveryStore(_sessions(database)).load(_lease())
@@ -564,6 +594,7 @@ async def test_postgres_recovery_loads_messages_plan_and_terminal_tool_outcomes(
     assert state.messages[0].content == "continue"
     assert state.task_plan.to_json_object() == {"steps": []}
     assert state.prior_tool_outcomes[0].result is not None
+    assert database.streams and all(stream.closed for stream in database.streams)
 
     missing_owner = PostgresRecoveryStore(_sessions(_Database(scalar_values=[None])))
     with pytest.raises(DomainOperationError) as error:
@@ -588,7 +619,13 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     )
     lease = _lease().model_copy(update={"checkpoint_id": checkpoint_id})
     database = _Database(
-        scalar_values=[_run_lease_row(), checkpoint],
+        scalar_values=[
+            _run_lease_row(),
+            _run_row(status=RunStatus.RUNNING),
+            checkpoint,
+            8,
+            64,
+        ],
         scalar_sets=[
             [
                 SimpleNamespace(
@@ -620,7 +657,11 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     missing_checkpoint = PostgresRecoveryStore(
         _sessions(
             _Database(
-                scalar_values=[_run_lease_row(), None],
+                scalar_values=[
+                    _run_lease_row(),
+                    _run_row(status=RunStatus.RUNNING),
+                    None,
+                ],
             )
         )
     )
@@ -631,7 +672,12 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     empty = PostgresRecoveryStore(
         _sessions(
             _Database(
-                scalar_values=[_run_lease_row(), None],
+                scalar_values=[
+                    _run_lease_row(),
+                    _run_row(status=RunStatus.RUNNING),
+                    None,
+                    0,
+                ],
                 scalar_sets=[[]],
             )
         )
@@ -643,7 +689,12 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     invalid_message = PostgresRecoveryStore(
         _sessions(
             _Database(
-                scalar_values=[_run_lease_row(), None],
+                scalar_values=[
+                    _run_lease_row(),
+                    _run_row(status=RunStatus.RUNNING),
+                    None,
+                    3,
+                ],
                 scalar_sets=[
                     [
                         SimpleNamespace(
@@ -661,10 +712,51 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
         await invalid_message.load(_lease())
     assert error.value.code == "recovery_message_invalid"
 
+
+@pytest.mark.asyncio
+async def test_postgres_recovery_rejects_context_and_tool_bytes_before_streaming() -> None:
+    context_database = _Database(
+        scalar_values=[
+            _run_lease_row(),
+            _run_row(status=RunStatus.RUNNING),
+            None,
+            MAX_RECOVERY_CONTEXT_BYTES + 1,
+        ]
+    )
+    with pytest.raises(DomainOperationError) as context:
+        await PostgresRecoveryStore(_sessions(context_database)).load(_lease())
+    assert context.value.code == "recovery_context_limit"
+
+    message = SimpleNamespace(
+        sequence=1,
+        role="user",
+        content="continue",
+        metadata_json={},
+    )
+    tool_database = _Database(
+        scalar_values=[
+            _run_lease_row(),
+            _run_row(status=RunStatus.RUNNING),
+            None,
+            8,
+            SimpleNamespace(plan={"steps": []}),
+            MAX_RECOVERY_TOOL_BYTES + 1,
+        ],
+        scalar_sets=[[message]],
+    )
+    with pytest.raises(DomainOperationError) as tool:
+        await PostgresRecoveryStore(_sessions(tool_database)).load(_lease())
+    assert tool.value.code == "recovery_tool_limit"
+
     reserved_metadata = PostgresRecoveryStore(
         _sessions(
             _Database(
-                scalar_values=[_run_lease_row(), None],
+                scalar_values=[
+                    _run_lease_row(),
+                    _run_row(status=RunStatus.RUNNING),
+                    None,
+                    32,
+                ],
                 scalar_sets=[
                     [
                         SimpleNamespace(

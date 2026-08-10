@@ -808,7 +808,62 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
     now = datetime.now(UTC)
     session = _session(now)
     await sessions.create(session)
-    run = _run(session, now).model_copy(update={"priority": 10_000})
+    await queue.register_worker(
+        WorkerRegistration(
+            worker_id="historical-worker",
+            supported_sandbox_types=("podman",),
+            total_slots=1,
+            available_slots=1,
+            status=WorkerStatus.ACTIVE,
+            registered_at=now - timedelta(seconds=10),
+            last_heartbeat_at=now - timedelta(seconds=10),
+        )
+    )
+    previous_run = _run(session, now - timedelta(seconds=10)).model_copy(
+        update={"id": uuid.uuid4()}
+    )
+    await runs.create_idempotent(
+        TENANT_ID,
+        previous_run,
+        idempotency_key=f"prior-conversation-{previous_run.id}",
+        creation_hash=run_creation_hash(priority=previous_run.priority),
+    )
+    assert await runs.transition(
+        TENANT_ID,
+        previous_run.id,
+        RunStatus.QUEUED,
+        RunStatus.LEASED,
+        occurred_at=now - timedelta(seconds=9),
+        worker_id="historical-worker",
+        lease_expires_at=now - timedelta(seconds=5),
+    )
+    assert await runs.transition(
+        TENANT_ID,
+        previous_run.id,
+        RunStatus.LEASED,
+        RunStatus.RUNNING,
+        occurred_at=now - timedelta(seconds=8),
+    )
+    assert await runs.transition(
+        TENANT_ID,
+        previous_run.id,
+        RunStatus.RUNNING,
+        RunStatus.COMPLETED,
+        occurred_at=now - timedelta(seconds=7),
+    )
+    await execution.append_message(
+        TENANT_ID,
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=previous_run.id,
+            sequence=1,
+            role=MessageRole.USER,
+            content="prior session context",
+            created_at=now - timedelta(seconds=8),
+        ),
+    )
+    run = _run(session, now).model_copy(update={"priority": 100})
     await runs.create_idempotent(
         TENANT_ID,
         run,
@@ -821,7 +876,7 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
             id=uuid.uuid4(),
             session_id=session.id,
             run_id=run.id,
-            sequence=1,
+            sequence=2,
             role=MessageRole.USER,
             content="resume safely",
             created_at=now,
@@ -853,7 +908,7 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         id=uuid.uuid4(),
         run_id=run.id,
         session_id=session.id,
-        message_sequence=1,
+        message_sequence=2,
         workspace_snapshot_uri="s3://agent-platform/worker-service-recovery",
         workspace_revision="revision-before-tool",
         task_plan=FrozenJsonObject({"steps": [{"title": "finish", "done": False}]}),
@@ -970,6 +1025,10 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         assert restored_revision == "revision-after-tool"
         assert len(captured_recovery) == 1
         restored = captured_recovery[0]
+        assert [message.content for message in restored.messages] == [
+            "prior session context",
+            "resume safely",
+        ]
         assert len(restored.prior_tool_outcomes) == 1
         assert restored.prior_tool_outcomes[0].tool_call_id == completed_tool.id
         assert restored.prior_tool_outcomes[0].result == completed_tool.result

@@ -22,7 +22,7 @@ from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import Checkpoint, Run, ToolCall, canonical_argument_hash
 from agent_core.domain.status import RunStatus, ToolCallStatus
 from agent_core.event_store import EventDraft, StoredEvent
-from agent_core.events import EventType, ToolCompletedEvent, parse_agent_event
+from agent_core.events import EventType, RunFailedEvent, ToolCompletedEvent, parse_agent_event
 from agent_core.fakes import (
     ScriptedGatewayTurn,
     ScriptedModelGateway,
@@ -229,6 +229,66 @@ async def test_recovered_agent_loop_reuses_terminal_tool_outcome() -> None:
     reused = [event for event in events if isinstance(event, ToolCompletedEvent)]
     assert len(reused) == 1
     assert reused[0].payload.result == prior.result
+
+
+@pytest.mark.asyncio
+async def test_recovered_outcome_rejects_same_id_and_hash_for_another_tool() -> None:
+    arguments: JsonObject = {"path": "README.md"}
+    prior = DurableToolOutcome(
+        tool_call_id="call-1",
+        tool_name="read_file",
+        turn_number=1,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.COMPLETED,
+        result={"content": "already durable"},
+    )
+    handler = CountingReadHandler()
+    loop = AgentLoop(
+        gateway=ScriptedModelGateway(
+            (
+                ScriptedGatewayTurn.tool_calls(
+                    GatewayToolCall(
+                        id=prior.tool_call_id,
+                        name="search_workspace",
+                        arguments=arguments,
+                    )
+                ),
+            )
+        ),
+        tools=ToolRegistry(
+            (
+                RegisteredTool(
+                    name="search_workspace",
+                    description="Search files",
+                    arguments_type=ReadArguments,
+                    handler=handler,
+                    effect=ToolEffect.READ_ONLY,
+                ),
+            )
+        ),
+        clock=SteppingClock(NOW),
+        id_generator=SequentialIdGenerator(),
+    )
+
+    events = [
+        event
+        async for event in loop.run(
+            AgentLoopInput(
+                tenant_id=TENANT_ID,
+                session_id=SESSION_ID,
+                run_id=RUN_ID,
+                attempt=2,
+                worker_id="worker-2",
+                route_name="coding-default",
+                messages=recovery_state().messages,
+                prior_tool_outcomes=(prior,),
+            )
+        )
+    ]
+
+    assert handler.calls == 0
+    failure = next(event for event in events if isinstance(event, RunFailedEvent))
+    assert failure.payload.error.code == "tool_call_id_conflict"
 
 
 class MemoryEventStore:

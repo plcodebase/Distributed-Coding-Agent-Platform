@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 class ToolOutcome:
     """A same-run terminal outcome eligible for safe duplicate reuse."""
 
+    tool_name: str
     argument_hash: str | None
     status: ToolCallStatus
     result: FrozenJsonObject | None = None
@@ -496,12 +497,14 @@ class ToolTurnExecutor:
 
             if run_result.error is not None:
                 outcome = ToolOutcome(
+                    tool_name=item.tool_call.name,
                     argument_hash=item.argument_hash,
                     status=ToolCallStatus.FAILED,
                     error=run_result.error,
                 )
             elif run_result.result is not None:
                 outcome = ToolOutcome(
+                    tool_name=item.tool_call.name,
                     argument_hash=item.argument_hash,
                     status=ToolCallStatus.COMPLETED,
                     result=run_result.result,
@@ -530,16 +533,19 @@ class ToolTurnExecutor:
         invalid_tool_calls: tuple[InvalidToolCall, ...],
         outcomes: dict[str, ToolOutcome],
     ) -> tuple[str, str] | None:
-        hashes = {tool_call_id: outcome.argument_hash for tool_call_id, outcome in outcomes.items()}
+        identities = {
+            tool_call_id: (outcome.tool_name, outcome.argument_hash)
+            for tool_call_id, outcome in outcomes.items()
+        }
         for call in tool_calls:
             current_hash = canonical_argument_hash(call.arguments)
-            if call.id in hashes and hashes[call.id] != current_hash:
+            if call.id in identities and identities[call.id] != (call.name, current_hash):
                 return call.id, call.name
-            hashes[call.id] = current_hash
+            identities[call.id] = (call.name, current_hash)
         for invalid_call in invalid_tool_calls:
-            if invalid_call.tool_call_id in hashes:
+            if invalid_call.tool_call_id in identities:
                 return invalid_call.tool_call_id, invalid_call.tool_name
-            hashes[invalid_call.tool_call_id] = None
+            identities[invalid_call.tool_call_id] = (invalid_call.tool_name, None)
         return None
 
     def _reject_conflicting_turn(
@@ -554,7 +560,7 @@ class ToolTurnExecutor:
         conflict_id, conflict_name = conflict
         conflict_error = loop_error(
             "tool_call_id_conflict",
-            "a stable tool-call identifier was reused with different arguments",
+            "a stable tool-call identifier was reused for a different tool or arguments",
             details={
                 "tool_call_id": conflict_id,
                 "tool_name": conflict_name,
@@ -649,6 +655,7 @@ class ToolTurnExecutor:
         for item in prepared_calls:
             error = item.validation_error or rejected_error
             outcome = ToolOutcome(
+                tool_name=item.tool_call.name,
                 argument_hash=item.argument_hash,
                 status=ToolCallStatus.FAILED,
                 error=error,
@@ -674,6 +681,7 @@ class ToolTurnExecutor:
             outcomes.setdefault(
                 call.tool_call_id,
                 ToolOutcome(
+                    tool_name=call.tool_name,
                     argument_hash=None,
                     status=ToolCallStatus.FAILED,
                     error=call.error,
