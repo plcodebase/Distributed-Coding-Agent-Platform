@@ -190,6 +190,7 @@ async def test_replayed_gateway_completion_does_not_double_count_provider_tokens
     assert 'direction="input",route="coding-default"} 11.0' in payload
     assert 'direction="output",route="coding-default"} 7.0' in payload
     assert 'outcome="success",route="coding-default"} 2.0' in payload
+    assert 'agent_platform_idempotent_replays_total{component="gateway"} 1.0' in payload
     telemetry.shutdown()
 
 

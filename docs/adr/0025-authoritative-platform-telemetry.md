@@ -27,9 +27,14 @@ results, credentials, or unbounded identifiers as metric labels.
   model requests, provider attempts, first output, token counts, retries, tool
   execution, sandbox startup, and checkpoint creation. Queue pressure is sampled
   through a read-only domain protocol.
+- Count newly accepted runs separately from idempotent API replays. Export bounded
+  run-state transitions, scheduler recoveries, WebSocket reconnects, and same-run
+  idempotent replays so reliability tests can distinguish useful work from duplicate
+  delivery.
 - Use stable structured error categories. Span helpers disable automatic exception
   recording; callers record only category and retryability so exception messages and
-  source content cannot enter exported telemetry.
+  source content cannot enter exported telemetry. Handled API errors and exceptions
+  escaping a span are classified through the same content-free boundary.
 - Keep OpenAI Agents SDK tracing disabled at the adapter. The platform model-request
   span surrounding the SDK model layer is authoritative and participates in the same
   distributed trace without requiring a separate provider tracing credential.

@@ -223,11 +223,12 @@ class WorkerService:
         try:
             lease = await self._queue.start(lease, occurred_at=self._clock.now())
             if lease.cancellation_requested:
-                await self._queue.finish(
+                finished = await self._queue.finish(
                     lease,
                     RunExecutionResult(status=RunStatus.CANCELLED),
                     occurred_at=self._clock.now(),
                 )
+                self._record_run_state(finished.status)
                 return
             workspace_lease = self._require_workspace_lease(
                 await self._workspace_leases.acquire(
@@ -274,11 +275,12 @@ class WorkerService:
                 name=f"agent-execution-{lease.run_id}",
             )
             result = await self._wait_phase_or_heartbeat(execution, heartbeat)
-            await self._queue.finish(
+            finished = await self._queue.finish(
                 lease,
                 result,
                 occurred_at=self._clock.now(),
             )
+            self._record_run_state(finished.status)
         except asyncio.CancelledError:
             await self._executor.cancel(lease)
             raise
@@ -365,11 +367,12 @@ class WorkerService:
 
     async def _finish_cancelled_if_owned(self, lease: RunLease) -> None:
         try:
-            await self._queue.finish(
+            finished = await self._queue.finish(
                 lease,
                 RunExecutionResult(status=RunStatus.CANCELLED),
                 occurred_at=self._clock.now(),
             )
+            self._record_run_state(finished.status)
         except DomainOperationError as finish_error:
             if finish_error.code not in {"run_lease_lost", "run_lease_expired"}:
                 raise
@@ -380,11 +383,12 @@ class WorkerService:
         error: ErrorDetail,
     ) -> None:
         try:
-            await self._queue.finish(
+            finished = await self._queue.finish(
                 lease,
                 RunExecutionResult(status=RunStatus.FAILED, error=error),
                 occurred_at=self._clock.now(),
             )
+            self._record_run_state(finished.status)
         except DomainOperationError as finish_error:
             if finish_error.code not in {"run_lease_lost", "run_lease_expired"}:
                 raise
@@ -454,6 +458,10 @@ class WorkerService:
                 active=self.active_count,
                 total=self._config.total_slots,
             )
+
+    def _record_run_state(self, status: RunStatus) -> None:
+        if self._telemetry is not None:
+            self._telemetry.metrics.record_run_state(status.value)
 
     def _observe_queue_wait(self, lease: RunLease) -> None:
         if self._telemetry is None or lease.queued_at is None:

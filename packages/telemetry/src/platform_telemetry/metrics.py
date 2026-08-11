@@ -14,6 +14,19 @@ _QUEUE_BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900)
 _SANDBOX_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60)
 _ALLOWED_PRIORITIES = frozenset({"interactive", "background", "evaluation"})
 _ALLOWED_CIRCUIT_STATES = frozenset({"closed", "open", "half_open"})
+_ALLOWED_RUN_STATES = frozenset(
+    {
+        "queued",
+        "leased",
+        "running",
+        "waiting_approval",
+        "retry_pending",
+        "lost",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+)
 _ALLOWED_HTTP_METHODS = frozenset(
     {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"}
 )
@@ -102,6 +115,33 @@ class PlatformMetrics:
         self.active_runs = Gauge(
             "agent_platform_active_runs",
             "Runs currently owned by workers.",
+            registry=self.registry,
+        )
+        self.runs_accepted = Counter(
+            "agent_platform_runs_accepted_total",
+            "New durable runs accepted by the API; idempotent replays are excluded.",
+            registry=self.registry,
+        )
+        self.run_state_transitions = Counter(
+            "agent_platform_run_state_transitions_total",
+            "Durable worker completion transitions by bounded run state.",
+            ("state",),
+            registry=self.registry,
+        )
+        self.run_recoveries = Counter(
+            "agent_platform_run_recoveries_total",
+            "Expired run attempts durably recovered by the scheduler.",
+            registry=self.registry,
+        )
+        self.event_reconnects = Counter(
+            "agent_platform_event_reconnects_total",
+            "Authenticated event streams resumed after a durable sequence.",
+            registry=self.registry,
+        )
+        self.idempotent_replays = Counter(
+            "agent_platform_idempotent_replays_total",
+            "Previously committed results reused by bounded component.",
+            ("component",),
             registry=self.registry,
         )
         self.queue_depth = Gauge(
@@ -283,6 +323,14 @@ class PlatformMetrics:
             tenant=self.tenant(tenant_id),
             route=self.route(route),
         ).inc(_finite_nonnegative(usd, name="usd"))
+
+    def record_run_state(self, state: str) -> None:
+        if state not in _ALLOWED_RUN_STATES:
+            raise ValueError("state is not a supported run state")
+        self.run_state_transitions.labels(state=state).inc()
+
+    def record_replay(self, component: str) -> None:
+        self.idempotent_replays.labels(component=self.component(component)).inc()
 
     def set_circuit(self, *, route: str, state: str) -> None:
         if state not in _ALLOWED_CIRCUIT_STATES:

@@ -989,6 +989,12 @@ def test_metrics_endpoint_is_bounded_and_optionally_authenticated() -> None:
     assert client.get("/metrics").status_code == 401
     assert client.get("/metrics", headers=authorization("wrong-token")).status_code == 401
     assert client.get("/health/live").status_code == 200
+    invalid = client.post(
+        "/v1/sessions",
+        headers=authorization(),
+        json={},
+    )
+    assert invalid.status_code == 422
     response = client.get("/metrics", headers=authorization(token))
 
     assert response.status_code == 200
@@ -997,6 +1003,7 @@ def test_metrics_endpoint_is_bounded_and_optionally_authenticated() -> None:
     assert 'route="/health/live"' in response.text
     assert 'method="GET"' in response.text
     assert 'status="200"' in response.text
+    assert 'category="validation",component="agent-api"' in response.text
     assert token not in response.text
     telemetry.shutdown()
 
@@ -1068,6 +1075,14 @@ def test_run_creation_persists_current_w3c_context_for_worker_handoff() -> None:
     )
     assert traceparent.split("-")[2] == f"{request_span.context.span_id:016x}"
     assert run["tracestate"] is None
+    replay = client.post(
+        f"/v1/sessions/{session_id}/runs",
+        headers={**authorization(), "Idempotency-Key": "trace-handoff"},
+        json={},
+    )
+    assert replay.status_code == 200
+    metrics = telemetry.metrics.render().decode("utf-8")
+    assert "agent_platform_runs_accepted_total 1.0" in metrics
     telemetry.shutdown()
 
 

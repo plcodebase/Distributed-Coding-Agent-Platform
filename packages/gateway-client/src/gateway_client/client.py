@@ -282,6 +282,8 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         claim = await self._claim_request(request, request_hash)
         stored_events = self._stored_events_or_raise(request, claim)
         if stored_events is not None:
+            if self._telemetry is not None:
+                self._telemetry.metrics.record_replay("gateway")
             for event in stored_events:
                 yield event
             return

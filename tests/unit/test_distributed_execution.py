@@ -201,6 +201,7 @@ async def test_recovered_agent_loop_reuses_terminal_tool_outcome() -> None:
         result={"content": "already durable"},
     )
     handler = CountingReadHandler()
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="agent-core"))
     tools = ToolRegistry(
         (
             RegisteredTool(
@@ -222,6 +223,7 @@ async def test_recovered_agent_loop_reuses_terminal_tool_outcome() -> None:
         tools=tools,
         clock=SteppingClock(NOW),
         id_generator=SequentialIdGenerator(),
+        telemetry=telemetry,
     )
 
     events = [
@@ -244,6 +246,9 @@ async def test_recovered_agent_loop_reuses_terminal_tool_outcome() -> None:
     reused = [event for event in events if isinstance(event, ToolCompletedEvent)]
     assert len(reused) == 1
     assert reused[0].payload.result == prior.result
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'agent_platform_idempotent_replays_total{component="tool"} 1.0' in payload
+    telemetry.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1150,6 +1155,7 @@ async def test_worker_records_correlated_run_queue_and_capacity_telemetry() -> N
     payload = telemetry.metrics.render().decode("utf-8")
     assert "agent_platform_queue_wait_seconds_count 1.0" in payload
     assert "agent_platform_worker_utilization_ratio 0.0" in payload
+    assert 'agent_platform_run_state_transitions_total{state="completed"} 1.0' in payload
     assert str(TENANT_ID) not in payload
     telemetry.shutdown()
 
@@ -1458,20 +1464,41 @@ async def test_scheduler_exports_bounded_queue_pressure_metrics() -> None:
                 captured_at=occurred_at,
             )
 
+    class RecoveringQueue(FakeQueue):
+        async def recover_expired(
+            self,
+            *,
+            occurred_at: datetime,
+            limit: int,
+        ) -> tuple[Run, ...]:
+            del occurred_at, limit
+            return (
+                Run(
+                    id=RUN_ID,
+                    session_id=SESSION_ID,
+                    workspace_id=WORKSPACE_ID,
+                    status=RunStatus.QUEUED,
+                    priority=0,
+                    attempt=2,
+                    created_at=NOW,
+                ),
+            )
+
     telemetry = PlatformTelemetry(TelemetrySettings(service_name="agent-scheduler"))
     scheduler = SchedulerService(
-        queue=FakeQueue(None),
+        queue=RecoveringQueue(None),
         queue_monitor=QueueMonitorFake(),
         clock=MutableClock(),
         telemetry=telemetry,
     )
 
-    assert await scheduler.recover_once() == 0
+    assert await scheduler.recover_once() == 1
     payload = telemetry.metrics.render().decode("utf-8")
     assert 'agent_platform_queue_depth{priority="interactive"} 3.0' in payload
     assert 'agent_platform_queue_depth{priority="background"} 2.0' in payload
     assert 'agent_platform_queue_depth{priority="evaluation"} 1.0' in payload
     assert "agent_platform_oldest_queued_seconds 12.5" in payload
+    assert "agent_platform_run_recoveries_total 1.0" in payload
     telemetry.shutdown()
 
 

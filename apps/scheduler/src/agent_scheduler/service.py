@@ -55,6 +55,8 @@ class SchedulerService:
             occurred_at=self._clock.now(),
             limit=self._config.recovery_batch_size,
         )
+        if recovered and self._telemetry is not None:
+            self._telemetry.metrics.run_recoveries.inc(len(recovered))
         if self._queue_monitor is not None and self._telemetry is not None:
             snapshot = await self._queue_monitor.snapshot(occurred_at=self._clock.now())
             self._telemetry.metrics.observe_queue(

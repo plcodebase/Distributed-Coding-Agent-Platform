@@ -114,6 +114,11 @@ def test_prometheus_metrics_have_bounded_labels_and_opaque_tenants() -> None:
     metrics.observe_queue(depth={"interactive": 2, "background": 1}, oldest_seconds=3.5)
     metrics.observe_worker(active=2, total=4)
     metrics.set_circuit(route="coding-primary", state="open")
+    metrics.runs_accepted.inc()
+    metrics.record_run_state("completed")
+    metrics.run_recoveries.inc(2)
+    metrics.event_reconnects.inc()
+    metrics.record_replay("tool")
     payload = metrics.render().decode("utf-8")
 
     assert "agent_platform_api_requests_total" in payload
@@ -125,6 +130,11 @@ def test_prometheus_metrics_have_bounded_labels_and_opaque_tenants() -> None:
     assert 'priority="evaluation"' in payload
     assert "agent_platform_worker_utilization_ratio 0.5" in payload
     assert 'state="open"} 1.0' in payload
+    assert "agent_platform_runs_accepted_total 1.0" in payload
+    assert 'agent_platform_run_state_transitions_total{state="completed"} 1.0' in payload
+    assert "agent_platform_run_recoveries_total 2.0" in payload
+    assert "agent_platform_event_reconnects_total 1.0" in payload
+    assert 'agent_platform_idempotent_replays_total{component="tool"} 1.0' in payload
     assert metrics.method("NONSTANDARD-METHOD") == "OTHER"
 
 
@@ -140,6 +150,8 @@ def test_metric_observations_validate_values() -> None:
         metrics.record_cost(tenant_id="tenant", route="route", usd=float("inf"))
     with pytest.raises(ValueError, match="closed, open, or half_open"):
         metrics.set_circuit(route="route", state="unknown")
+    with pytest.raises(ValueError, match="supported run state"):
+        metrics.record_run_state("invented")
 
 
 def test_record_error_is_structured_and_content_free() -> None:
@@ -171,4 +183,7 @@ def test_unexpected_exception_content_is_not_recorded_by_span_helper() -> None:
     assert len(spans) == 1
     assert known_value not in repr(spans[0].attributes)
     assert known_value not in repr(spans[0].events)
+    assert spans[0].status.status_code.name == "ERROR"
+    assert spans[0].attributes is not None
+    assert spans[0].attributes["error.type"] == "internal"
     telemetry.shutdown()

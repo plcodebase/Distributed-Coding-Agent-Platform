@@ -57,7 +57,7 @@ from agent_core.domain.errors import DomainOperationError
 from agent_core.domain.models import Run, Session
 from agent_core.domain.status import RunStatus, SessionStatus
 from agent_core.event_store import MAX_EVENT_PAGE_SIZE, StoredEvent
-from platform_telemetry import PlatformTelemetry, TelemetryContext
+from platform_telemetry import ErrorCategory, PlatformTelemetry, TelemetryContext
 
 type CloseCallback = Callable[[], Awaitable[None]]
 type RequestHandler = Callable[[Request], Awaitable[Response]]
@@ -159,7 +159,12 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         request: Request,
         error: DomainOperationError,
     ) -> JSONResponse:
-        del request
+        _record_api_error(
+            request,
+            telemetry,
+            category=_domain_error_category(error),
+            retryable=error.retryable,
+        )
         return JSONResponse(
             status_code=_error_status(error),
             content={"error": error.as_dict()},
@@ -171,7 +176,13 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         request: Request,
         error: RequestValidationError,
     ) -> JSONResponse:
-        del request, error
+        del error
+        _record_api_error(
+            request,
+            telemetry,
+            category=ErrorCategory.VALIDATION,
+            retryable=False,
+        )
         return JSONResponse(
             status_code=422,
             content={
@@ -186,7 +197,13 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
 
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, error: Exception) -> JSONResponse:
-        del request, error
+        del error
+        _record_api_error(
+            request,
+            telemetry,
+            category=ErrorCategory.INTERNAL,
+            retryable=True,
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -437,6 +454,8 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
                 priority_class=body.priority_class,
             ),
         )
+        if telemetry is not None and result.created:
+            telemetry.metrics.runs_accepted.inc()
         return RunCreationResponse(run=result.run, created=result.created)
 
     @app.get("/v1/runs/{run_id}", response_model=Run)
@@ -597,6 +616,8 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             await websocket.close(code=1011)
             return
         await websocket.accept()
+        if telemetry is not None and after > 0:
+            telemetry.metrics.event_reconnects.inc()
         event_stream = services.events.stream(
             identity.tenant_id,
             run_id,
@@ -682,6 +703,56 @@ def _error_headers(error: DomainOperationError) -> dict[str, str] | None:
     ):
         headers["Retry-After"] = str(max(1, math.ceil(retry_after)))
     return headers or None
+
+
+def _record_api_error(
+    request: Request,
+    telemetry: PlatformTelemetry | None,
+    *,
+    category: ErrorCategory,
+    retryable: bool,
+) -> None:
+    if telemetry is None:
+        return
+    span = getattr(request.state, "telemetry_span", None)
+    if span is not None:
+        telemetry.record_error(
+            span,
+            category=category,
+            component="agent-api",
+            retryable=retryable,
+        )
+
+
+def _domain_error_category(error: DomainOperationError) -> ErrorCategory:
+    code = error.code
+    exact = {
+        "authentication_required": ErrorCategory.AUTHENTICATION,
+        "resource_not_found": ErrorCategory.VALIDATION,
+    }
+    if code in exact:
+        return exact[code]
+    rules = (
+        (("authoriz", "permission", "denied"), ErrorCategory.AUTHORIZATION),
+        (("capacity", "overload", "quota"), ErrorCategory.CAPACITY),
+        (("rate_limit",), ErrorCategory.RATE_LIMIT),
+        (("timeout", "expired"), ErrorCategory.TIMEOUT),
+        (("cancel",), ErrorCategory.CANCELLED),
+        (("conflict", "in_progress", "lease_lost"), ErrorCategory.CONFLICT),
+        (("sandbox", "command"), ErrorCategory.SANDBOX),
+        (("persist", "database", "event_store"), ErrorCategory.PERSISTENCE),
+        (("provider",), ErrorCategory.PROVIDER),
+        (("gateway", "unavailable"), ErrorCategory.DEPENDENCY),
+    )
+    category = next(
+        (category for markers, category in rules if any(marker in code for marker in markers)),
+        None,
+    )
+    if category is not None:
+        return category
+    if code.startswith("invalid_") or code.endswith("_invalid"):
+        return ErrorCategory.VALIDATION
+    return ErrorCategory.INTERNAL
 
 
 async def _close_event_stream(stream: AsyncIterator[StoredEvent]) -> None:

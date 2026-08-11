@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from contextlib import contextmanager
@@ -220,7 +221,16 @@ class PlatformTelemetry:
                 set_status_on_exception=False,
             ) as active_span,
         ):
-            yield active_span
+            try:
+                yield active_span
+            except asyncio.CancelledError:
+                active_span.set_attribute("error.type", ErrorCategory.CANCELLED.value)
+                active_span.set_status(Status(StatusCode.ERROR))
+                raise
+            except Exception:
+                active_span.set_attribute("error.type", ErrorCategory.INTERNAL.value)
+                active_span.set_status(Status(StatusCode.ERROR))
+                raise
 
     def record_error(
         self,

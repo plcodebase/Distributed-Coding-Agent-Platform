@@ -244,6 +244,8 @@ class ToolTurnExecutor:
             )
             prior = outcomes.get(item.tool_call.id)
             if prior is not None:
+                if self._telemetry is not None:
+                    self._telemetry.metrics.record_replay("tool")
                 emitted.append(self._completion_from_outcome(events, item.tool_call.id, prior))
                 transcript.append(
                     tool_message(
