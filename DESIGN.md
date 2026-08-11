@@ -1250,10 +1250,12 @@ only one request may remain pending per session, and original messages remain
 append-only. Only unresolved task items are critical during compaction. Versioned task
 plans use compare-and-set updates. Durable run completion atomically enqueues bounded
 memory extraction jobs; source messages stream in bounded batches and extraction has a
-deadline shorter than its lease. Extracted memories carry tenant-scoped source
+deadline shorter than its lease. Reads are fenced at the caller's current time and only
+select messages belonging to the source run. Extracted memories carry tenant-scoped source
 session/run/time provenance, content-hash deduplication, and honor both tenant and
 session enablement. Extraction claims are expiring and generation-fenced so abandoned
-jobs can be recovered without accepting stale writes.
+jobs can be recovered without accepting stale writes. Versioned task updates reject
+in-progress or completed items whose dependencies are not complete.
 Status, compact/compaction-status, rewind, new-session, task-plan, memory-control, and
 memory-archive HTTP operations are available. Shell-style command aliases remain a CLI
 concern.
@@ -1265,11 +1267,17 @@ session, run, turn, model-call, and tool-call identifiers are trace and structur
 fields, never raw metric labels. OpenTelemetry exporters and Prometheus registries have
 explicit application-owned lifecycles. SDK remote tracing remains disabled; the
 platform span surrounding the Agents SDK model layer is authoritative.
+Bounded metrics also distinguish accepted runs from API idempotency replays and expose
+terminal transitions, scheduler recoveries, event reconnects, and replay suppression.
+Handled API errors and escaping span failures share the content-free error taxonomy.
 
 Sequence 26 provisions versioned Grafana overview and reliability dashboards with a
 stable Prometheus datasource UID. Prometheus loads reviewed recording and alert rules
-from a read-only mount. Tests ensure every platform query resolves to an exported or
-recorded metric and prevent content-bearing fields from entering dashboards or alerts.
+from a read-only mount. Provider-success math retains routes with only failed attempts;
+the test-target alerts use 99% provider success and 0.5% API errors. Reliability panels
+include accepted/terminal runs, recoveries, reconnects, and replays. Tests ensure every
+platform query resolves to an exported or recorded metric and prevent content-bearing
+fields from entering dashboards or alerts.
 
 Sequence 27 adds a bounded load harness and versioned profiles for all design load
 surfaces plus sandbox saturation. A fixed worker-task pool prevents task-count memory
@@ -1280,6 +1288,10 @@ platform performance claim. Accepted HTTP submissions are followed to durable te
 events, and observation counts distinguish unavailable measurements from measured
 zeros. Live deployment and horizontal-scaling evidence remain required before the final
 benchmark report.
+Each live campaign has a unique identity used in reports and API idempotency keys.
+HTTP and cumulative WebSocket bodies are incrementally bounded, live URLs are strict
+credential-free origins, event sequences from `after=0` begin at one without gaps, and
+process utilization is labelled as load-generator-only.
 
 Sequence 28 adds versioned contracts for all ten design failure scenarios. Scenarios
 run serially and pass only when observations prove accepted-task visibility, recovery
@@ -1289,6 +1301,10 @@ Cleanup is independently bounded and runs after cancellation and failures. CI ou
 simulation-only; live service faults use exact allowlisted targets through the Podman
 CLI, while non-service faults use typed injected platform seams. Kubernetes recovery
 evidence remains assigned to Sequences 29–30.
+Fault injection has its own deadline, recovery time is measured by the runner, scenario
+targets are exact, and successful live signal evidence must be positive and sourced
+from Prometheus. The live CLI loads a trusted driver factory and delays target
+restoration until after observation for faults whose continued presence is the test.
 
 ---
 

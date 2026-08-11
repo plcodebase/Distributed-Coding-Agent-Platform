@@ -388,7 +388,9 @@ per-session memory controls, tenant/session-filtered memory reads, and asynchron
 post-run memory extraction through the shared `summarization` route. Run completion
 is the sole path that atomically creates a recoverable, expiring, generation-fenced
 extraction job. Source rows stream in bounded batches, and extraction has a deadline
-strictly shorter than its lease.
+strictly shorter than its lease. Source reads are fenced by lease expiry and current
+time and include only messages attributed to the job's source run. Task states cannot
+advance past incomplete dependencies.
 Gateway-produced memory JSON is byte-bounded and validated before content-hash
 deduplication. Every memory records its source tenant/session/run, kind, extraction
 time, and optional closed metadata. Tenant or session disablement suppresses extraction
@@ -405,6 +407,9 @@ tool execution, checkpoint creation, and Podman sandbox startup. Prompt text, so
 content, tool arguments/results, exception messages, and credentials are excluded.
 Raw tenant/run/call identifiers are trace-only; tenant cost labels are opaque, capped,
 and overflow safely. `/metrics` can be protected with a dedicated bearer token.
+Accepted runs, terminal transitions, scheduler recoveries, event reconnects, and
+idempotent replays are exported as bounded-cardinality reliability counters; handled
+API failures and escaping span exceptions use the same structured error categories.
 
 ### Sequence 26: Grafana dashboards and Prometheus rules
 
@@ -412,9 +417,11 @@ Sequence 26 provisions immutable overview and reliability dashboards with stable
 plus recording and alert rules loaded from a read-only Prometheus mount. The views
 cover run/queue/worker pressure, sandbox and model latency, provider success, tokens,
 opaque-tenant cost, retries, fallbacks, circuit state, API errors, tools, and
-checkpoints. Tests reject dashboard queries that reference metrics not exported or
-recorded by the platform. Alert thresholds remain test targets, not production SLO
-claims.
+checkpoints, plus accepted/terminal runs, recoveries, reconnects, and replay
+suppression. Provider ratios preserve all-failure routes and alerts use the design's
+99% provider-success and 0.5% API-error test thresholds. Tests reject dashboard queries
+that reference metrics not exported or recorded by the platform. Alert thresholds
+remain test targets, not production SLO claims.
 
 ### Sequence 27: bounded load-test suite
 
@@ -426,6 +433,11 @@ outcomes, tokens, retries, fallbacks, permission denials, and process resource u
 Accepted submissions are followed to a durable terminal event; HTTP acceptance is not
 reported as task success. Summary counts distinguish unavailable measurements from
 real zero values.
+Live reports and idempotency keys carry a unique campaign ID. Live endpoints must be
+credential-free HTTP(S) origins, successful HTTP bodies and cumulative event streams
+are incrementally byte-bounded, and durable streams beginning at zero must start at
+sequence 1 without gaps. CPU and RSS are explicitly scoped to the load-generator
+process.
 Deterministic CI reports are explicitly labelled `simulation_only`; only opt-in live
 runs can produce measurement reports, and live credentials are never serialized.
 
@@ -439,6 +451,11 @@ cancellation. CI simulations are explicitly non-measurements. Live service fault
 only an absolute Podman executable and exact allowlisted container identifiers through
 an argv-only bounded process boundary; platform-level faults use injected test seams.
 Fault-command success alone never passes a scenario.
+Fault injection, recovery observation, and cleanup have independent deadlines. The
+harness—not the driver—measures recovery time, exact semantic targets are validated,
+and passing live evidence must contain positive Prometheus observations. Live drivers
+are supplied through a trusted composition factory and service restoration is ordered
+so the intended fault remains active during observation where required.
 
 ## Local setup
 
