@@ -75,6 +75,41 @@
       "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
       "targets": [{"refId": "A", "expr": "sum by (outcome) (rate(agent_platform_sandbox_startup_duration_seconds_count[5m]))", "legendFormat": "{{outcome}}"}],
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16}
+    },
+    {
+      "id": 10,
+      "title": "Accepted and terminal runs",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "agent_platform:runs_accepted:rate5m", "legendFormat": "accepted"},
+        {"refId": "B", "expr": "agent_platform:run_terminal:rate5m", "legendFormat": "{{state}}"}
+      ],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24}
+    },
+    {
+      "id": 11,
+      "title": "Run recoveries",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "agent_platform:run_recoveries:rate5m"}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24}
+    },
+    {
+      "id": 12,
+      "title": "Event reconnects",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "agent_platform:event_reconnects:rate5m"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24}
+    },
+    {
+      "id": 13,
+      "title": "Idempotent replays",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "agent_platform:idempotent_replays:rate5m", "legendFormat": "{{component}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 32}
     }
   ],
   "refresh": "15s",

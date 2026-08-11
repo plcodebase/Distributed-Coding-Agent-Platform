@@ -17,13 +17,17 @@ false impression that a reliability signal exists.
 - Split views into platform overview and reliability dashboards. Cover active runs,
   queue pressure, worker utilization, sandbox startup, provider success, model latency
   and first output, token rate, opaque-tenant cost, retries, fallbacks, circuit state,
-  structured errors, API errors, tool outcomes, and checkpoints.
+  structured errors, API errors, tool outcomes, checkpoints, accepted/terminal runs,
+  scheduler recoveries, event reconnects, and idempotent replays.
 - Load versioned Prometheus recording and alert rules through a read-only mount.
   Recording rules centralize p95 and ratio expressions; alerts include a nonzero hold
   duration and stable warning or critical severity.
 - Treat the documented SLO values as test targets rather than guarantees. Dashboards
   display measurements; they do not claim that an SLO has been met without load-test
   evidence.
+- Preserve provider routes that have attempts but zero successes when computing success
+  ratios. Alert against the design test targets of 99% provider success and 0.5% API
+  server errors; do not substitute looser thresholds silently.
 - Validate JSON/YAML provisioning, stable UIDs, panel coverage, rule metadata, and every
   platform metric reference in unit tests. Prompts, source code, arguments, results,
   and credentials are prohibited from dashboard and alert definitions.

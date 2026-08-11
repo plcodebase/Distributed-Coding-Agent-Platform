@@ -125,6 +125,10 @@ def test_dashboards_cover_required_operational_views_without_content_fields() ->
         "Gateway retries",
         "Gateway fallbacks",
         "Circuit state",
+        "Accepted and terminal runs",
+        "Run recoveries",
+        "Event reconnects",
+        "Idempotent replays",
     } <= titles
     for panel in panels:
         assert panel["datasource"] == {"type": "prometheus", "uid": DATASOURCE_UID}
@@ -177,3 +181,28 @@ def test_alerts_have_stable_severity_duration_and_content_free_annotations() -> 
         annotation = json.dumps(alert["annotations"], sort_keys=True).casefold()
         assert "secret" not in annotation
         assert "source" not in annotation
+
+    by_name = {str(rule["alert"]): rule for rule in alerts}
+    assert "< 0.99" in str(by_name["AgentPlatformProviderSuccessLow"]["expr"])
+    assert "> 0.005" in str(by_name["AgentPlatformApiErrorsHigh"]["expr"])
+
+
+def test_provider_success_record_preserves_all_failure_routes() -> None:
+    rules = _yaml(DEPLOYMENT / "prometheus-rules" / "platform.yml")
+    records = {
+        str(rule["record"]): str(rule["expr"])
+        for group in cast("list[dict[str, Any]]", rules["groups"])
+        for rule in cast("list[dict[str, Any]]", group["rules"])
+        if "record" in rule
+    }
+    provider_success = records["agent_platform:provider_success:rate5m"]
+    assert 'outcome="success"' in provider_success
+    assert "or on (route)" in provider_success
+    assert "0 * sum by (route)" in provider_success
+    assert {
+        "agent_platform:runs_accepted:rate5m",
+        "agent_platform:run_terminal:rate5m",
+        "agent_platform:run_recoveries:rate5m",
+        "agent_platform:event_reconnects:rate5m",
+        "agent_platform:idempotent_replays:rate5m",
+    } <= records.keys()

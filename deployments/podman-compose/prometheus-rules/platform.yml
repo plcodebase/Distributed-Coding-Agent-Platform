@@ -6,7 +6,9 @@ groups:
         expr: sum(agent_platform_queue_depth)
       - record: agent_platform:provider_success:rate5m
         expr: >-
-          sum by (route) (rate(agent_platform_provider_requests_total{outcome="success"}[5m]))
+          (sum by (route) (rate(agent_platform_provider_requests_total{outcome="success"}[5m]))
+          or on (route)
+          (0 * sum by (route) (rate(agent_platform_provider_requests_total[5m]))))
           / clamp_min(sum by (route) (rate(agent_platform_provider_requests_total[5m])), 0.000001)
       - record: agent_platform:model_latency:p95_5m
         expr: >-
@@ -22,6 +24,19 @@ groups:
           / clamp_min(sum(rate(agent_platform_api_requests_total[5m])), 0.000001)
       - record: agent_platform:model_tokens:rate5m
         expr: sum by (route, direction) (rate(agent_platform_model_tokens_total[5m]))
+      - record: agent_platform:runs_accepted:rate5m
+        expr: rate(agent_platform_runs_accepted_total[5m])
+      - record: agent_platform:run_terminal:rate5m
+        expr: >-
+          sum by (state)
+          (rate(agent_platform_run_state_transitions_total{state=~"completed|failed|cancelled"}[5m]))
+      - record: agent_platform:run_recoveries:rate5m
+        expr: rate(agent_platform_run_recoveries_total[5m])
+      - record: agent_platform:event_reconnects:rate5m
+        expr: rate(agent_platform_event_reconnects_total[5m])
+      - record: agent_platform:idempotent_replays:rate5m
+        expr: >-
+          sum by (component) (rate(agent_platform_idempotent_replays_total[5m]))
 
   - name: agent-platform-alerts
     interval: 30s
@@ -42,7 +57,7 @@ groups:
           summary: Worker utilization remains above ninety percent
       - alert: AgentPlatformProviderSuccessLow
         expr: >-
-          agent_platform:provider_success:rate5m < 0.95
+          agent_platform:provider_success:rate5m < 0.99
           and on (route) sum by (route) (rate(agent_platform_provider_requests_total[5m])) > 0
         for: 10m
         labels:
@@ -50,12 +65,12 @@ groups:
         annotations:
           summary: Model provider success rate is below the test target
       - alert: AgentPlatformApiErrorsHigh
-        expr: agent_platform:api_error:rate5m > 0.05
+        expr: agent_platform:api_error:rate5m > 0.005
         for: 10m
         labels:
           severity: critical
         annotations:
-          summary: API server-error rate is above five percent
+          summary: API server-error rate is above one-half percent
       - alert: AgentPlatformGatewayCircuitOpen
         expr: agent_platform_gateway_circuit_state{state="open"} == 1
         for: 2m
