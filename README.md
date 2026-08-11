@@ -406,6 +406,16 @@ content, tool arguments/results, exception messages, and credentials are exclude
 Raw tenant/run/call identifiers are trace-only; tenant cost labels are opaque, capped,
 and overflow safely. `/metrics` can be protected with a dedicated bearer token.
 
+### Sequence 26: Grafana dashboards and Prometheus rules
+
+Sequence 26 provisions immutable overview and reliability dashboards with stable UIDs,
+plus recording and alert rules loaded from a read-only Prometheus mount. The views
+cover run/queue/worker pressure, sandbox and model latency, provider success, tokens,
+opaque-tenant cost, retries, fallbacks, circuit state, API errors, tools, and
+checkpoints. Tests reject dashboard queries that reference metrics not exported or
+recorded by the platform. Alert thresholds remain test targets, not production SLO
+claims.
+
 ## Local setup
 
 ```shell

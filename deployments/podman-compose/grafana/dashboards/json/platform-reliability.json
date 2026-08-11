@@ -1,0 +1,89 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Gateway retries",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (route, category) (rate(agent_platform_gateway_retries_total[5m]))", "legendFormat": "{{route}} {{category}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Gateway fallbacks",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (route, category) (rate(agent_platform_gateway_fallbacks_total[5m]))", "legendFormat": "{{route}} {{category}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Circuit state",
+      "type": "state-timeline",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "agent_platform_gateway_circuit_state", "legendFormat": "{{route}} {{state}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0}
+    },
+    {
+      "id": 4,
+      "title": "Structured errors",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (component, category) (rate(agent_platform_errors_total[5m]))", "legendFormat": "{{component}} {{category}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8}
+    },
+    {
+      "id": 5,
+      "title": "Model outcomes",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (route, outcome) (rate(agent_platform_model_requests_total[5m]))", "legendFormat": "{{route}} {{outcome}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8}
+    },
+    {
+      "id": 6,
+      "title": "Provider outcomes",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (route, outcome) (rate(agent_platform_provider_requests_total[5m]))", "legendFormat": "{{route}} {{outcome}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8}
+    },
+    {
+      "id": 7,
+      "title": "API error ratio",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform:api_error:rate5m"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16}
+    },
+    {
+      "id": 8,
+      "title": "Active alerts",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "ALERTS{alertstate=\"firing\",alertname=~\"AgentPlatform.*\"}", "format": "table", "instant": true}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16}
+    },
+    {
+      "id": 9,
+      "title": "Sandbox startup outcomes",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (outcome) (rate(agent_platform_sandbox_startup_duration_seconds_count[5m]))", "legendFormat": "{{outcome}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["agent-platform", "reliability"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Agent Platform Reliability",
+  "uid": "agent-platform-reliability",
+  "version": 1
+}

@@ -194,6 +194,7 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./deployments/podman-compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployments/podman-compose/prometheus-rules:/etc/prometheus/rules:ro
       - prometheus-secrets:/run/secrets:ro
       - prometheus-data:/prometheus
     healthcheck:
@@ -216,6 +217,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"

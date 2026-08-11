@@ -1,0 +1,72 @@
+groups:
+  - name: agent-platform-recording
+    interval: 30s
+    rules:
+      - record: agent_platform:queue_depth:sum
+        expr: sum(agent_platform_queue_depth)
+      - record: agent_platform:provider_success:rate5m
+        expr: >-
+          sum by (route) (rate(agent_platform_provider_requests_total{outcome="success"}[5m]))
+          / clamp_min(sum by (route) (rate(agent_platform_provider_requests_total[5m])), 0.000001)
+      - record: agent_platform:model_latency:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+          sum by (le, route) (rate(agent_platform_model_request_duration_seconds_bucket[5m])))
+      - record: agent_platform:sandbox_startup:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+          sum by (le) (rate(agent_platform_sandbox_startup_duration_seconds_bucket[5m])))
+      - record: agent_platform:api_error:rate5m
+        expr: >-
+          sum(rate(agent_platform_api_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(agent_platform_api_requests_total[5m])), 0.000001)
+      - record: agent_platform:model_tokens:rate5m
+        expr: sum by (route, direction) (rate(agent_platform_model_tokens_total[5m]))
+
+  - name: agent-platform-alerts
+    interval: 30s
+    rules:
+      - alert: AgentPlatformQueueBacklogOld
+        expr: agent_platform_oldest_queued_seconds > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Oldest queued run exceeds five minutes
+      - alert: AgentPlatformWorkersSaturated
+        expr: agent_platform_worker_utilization_ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker utilization remains above ninety percent
+      - alert: AgentPlatformProviderSuccessLow
+        expr: >-
+          agent_platform:provider_success:rate5m < 0.95
+          and on (route) sum by (route) (rate(agent_platform_provider_requests_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Model provider success rate is below the test target
+      - alert: AgentPlatformApiErrorsHigh
+        expr: agent_platform:api_error:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: API server-error rate is above five percent
+      - alert: AgentPlatformGatewayCircuitOpen
+        expr: agent_platform_gateway_circuit_state{state="open"} == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A model route circuit remains open
+      - alert: AgentPlatformSandboxStartupSlow
+        expr: agent_platform:sandbox_startup:p95_5m > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sandbox startup p95 exceeds ten seconds

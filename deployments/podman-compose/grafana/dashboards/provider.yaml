@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: Agent Platform
+    orgId: 1
+    folder: Agent Platform
+    folderUid: agent-platform
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+      foldersFromFilesStructure: false

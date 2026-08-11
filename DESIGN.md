@@ -1243,7 +1243,7 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 25: the worker uses a contributor-based,
+Implementation status through Sequence 26: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
@@ -1265,6 +1265,11 @@ session, run, turn, model-call, and tool-call identifiers are trace and structur
 fields, never raw metric labels. OpenTelemetry exporters and Prometheus registries have
 explicit application-owned lifecycles. SDK remote tracing remains disabled; the
 platform span surrounding the Agents SDK model layer is authoritative.
+
+Sequence 26 provisions versioned Grafana overview and reliability dashboards with a
+stable Prometheus datasource UID. Prometheus loads reviewed recording and alert rules
+from a read-only mount. Tests ensure every platform query resolves to an exported or
+recorded metric and prevent content-bearing fields from entering dashboards or alerts.
 
 ---
 

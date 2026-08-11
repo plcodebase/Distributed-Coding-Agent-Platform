@@ -1,0 +1,153 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active runs",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "agent_platform_active_runs"}],
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Queue depth",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (priority) (agent_platform_queue_depth)", "legendFormat": "{{priority}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 4, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Oldest queued run",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform_oldest_queued_seconds"}],
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 4}
+    },
+    {
+      "id": 4,
+      "title": "Worker utilization",
+      "type": "gauge",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform_worker_utilization_ratio"}],
+      "gridPos": {"h": 8, "w": 4, "x": 12, "y": 0}
+    },
+    {
+      "id": 5,
+      "title": "Sandbox startup p95",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform:sandbox_startup:p95_5m"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0}
+    },
+    {
+      "id": 6,
+      "title": "Provider success rate",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform:provider_success:rate5m{route=~\"$route\"}", "legendFormat": "{{route}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8}
+    },
+    {
+      "id": 7,
+      "title": "Model latency",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le, route) (rate(agent_platform_model_request_duration_seconds_bucket{route=~\"$route\"}[5m])))", "legendFormat": "p50 {{route}}"},
+        {"refId": "B", "expr": "agent_platform:model_latency:p95_5m{route=~\"$route\"}", "legendFormat": "p95 {{route}}"}
+      ],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8}
+    },
+    {
+      "id": 8,
+      "title": "Time to first output p95",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le, route) (rate(agent_platform_model_time_to_first_token_seconds_bucket{route=~\"$route\"}[5m])))", "legendFormat": "{{route}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8}
+    },
+    {
+      "id": 9,
+      "title": "Token rate",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "agent_platform:model_tokens:rate5m{route=~\"$route\"}", "legendFormat": "{{route}} {{direction}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16}
+    },
+    {
+      "id": 10,
+      "title": "Cost by opaque tenant",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (tenant) (increase(agent_platform_model_cost_usd_total{route=~\"$route\"}[$__range]))", "legendFormat": "{{tenant}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16}
+    },
+    {
+      "id": 11,
+      "title": "API request rate",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (route, status) (rate(agent_platform_api_requests_total[5m]))", "legendFormat": "{{route}} {{status}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16}
+    },
+    {
+      "id": 12,
+      "title": "Queue wait p95",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(agent_platform_queue_wait_seconds_bucket[5m])))"}],
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24}
+    },
+    {
+      "id": 13,
+      "title": "Tool outcomes",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (tool, outcome) (rate(agent_platform_tool_calls_total[5m]))", "legendFormat": "{{tool}} {{outcome}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24}
+    },
+    {
+      "id": 14,
+      "title": "Checkpoint rate",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+      "targets": [{"refId": "A", "expr": "sum by (outcome) (rate(agent_platform_checkpoints_total[5m]))", "legendFormat": "{{outcome}}"}],
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24}
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["agent-platform", "overview"],
+  "templating": {
+    "list": [
+      {
+        "name": "route",
+        "label": "Model route",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "agent-platform-prometheus"},
+        "query": {"query": "label_values(agent_platform_model_requests_total, route)", "refId": "route-variable"},
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Agent Platform Overview",
+  "uid": "agent-platform-overview",
+  "version": 1
+}
