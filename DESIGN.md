@@ -1243,7 +1243,7 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 26: the worker uses a contributor-based,
+Implementation status through Sequence 27: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
@@ -1270,6 +1270,16 @@ Sequence 26 provisions versioned Grafana overview and reliability dashboards wit
 stable Prometheus datasource UID. Prometheus loads reviewed recording and alert rules
 from a read-only mount. Tests ensure every platform query resolves to an exported or
 recorded metric and prevent content-bearing fields from entering dashboards or alerts.
+
+Sequence 27 adds a bounded load harness and versioned profiles for all design load
+surfaces plus sandbox saturation. A fixed worker-task pool prevents task-count memory
+growth, each operation has a deadline, and reports include throughput, error rate,
+p50/p95/p99 latency, task/model/tool accounting, process utilization, methodology, and
+hardware. Synthetic CI output is machine-labelled as simulation-only and is not a
+platform performance claim. Accepted HTTP submissions are followed to durable terminal
+events, and observation counts distinguish unavailable measurements from measured
+zeros. Live deployment and horizontal-scaling evidence remain required before the final
+benchmark report.
 
 ---
 

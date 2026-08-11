@@ -18,3 +18,4 @@ build/
 benchmarks/reports/*.json
 benchmarks/reports/*.md
 !benchmarks/reports/.gitkeep
+!benchmarks/reports/README.md

@@ -1,0 +1,90 @@
+- name: simulation-10
+  scenario: api_submission
+  concurrency: 10
+  operations: 100
+  operation_timeout_seconds: 5
+  preconditions:
+    - Synthetic CI validation only; results are not deployment measurements.
+
+- name: api-50
+  scenario: api_submission
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 30
+  preconditions:
+    - A dedicated session exists in the test deployment.
+
+- name: api-100
+  scenario: api_submission
+  concurrency: 100
+  operations: 2000
+  operation_timeout_seconds: 30
+  preconditions:
+    - Per-tenant and global queue limits are configured above the intended accepted load.
+
+- name: websocket-50
+  scenario: websocket_connections
+  concurrency: 50
+  operations: 500
+  operation_timeout_seconds: 30
+  max_events_per_connection: 1
+  preconditions:
+    - AGENT_PLATFORM_LOAD_RUN_ID identifies a tenant-owned run with a replayable event.
+
+- name: event-throughput-50
+  scenario: event_throughput
+  concurrency: 50
+  operations: 500
+  operation_timeout_seconds: 60
+  max_events_per_connection: 1000
+  preconditions:
+    - The selected run produces a bounded stream and ends in a terminal event.
+
+- name: worker-saturation-100
+  scenario: worker_saturation
+  concurrency: 100
+  operations: 2000
+  operation_timeout_seconds: 30
+  preconditions:
+    - Worker metrics and queue dashboards are available during the run.
+
+- name: gateway-rate-limit-50
+  scenario: gateway_rate_limit
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 60
+  preconditions:
+    - The test route has an intentionally documented request limit.
+
+- name: provider-fallback-50
+  scenario: provider_fallback
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 60
+  preconditions:
+    - The primary fake provider is configured to fail and the fallback remains healthy.
+
+- name: postgres-contention-50
+  scenario: postgres_contention
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 60
+  preconditions:
+    - PostgreSQL contention is injected by the separately controlled test environment.
+
+- name: redis-contention-50
+  scenario: redis_contention
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 60
+  preconditions:
+    - Redis contention is injected by the separately controlled test environment.
+
+- name: sandbox-saturation-50
+  scenario: sandbox_saturation
+  concurrency: 50
+  operations: 1000
+  operation_timeout_seconds: 120
+  preconditions:
+    - The test deployment has a documented sandbox-slot capacity below the submitted load.
+    - Worker and sandbox startup metrics are available during the run.

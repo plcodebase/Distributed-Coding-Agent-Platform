@@ -88,6 +88,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "mypy" },
     { name = "pip-audit" },
     { name = "podman-compose" },
@@ -98,6 +99,7 @@ dev = [
     { name = "pyyaml" },
     { name = "ruff" },
     { name = "types-pyyaml" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -116,6 +118,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "mypy", specifier = ">=1.15,<2" },
     { name = "pip-audit", specifier = ">=2.9,<3" },
     { name = "podman-compose", specifier = ">=1.5,<2" },
@@ -126,6 +129,7 @@ dev = [
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", specifier = ">=6,<7" },
+    { name = "websockets", specifier = ">=15,<16" },
 ]
 
 [[package]]

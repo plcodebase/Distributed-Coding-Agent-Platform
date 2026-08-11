@@ -416,6 +416,19 @@ checkpoints. Tests reject dashboard queries that reference metrics not exported 
 recorded by the platform. Alert thresholds remain test targets, not production SLO
 claims.
 
+### Sequence 27: bounded load-test suite
+
+Sequence 27 adds versioned profiles for API submission, event streaming, worker and
+sandbox saturation, gateway limiting/fallback, and PostgreSQL/Redis contention. A
+fixed-worker async runner enforces concurrency, operation, timeout, event, and report
+limits and records throughput, errors, p50/p95/p99 latency, queue/model timing, task
+outcomes, tokens, retries, fallbacks, permission denials, and process resource use.
+Accepted submissions are followed to a durable terminal event; HTTP acceptance is not
+reported as task success. Summary counts distinguish unavailable measurements from
+real zero values.
+Deterministic CI reports are explicitly labelled `simulation_only`; only opt-in live
+runs can produce measurement reports, and live credentials are never serialized.
+
 ## Local setup
 
 ```shell
