@@ -429,6 +429,17 @@ real zero values.
 Deterministic CI reports are explicitly labelled `simulation_only`; only opt-in live
 runs can produce measurement reports, and live credentials are never serialized.
 
+### Sequence 28: fail-closed chaos-test suite
+
+Sequence 28 defines all ten design failure scenarios as closed, versioned contracts.
+The runner evaluates accepted-task visibility, recovery deadlines, final state,
+single-commit behavior, durable-event continuity, retry class, and bounded metric
+evidence, with independently timed cleanup after success, failure, timeout, or
+cancellation. CI simulations are explicitly non-measurements. Live service faults use
+only an absolute Podman executable and exact allowlisted container identifiers through
+an argv-only bounded process boundary; platform-level faults use injected test seams.
+Fault-command success alone never passes a scenario.
+
 ## Local setup
 
 ```shell

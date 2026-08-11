@@ -1,7 +1,7 @@
 # Benchmark reports
 
-This directory accepts generated JSON reports from `scripts/load_test`. A report is
-evidence only when `synthetic` is `false` and
+This directory accepts generated JSON reports from `scripts/load_test` and
+`scripts/chaos_test`. A report is evidence only when `synthetic` is `false` and
 `result_claim` is `measurement`. Simulation reports validate scheduling, aggregation,
 timeouts, invariant evaluation, and serialization; they must never be quoted as
 platform throughput, latency, or live recovery evidence.
@@ -30,4 +30,8 @@ through their durable event stream. Metric summaries include an observation coun
 zero count means the selected interface did not expose that measurement and must not be
 interpreted as a measured value of zero.
 
-Generated JSON reports are intentionally not committed by default.
+Chaos reports follow the same evidence rule. A passing simulation proves only that the
+runner evaluates the versioned expectations. A passing live scenario must also contain
+the measured recovery observation and bounded metric evidence required by that
+scenario; successful fault injection alone is insufficient. Generated JSON reports
+are intentionally not committed by default.

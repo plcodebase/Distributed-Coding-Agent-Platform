@@ -1,0 +1,147 @@
+- name: active-worker-termination
+  scenario: worker_termination
+  fault:
+    action: terminate
+    target: active_worker
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - An accepted run is actively leased by the exact allowlisted worker container.
+    - At least one replacement worker is healthy and can claim expired leases.
+  expected:
+    allowed_final_states: [completed, retry_pending]
+    max_committed_changes: 1
+    retry_categories: [worker_lost]
+    required_signals: [worker_recovery, queue_recovery]
+
+- name: redis-restart
+  scenario: redis_restart
+  fault:
+    action: restart
+    target: redis
+  recovery_timeout_seconds: 60
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - Redis is healthy and the accepted run is durably queued in PostgreSQL.
+  expected:
+    allowed_final_states: [completed, retry_pending]
+    max_committed_changes: 1
+    required_signals: [queue_recovery]
+
+- name: postgres-interruption
+  scenario: postgres_interruption
+  fault:
+    action: block
+    target: postgres
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - PostgreSQL is healthy and an accepted run ID has been recorded before interruption.
+  expected:
+    allowed_final_states: [completed, retry_pending, failed]
+    max_committed_changes: 1
+    required_signals: [api_error, queue_recovery]
+
+- name: primary-provider-disabled
+  scenario: primary_provider_disabled
+  fault:
+    action: disable
+    target: primary_provider
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - The primary and secondary deterministic providers are healthy before the fault.
+    - The route has bounded fallback enabled.
+  expected:
+    allowed_final_states: [completed]
+    max_committed_changes: 1
+    retry_categories: [provider_unavailable]
+    required_signals: [provider_fallback]
+
+- name: gateway-rate-limit
+  scenario: gateway_rate_limit
+  fault:
+    action: return_429
+    target: gateway_route
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - The deterministic gateway route is configured to return a bounded sequence of 429 responses.
+  expected:
+    allowed_final_states: [completed, retry_pending, failed]
+    max_committed_changes: 1
+    retry_categories: [rate_limit]
+    required_signals: [gateway_retry]
+
+- name: websocket-disconnect
+  scenario: websocket_disconnect
+  fault:
+    action: disconnect
+    target: event_client
+  recovery_timeout_seconds: 60
+  cleanup_timeout_seconds: 15
+  preconditions:
+    - The client has persisted the last observed event sequence before disconnecting.
+  expected:
+    allowed_final_states: [running, completed, failed]
+    max_committed_changes: 1
+    required_signals: [event_replay]
+
+- name: sandbox-oom
+  scenario: sandbox_oom
+  fault:
+    action: force_oom
+    target: sandbox_process
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - The test sandbox uses a deliberately small documented memory limit.
+    - The workload allocates memory only inside the isolated sandbox.
+  expected:
+    allowed_final_states: [failed, retry_pending]
+    max_committed_changes: 0
+    retry_categories: [sandbox_oom]
+    required_signals: [sandbox_failure]
+
+- name: duplicate-task-delivery
+  scenario: duplicate_task_delivery
+  fault:
+    action: duplicate_task
+    target: durable_task
+  recovery_timeout_seconds: 60
+  cleanup_timeout_seconds: 15
+  preconditions:
+    - The same durable task identity and generation are delivered twice.
+  expected:
+    allowed_final_states: [completed, retry_pending]
+    max_committed_changes: 1
+    required_signals: [queue_recovery]
+
+- name: duplicate-tool-call
+  scenario: duplicate_tool_call
+  fault:
+    action: duplicate_tool
+    target: tool_delivery
+  recovery_timeout_seconds: 60
+  cleanup_timeout_seconds: 15
+  preconditions:
+    - The same tool-call ID and canonical argument hash are delivered twice.
+  expected:
+    allowed_final_states: [completed, retry_pending]
+    max_committed_changes: 1
+    required_signals: [tool_replay]
+
+- name: checkpoint-interruption
+  scenario: checkpoint_interruption
+  fault:
+    action: interrupt_checkpoint
+    target: checkpoint_worker
+  recovery_timeout_seconds: 120
+  cleanup_timeout_seconds: 30
+  preconditions:
+    - A worker is interrupted between checkpoint intent and durable completion.
+    - A replacement worker can acquire a newer lease generation.
+  expected:
+    allowed_final_states: [completed, retry_pending]
+    max_committed_changes: 1
+    required_signals: [checkpoint_recovery, worker_recovery]

@@ -11,7 +11,7 @@ AUDIT_REQUIREMENTS ?= .cache/audit-requirements.txt
 export UV_CACHE_DIR ?= $(CURDIR)/.cache/uv
 export PRE_COMMIT_HOME ?= $(CURDIR)/.cache/pre-commit
 
-.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test load-sim podman-images sandbox-security gateway-security postgres-security migrate migration-check api compose-config compose-up compose-smoke compose-down
+.PHONY: bootstrap sync format lint typecheck unit integration coverage audit check test load-sim chaos-sim podman-images sandbox-security gateway-security postgres-security migrate migration-check api compose-config compose-up compose-smoke compose-down
 
 bootstrap:
 	$(UV) python install 3.12
@@ -50,6 +50,9 @@ test: check integration
 
 load-sim:
 	$(UV) run python -m scripts.load_test --profiles benchmarks/gateway_load/profiles.yaml --profile simulation-10 --mode simulation --report benchmarks/reports/load-simulation.json
+
+chaos-sim:
+	$(UV) run python -m scripts.chaos_test --scenarios benchmarks/chaos/scenarios.yaml --mode simulation --report benchmarks/reports/chaos-simulation.json
 
 podman-images:
 	$(PODMAN) build --tag $(FAKE_LLM_IMAGE) --file services/fake-llm/Containerfile services/fake-llm

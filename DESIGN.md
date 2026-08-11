@@ -1243,7 +1243,7 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 27: the worker uses a contributor-based,
+Implementation status through Sequence 28: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
@@ -1280,6 +1280,15 @@ platform performance claim. Accepted HTTP submissions are followed to durable te
 events, and observation counts distinguish unavailable measurements from measured
 zeros. Live deployment and horizontal-scaling evidence remain required before the final
 benchmark report.
+
+Sequence 28 adds versioned contracts for all ten design failure scenarios. Scenarios
+run serially and pass only when observations prove accepted-task visibility, recovery
+within deadline, at most one committed change, durable event continuity, an allowed
+run state, the expected retry class where applicable, and required metric evidence.
+Cleanup is independently bounded and runs after cancellation and failures. CI output is
+simulation-only; live service faults use exact allowlisted targets through the Podman
+CLI, while non-service faults use typed injected platform seams. Kubernetes recovery
+evidence remains assigned to Sequences 29–30.
 
 ---
 
