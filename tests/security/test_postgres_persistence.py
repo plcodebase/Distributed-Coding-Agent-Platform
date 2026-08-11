@@ -785,7 +785,11 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         assert memory_job.run_id == primary.id
         assert memory_job.status is MemoryExtractionStatus.RUNNING
         assert memory_job.lease_generation == 1
-        source = await memories.source_for_job(memory_job, max_bytes=4096)
+        source = await memories.source_for_job(
+            memory_job,
+            max_bytes=4096,
+            occurred_at=now + timedelta(seconds=21),
+        )
         assert "recover this run" in source
         memory_content = "The recovered run keeps one durable decision."
         duplicate_memories = tuple(
@@ -1521,7 +1525,11 @@ async def test_memory_extraction_lease_recovery_fences_stale_scheduler(
         assert recovered.lease_token == second_token
 
         with pytest.raises(DomainOperationError) as stale_source:
-            await memories.source_for_job(first, max_bytes=1024)
+            await memories.source_for_job(
+                first,
+                max_bytes=1024,
+                occurred_at=now + timedelta(seconds=4),
+            )
         assert stale_source.value.code == "memory_extraction_lease_lost"
         with pytest.raises(DomainOperationError) as stale_finish:
             await memories.complete(

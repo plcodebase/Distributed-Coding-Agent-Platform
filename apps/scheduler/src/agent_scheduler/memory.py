@@ -14,7 +14,7 @@ from agent_core.control import (
     PersistedMemory,
     memory_content_hash,
 )
-from agent_core.domain.errors import ErrorDetail
+from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.memory import MAX_MEMORY_EXTRACTION_SOURCE_BYTES, MemoryExtractionInput
 
 MAX_MEMORY_WORKER_ID_LENGTH = 255
@@ -44,6 +44,7 @@ class MemoryExtractionStore(Protocol):
         job: MemoryExtractionJob,
         *,
         max_bytes: int,
+        occurred_at: datetime,
     ) -> str: ...
 
     async def complete(
@@ -124,6 +125,7 @@ class MemoryExtractionProcessor:
                 source = await self._store.source_for_job(
                     job,
                     max_bytes=MAX_MEMORY_EXTRACTION_SOURCE_BYTES,
+                    occurred_at=self._clock.now(),
                 )
                 if not source.strip():
                     await self._store.complete(job, (), completed_at=self._clock.now())
@@ -157,8 +159,16 @@ class MemoryExtractionProcessor:
                 error=ErrorDetail(
                     code="memory_extraction_timeout",
                     message="memory extraction exceeded its bounded deadline",
-                    retryable=True,
+                    retryable=False,
                 ),
+                completed_at=self._clock.now(),
+            )
+        except DomainOperationError as error:
+            if error.code == "memory_extraction_lease_lost":
+                return True
+            await self._store.fail(
+                job,
+                error=error.error,
                 completed_at=self._clock.now(),
             )
         except Exception:
@@ -167,7 +177,7 @@ class MemoryExtractionProcessor:
                 error=ErrorDetail(
                     code="memory_extraction_failed",
                     message="memory extraction could not be completed",
-                    retryable=True,
+                    retryable=False,
                 ),
                 completed_at=self._clock.now(),
             )

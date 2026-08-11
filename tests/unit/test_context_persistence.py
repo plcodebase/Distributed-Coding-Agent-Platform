@@ -409,7 +409,11 @@ async def test_memory_repository_settings_listing_source_completion_and_failure(
                 scalar_sets=[cast("list[object]", messages)],
             )
         )
-    ).source_for_job(job, max_bytes=100)
+    ).source_for_job(
+        job,
+        max_bytes=100,
+        occurred_at=NOW + timedelta(seconds=2),
+    )
     assert source == "[user] old\n[assistant] new"
 
     many_messages = [
@@ -423,10 +427,21 @@ async def test_memory_repository_settings_listing_source_completion_and_failure(
     bounded_source = await PostgresMemoryRepository(_sessions(bounded_db)).source_for_job(
         job,
         max_bytes=120,
+        occurred_at=NOW + timedelta(seconds=2),
     )
     assert len(bounded_source.encode("utf-8")) <= 120
     assert bounded_db.streams[0].consumed == 2
     assert bounded_db.streams[0].closed is True
+
+    with pytest.raises(DomainOperationError) as expired:
+        await PostgresMemoryRepository(
+            _sessions(_Database(scalar_values=[_memory_job_row()]))
+        ).source_for_job(
+            job,
+            max_bytes=120,
+            occurred_at=NOW + timedelta(minutes=5),
+        )
+    assert expired.value.code == "memory_extraction_lease_lost"
 
     memory = PersistedMemory(
         id=uuid.uuid4(),

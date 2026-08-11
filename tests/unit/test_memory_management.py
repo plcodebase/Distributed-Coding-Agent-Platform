@@ -113,6 +113,21 @@ def test_context_task_and_memory_contracts_are_closed_and_consistent() -> None:
                 ],
             }
         )
+    with pytest.raises(ValidationError, match="completed dependencies"):
+        TaskPlanUpdate.model_validate(
+            {
+                "expected_version": 0,
+                "tasks": [
+                    {"id": "first", "title": "First"},
+                    {
+                        "id": "second",
+                        "title": "Second",
+                        "status": "completed",
+                        "depends_on": ["first"],
+                    },
+                ],
+            }
+        )
 
     memory = PersistedMemory(
         id=MEMORY_ID,
@@ -236,9 +251,11 @@ class MemoryStoreFake:
         job: MemoryExtractionJob,
         *,
         max_bytes: int,
+        occurred_at: datetime,
     ) -> str:
         assert job == self.job
         assert max_bytes >= len(self.source)
+        assert occurred_at >= NOW
         return self.source
 
     async def complete(
@@ -310,6 +327,27 @@ async def test_memory_processor_persists_provenance_and_handles_failures_opaquel
     assert await failed.process_once() is True
     assert failed_store.failed_error is not None
     assert failed_store.failed_error.code == "memory_extraction_failed"
+    assert failed_store.failed_error.retryable is False
+
+    class StructuredFailureExtractor:
+        async def extract(self, request: MemoryExtractionInput) -> MemoryExtractionResult:
+            del request
+            raise DomainOperationError(
+                code="memory_extraction_invalid",
+                message="the bounded response was invalid",
+                retryable=False,
+            )
+
+    structured_store = MemoryStoreFake(_running_job())
+    structured = MemoryExtractionProcessor(
+        store=structured_store,
+        extractor=StructuredFailureExtractor(),
+        clock=SteppingClock(NOW + timedelta(seconds=2)),
+    )
+    assert await structured.process_once() is True
+    assert structured_store.failed_error is not None
+    assert structured_store.failed_error.code == "memory_extraction_invalid"
+    assert structured_store.failed_error.retryable is False
 
 
 @pytest.mark.asyncio
@@ -356,7 +394,36 @@ async def test_memory_processor_times_out_before_its_lease_expires() -> None:
     assert store.completed is None
     assert store.failed_error is not None
     assert store.failed_error.code == "memory_extraction_timeout"
-    assert store.failed_error.retryable is True
+    assert store.failed_error.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_memory_processor_does_not_mutate_a_job_after_lease_loss() -> None:
+    class LeaseLostStore(MemoryStoreFake):
+        async def source_for_job(
+            self,
+            job: MemoryExtractionJob,
+            *,
+            max_bytes: int,
+            occurred_at: datetime,
+        ) -> str:
+            del job, max_bytes, occurred_at
+            raise DomainOperationError(
+                code="memory_extraction_lease_lost",
+                message="the memory extraction lease is no longer active",
+                retryable=True,
+            )
+
+    store = LeaseLostStore(_running_job())
+    processor = MemoryExtractionProcessor(
+        store=store,
+        extractor=MemoryExtractorFake(),
+        clock=SteppingClock(NOW + timedelta(seconds=2)),
+    )
+
+    assert await processor.process_once() is True
+    assert store.completed is None
+    assert store.failed_error is None
 
 
 def test_memory_processor_rejects_a_timeout_that_can_outlive_the_lease() -> None:

@@ -227,6 +227,17 @@ class TaskPlanUpdate(DomainModel):
 
         for identifier in identifiers:
             visit(identifier)
+        by_id = {task.id: task for task in self.tasks}
+        for task in self.tasks:
+            if task.status not in {TaskStatus.IN_PROGRESS, TaskStatus.COMPLETED}:
+                continue
+            incomplete = tuple(
+                dependency
+                for dependency in task.depends_on
+                if by_id[dependency].status is not TaskStatus.COMPLETED
+            )
+            if incomplete:
+                raise ValueError("in-progress and completed tasks require completed dependencies")
         return self
 
 

@@ -23,7 +23,7 @@ from agent_core.control import (
     TaskStatus,
     TrackedTask,
 )
-from agent_core.domain.base import FrozenJsonObject
+from agent_core.domain.base import FrozenJsonObject, normalize_timestamp
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from platform_persistence.models import (
     ContextCompactionRecord,
@@ -551,9 +551,11 @@ class PostgresMemoryRepository:
         job: MemoryExtractionJob,
         *,
         max_bytes: int,
+        occurred_at: datetime,
     ) -> str:
         if type(max_bytes) is not int or not 1 <= max_bytes <= 4 * 1024 * 1024:
             raise ValueError("memory extraction source limit is invalid")
+        timestamp = normalize_timestamp(occurred_at)
         async with self._sessions() as database:
             row = await database.scalar(
                 select(MemoryExtractionJobRecord).where(
@@ -563,12 +565,13 @@ class PostgresMemoryRepository:
             )
             if row is None or row.status != MemoryExtractionStatus.RUNNING.value:
                 raise _memory_lease_lost()
-            _assert_memory_job_lease(row, job)
+            _assert_memory_job_lease(row, job, occurred_at=timestamp)
             result = await database.stream_scalars(
                 select(MessageRecord)
                 .where(
                     MessageRecord.tenant_id == job.tenant_id,
                     MessageRecord.session_id == job.session_id,
+                    MessageRecord.run_id == job.run_id,
                     MessageRecord.sequence <= job.source_message_sequence,
                 )
                 .order_by(MessageRecord.sequence.desc())

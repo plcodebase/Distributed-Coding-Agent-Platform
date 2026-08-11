@@ -22,6 +22,9 @@ memory is untrusted and must not become unattributed tenant-global data.
 - Stream and bound the source at a durable message watermark, then validate the gateway's
   closed JSON envelope from the shared `summarization` route before persistence. The
   extraction deadline is strictly shorter than its fenced lease.
+- Fence source reads by the active lease identity, generation, expiry instant, and the
+  caller's current timestamp. Select only messages attributed to the extraction job's
+  source run; session-wide history must not be relabelled as run provenance.
 - Require every memory to include source tenant, source session, source run, extraction
   time, kind, a canonical content hash, and closed optional metadata.
 - Deduplicate by tenant, session, kind, and content hash in the same transaction that
@@ -30,6 +33,8 @@ memory is untrusted and must not become unattributed tenant-global data.
   suppresses both extraction and context use.
 - Preserve old arbitrary task-plan rows by converting their legacy `steps` shape into a
   read-only typed view. New writes always use the closed task contract.
+- Reject in-progress or completed task items until every declared dependency is itself
+  completed, in addition to rejecting cycles and unknown dependency IDs.
 
 ## Consequences
 
