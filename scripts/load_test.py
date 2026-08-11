@@ -11,6 +11,7 @@ import resource
 import sys
 import tempfile
 import time
+import uuid
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import suppress
@@ -18,6 +19,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
@@ -28,6 +30,7 @@ from pydantic import (
     SecretStr,
     StringConstraints,
     TypeAdapter,
+    field_validator,
     model_validator,
 )
 from websockets.asyncio.client import connect
@@ -44,6 +47,7 @@ MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_OPERATIONS = 100_000
 MAX_CONCURRENCY = 1_000
 MAX_API_RESPONSE_BYTES = 1024 * 1024
+MAX_EVENT_STREAM_BYTES = 16 * 1024 * 1024
 HTTP_CLIENT_ERROR = 400
 HTTP_RATE_LIMITED = 429
 HTTP_SERVER_ERROR = 500
@@ -52,6 +56,11 @@ type BoundedName = Annotated[
     StringConstraints(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_-]*$"),
 ]
 type PositiveCount = Annotated[int, Field(ge=1, le=MAX_OPERATIONS)]
+type CampaignId = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"),
+]
+_CAMPAIGN_ADAPTER: TypeAdapter[str] = TypeAdapter(CampaignId)
 
 
 class _Model(BaseModel):
@@ -180,6 +189,7 @@ class BenchmarkEnvironment(_Model):
 
 
 class ResourceUtilization(_Model):
+    scope: Literal["load_generator_process"] = "load_generator_process"
     wall_seconds: float = Field(gt=0)
     process_cpu_seconds: float = Field(ge=0)
     process_cpu_percent: float = Field(ge=0)
@@ -198,6 +208,7 @@ class LoadReport(_Model):
     report_version: Literal["agent-load-v1"] = "agent-load-v1"
     synthetic: bool
     result_claim: Literal["measurement", "simulation_only"]
+    campaign_id: CampaignId
     profile: LoadProfile
     started_at: datetime
     completed_at: datetime
@@ -221,6 +232,9 @@ class LoadDriver(Protocol):
     @property
     def mode(self) -> Literal["live", "simulation"]: ...
 
+    @property
+    def campaign_id(self) -> str: ...
+
     async def execute(self, profile: LoadProfile, operation: int) -> LoadSample: ...
 
 
@@ -228,6 +242,7 @@ class DeterministicLoadDriver:
     """Synthetic driver for repeatable CI validation; never a performance claim."""
 
     mode: Literal["simulation"] = "simulation"
+    campaign_id = "simulation"
 
     async def execute(self, profile: LoadProfile, operation: int) -> LoadSample:
         await asyncio.sleep(0)
@@ -271,19 +286,42 @@ class LiveLoadSettings(_Model):
     )
     verify_tls: bool = True
 
+    @field_validator("api_base_url")
+    @classmethod
+    def validate_api_base_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("api_base_url must be an absolute HTTP(S) origin")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("api_base_url must not contain credentials")
+        if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+            raise ValueError("api_base_url must not contain a path, query, or fragment")
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError("api_base_url contains an invalid port") from error
+        return value.rstrip("/")
+
 
 class LivePlatformDriver:
     """Opt-in client for a user-provisioned test deployment."""
 
     mode: Literal["live"] = "live"
 
-    def __init__(self, settings: LiveLoadSettings) -> None:
-        if not settings.api_base_url.startswith(("http://", "https://")):
-            raise ValueError("api_base_url must use http or https")
+    def __init__(
+        self,
+        settings: LiveLoadSettings,
+        *,
+        http_client: httpx.AsyncClient | None = None,
+        campaign_id: str | None = None,
+    ) -> None:
         self._settings = settings
-        self._client = httpx.AsyncClient(
-            base_url=settings.api_base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {settings.api_token.get_secret_value()}"},
+        self.campaign_id: str = _CAMPAIGN_ADAPTER.validate_python(
+            campaign_id if campaign_id is not None else uuid.uuid4().hex
+        )
+        self._owns_client = http_client is None
+        self._client = http_client or httpx.AsyncClient(
+            base_url=settings.api_base_url,
             verify=settings.verify_tls,
             follow_redirects=False,
         )
@@ -296,7 +334,8 @@ class LivePlatformDriver:
         await self.aclose()
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
     async def execute(self, profile: LoadProfile, operation: int) -> LoadSample:
         if profile.scenario in {
@@ -308,9 +347,13 @@ class LivePlatformDriver:
 
     async def _submit(self, profile: LoadProfile, operation: int) -> LoadSample:
         started = time.monotonic()
-        response = await self._client.post(
+        async with self._client.stream(
+            "POST",
             f"/v1/sessions/{self._settings.session_id}/runs",
-            headers={"Idempotency-Key": f"load-{profile.name}-{operation}"},
+            headers={
+                "Authorization": f"Bearer {self._settings.api_token.get_secret_value()}",
+                "Idempotency-Key": self._idempotency_key(profile, operation),
+            },
             json={
                 "priority": -10 if profile.scenario is LoadScenario.WORKER_SATURATION else 0,
                 "priority_class": (
@@ -319,28 +362,30 @@ class LivePlatformDriver:
                     else "interactive"
                 ),
             },
-        )
-        accepted = response.status_code < HTTP_CLIENT_ERROR
-        if not accepted:
-            return LoadSample(
-                operation=operation,
-                success=False,
-                status_code=response.status_code,
-                total_latency_seconds=time.monotonic() - started,
-                retries=1 if response.status_code == HTTP_RATE_LIMITED else 0,
-                error_category=_http_error_category(response.status_code),
-            )
-        if len(response.content) > MAX_API_RESPONSE_BYTES:
-            raise ValueError("run-creation response exceeded the benchmark protocol limit")
-        created = RunCreationResponse.model_validate_json(response.content)
+        ) as response:
+            status_code = response.status_code
+            if status_code >= HTTP_CLIENT_ERROR:
+                return LoadSample(
+                    operation=operation,
+                    success=False,
+                    status_code=status_code,
+                    total_latency_seconds=time.monotonic() - started,
+                    retries=1 if status_code == HTTP_RATE_LIMITED else 0,
+                    error_category=_http_error_category(status_code),
+                )
+            payload = await _bounded_response_body(response)
+        created = RunCreationResponse.model_validate_json(payload)
         return await self._observe_submitted_run(
             profile,
             operation=operation,
             run_id=str(created.run.id),
             run_created_at=created.run.created_at,
-            status_code=response.status_code,
+            status_code=status_code,
             started=started,
         )
+
+    def _idempotency_key(self, profile: LoadProfile, operation: int) -> str:
+        return f"load-{self.campaign_id}-{profile.name}-{operation}"
 
     async def _observe_submitted_run(
         self,
@@ -353,6 +398,7 @@ class LivePlatformDriver:
         started: float,
     ) -> LoadSample:
         events: list[StoredEvent] = []
+        received_bytes = 0
         url = f"{_websocket_url(self._settings.api_base_url, run_id)}?after=0"
         async with connect(
             url,
@@ -365,9 +411,10 @@ class LivePlatformDriver:
             max_queue=16,
         ) as websocket:
             while len(events) < profile.max_events_per_connection:
-                event = _stored_event(await websocket.recv(), expected_run_id=run_id)
-                if events and event.sequence != events[-1].sequence + 1:
-                    raise ValueError("durable event stream contained a sequence gap")
+                message = await websocket.recv()
+                received_bytes = _bounded_stream_total(received_bytes, message)
+                event = _stored_event(message, expected_run_id=run_id)
+                _validate_event_sequence(events[-1].sequence if events else 0, event)
                 events.append(event)
                 if event.event_type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
                     break
@@ -385,7 +432,10 @@ class LivePlatformDriver:
             raise ValueError("stream_run_id is required for WebSocket load profiles")
         started = time.monotonic()
         events = 0
+        received_bytes = 0
+        previous_sequence = 0
         task_success = False
+        terminal_failure: StoredEvent | None = None
         url = _websocket_url(self._settings.api_base_url, run_id)
         async with connect(
             url,
@@ -398,17 +448,27 @@ class LivePlatformDriver:
             max_queue=16,
         ) as websocket:
             while events < profile.max_events_per_connection:
-                event = _stored_event(await websocket.recv(), expected_run_id=run_id)
+                message = await websocket.recv()
+                received_bytes = _bounded_stream_total(received_bytes, message)
+                event = _stored_event(message, expected_run_id=run_id)
+                _validate_event_sequence(previous_sequence, event)
+                previous_sequence = event.sequence
                 events += 1
                 if event.event_type in {EventType.RUN_COMPLETED, EventType.RUN_FAILED}:
                     task_success = event.event_type is EventType.RUN_COMPLETED
+                    if not task_success:
+                        terminal_failure = event
                     break
+        success = terminal_failure is None
         return LoadSample(
             operation=operation,
-            success=True,
+            success=success,
             task_success=task_success,
             total_latency_seconds=time.monotonic() - started,
             events_received=events,
+            error_category=(
+                _terminal_error_category(terminal_failure) if terminal_failure is not None else None
+            ),
         )
 
 
@@ -416,6 +476,7 @@ class LoadRunner:
     """Run a fixed number of operations with a fixed worker-task ceiling."""
 
     async def run(self, profile: LoadProfile, driver: LoadDriver) -> LoadReport:
+        campaign_id = _CAMPAIGN_ADAPTER.validate_python(driver.campaign_id)
         started_at = datetime.now(UTC)
         started_monotonic = time.monotonic()
         started_cpu = time.process_time()
@@ -447,6 +508,7 @@ class LoadRunner:
         return LoadReport(
             synthetic=driver.mode == "simulation",
             result_claim="simulation_only" if driver.mode == "simulation" else "measurement",
+            campaign_id=campaign_id,
             profile=profile,
             started_at=started_at,
             completed_at=completed_at,
@@ -645,6 +707,28 @@ def _websocket_url(base_url: str, run_id: str) -> str:
     else:
         raise ValueError("api_base_url must use http or https")
     return f"{base}/v1/runs/{run_id}/stream"
+
+
+async def _bounded_response_body(response: httpx.Response) -> bytes:
+    payload = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(payload) + len(chunk) > MAX_API_RESPONSE_BYTES:
+            raise ValueError("run-creation response exceeded the benchmark protocol limit")
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def _bounded_stream_total(received_bytes: int, message: str | bytes) -> int:
+    message_bytes = len(message) if isinstance(message, bytes) else len(message.encode("utf-8"))
+    total = received_bytes + message_bytes
+    if total > MAX_EVENT_STREAM_BYTES:
+        raise ValueError("durable event stream exceeded the benchmark protocol limit")
+    return total
+
+
+def _validate_event_sequence(previous_sequence: int, event: StoredEvent) -> None:
+    if event.sequence != previous_sequence + 1:
+        raise ValueError("durable event stream contained a sequence gap")
 
 
 def _stored_event(message: str | bytes, *, expected_run_id: str) -> StoredEvent:

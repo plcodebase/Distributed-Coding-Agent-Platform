@@ -27,9 +27,15 @@ results cannot support the design's throughput or latency claims.
 - Keep deterministic CI simulation and live measurement adapters separate. Reports
   carry both `synthetic` and `result_claim`; simulation output is never performance
   evidence.
+- Give every live driver instance a validated campaign identity and include it in every
+  API idempotency key and report. Operation numbers are unique only inside that
+  campaign and therefore cannot replay an earlier benchmark accidentally.
 - Read live credentials only from runtime environment variables and serialize no
   credential or exception text. Write validated JSON reports atomically with a 16 MiB
   ceiling.
+- Accept only an HTTP(S) origin without credentials, path, query, or fragment. Consume
+  successful HTTP bodies incrementally under a 1 MiB limit and cap cumulative
+  WebSocket event bytes at 16 MiB in addition to the event-count ceiling.
 - Treat database contention, provider failure, and saturation as test-deployment
   preconditions controlled outside the client. The runner observes the result but does
   not silently mutate shared infrastructure.
@@ -37,6 +43,12 @@ results cannot support the design's throughput or latency claims.
   stream. API acceptance is not task success; terminal failure, event gaps, and event
   ceilings are load errors. Queue wait, first model output, retries, tools, permission
   denials, and total run latency come from validated durable event timestamps.
+- Require streams requested from `after=0` to begin at sequence 1 and remain contiguous.
+  Keep connection success distinct from terminal task success, but never count a
+  terminal failed run as a successful stream operation.
+- Label CPU and resident-memory observations explicitly as
+  `load_generator_process`; deployment-wide utilization remains an external metrics
+  correlation task rather than a claim made by the client process.
 
 ## Consequences
 

@@ -5,8 +5,9 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
+import httpx
 import pytest
 from pydantic import ValidationError
 from scripts.load_test import (
@@ -17,13 +18,19 @@ from scripts.load_test import (
     LoadRunner,
     LoadSample,
     LoadScenario,
+    _bounded_response_body,
+    _bounded_stream_total,
     _sample_from_run_events,
+    _validate_event_sequence,
     load_profiles,
     write_report,
 )
 
 from agent_core.event_store import StoredEvent
 from agent_core.events import EventType
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 ROOT = Path(__file__).parents[2]
 
@@ -104,6 +111,7 @@ async def test_deterministic_report_is_explicitly_synthetic_and_complete(
     assert result.environment.system
     assert result.environment.machine
     assert result.resources.wall_seconds > 0
+    assert result.resources.scope == "load_generator_process"
     assert result.resources.process_cpu_seconds >= 0
     assert result.source.revision == "a" * 40
     assert result.source.dirty is True
@@ -112,6 +120,7 @@ async def test_deterministic_report_is_explicitly_synthetic_and_complete(
 
 class ConcurrencyDriver:
     mode: Literal["simulation"] = "simulation"
+    campaign_id = "concurrency-test"
 
     def __init__(self) -> None:
         self.active = 0
@@ -146,6 +155,7 @@ async def test_runner_uses_fixed_worker_ceiling_instead_of_task_per_operation() 
 
 class FailureDriver:
     mode: Literal["live"] = "live"
+    campaign_id = "failure-test"
 
     async def execute(self, profile: LoadProfile, operation: int) -> LoadSample:
         del profile
@@ -171,6 +181,7 @@ async def test_timeout_and_driver_errors_are_bounded_and_opaque() -> None:
 async def test_mismatched_driver_operation_fails_the_harness() -> None:
     class MismatchedDriver:
         mode: Literal["simulation"] = "simulation"
+        campaign_id = "mismatch-test"
 
         async def execute(self, profile: LoadProfile, operation: int) -> LoadSample:
             del profile
@@ -198,6 +209,7 @@ async def test_report_write_is_atomic_json_and_live_secrets_are_repr_safe(
 
     parsed = json.loads(output.read_text(encoding="utf-8"))
     assert parsed["report_version"] == "agent-load-v1"
+    assert parsed["campaign_id"] == "simulation"
     assert parsed["profile"]["operations"] == 2
     assert await asyncio.to_thread(lambda: list(tmp_path.glob(".report.json.*"))) == []
     with pytest.raises(ValueError, match="JSON file"):
@@ -215,19 +227,146 @@ async def test_report_write_is_atomic_json_and_live_secrets_are_repr_safe(
 
 
 def test_live_settings_and_samples_reject_unsafe_values() -> None:
-    settings = LiveLoadSettings(
-        api_base_url="ftp://invalid.example",
-        api_token="secret",  # noqa: S106 - invalid URL test fixture
-        session_id="00000000-0000-0000-0000-000000000001",
-    )
-    with pytest.raises(ValueError, match="http or https"):
-        LivePlatformDriver(settings)
+    for invalid_url in (
+        "ftp://invalid.example",
+        "https://user:password@example.test",
+        "https://example.test/base",
+        "https://example.test?token=secret",
+        "https://example.test#fragment",
+        "https://example.test:99999",
+    ):
+        with pytest.raises(ValidationError):
+            LiveLoadSettings(
+                api_base_url=invalid_url,
+                api_token="secret",  # noqa: S106 - invalid URL test fixture
+                session_id="00000000-0000-0000-0000-000000000001",
+            )
     with pytest.raises(ValidationError):
         LoadSample(
             operation=1,
             success=True,
             total_latency_seconds=float("nan"),
         )
+
+
+@pytest.mark.asyncio
+async def test_campaign_keys_are_unique_and_injected_clients_are_not_owned() -> None:
+    settings = LiveLoadSettings(
+        api_base_url="https://example.test/",
+        api_token="secret",  # noqa: S106 - test fixture
+        session_id="00000000-0000-0000-0000-000000000001",
+    )
+    client = httpx.AsyncClient(base_url="https://example.test")
+    first = LivePlatformDriver(settings, http_client=client)
+    second = LivePlatformDriver(settings, http_client=client)
+
+    assert first.campaign_id != second.campaign_id
+    assert first._idempotency_key(profile(operations=1), 0) != second._idempotency_key(
+        profile(operations=1), 0
+    )
+    await first.aclose()
+    assert not client.is_closed
+    await client.aclose()
+
+    class InvalidCampaignDriver(ConcurrencyDriver):
+        campaign_id = "INVALID CAMPAIGN"
+
+    with pytest.raises(ValidationError):
+        await LoadRunner().run(profile(operations=1), InvalidCampaignDriver())
+
+
+@pytest.mark.asyncio
+async def test_response_and_event_stream_byte_budgets_are_cumulative() -> None:
+    class ChunkStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.yielded = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for chunk in (b"a" * 600_000, b"b" * 600_000, b"unreachable"):
+                self.yielded += 1
+                yield chunk
+
+    stream = ChunkStream()
+    response = httpx.Response(200, stream=stream)
+    with pytest.raises(ValueError, match="run-creation response exceeded"):
+        await _bounded_response_body(response)
+    assert stream.yielded == 2
+    await response.aclose()
+
+    assert _bounded_stream_total(0, "🙂") == 4
+    with pytest.raises(ValueError, match="event stream exceeded"):
+        _bounded_stream_total(16 * 1024 * 1024, "🙂")
+
+
+def test_standalone_stream_sequence_must_start_at_one_and_remain_contiguous() -> None:
+    run_id = uuid.uuid4()
+    event = StoredEvent(
+        run_id=run_id,
+        sequence=2,
+        event_type=EventType.RUN_STARTED,
+        payload={"attempt": 1, "worker_id": "worker-1"},
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="sequence gap"):
+        _validate_event_sequence(0, event)
+    _validate_event_sequence(1, event)
+
+
+@pytest.mark.asyncio
+async def test_standalone_terminal_failure_is_not_reported_as_stream_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = uuid.uuid4()
+    failed = StoredEvent(
+        run_id=run_id,
+        sequence=1,
+        event_type=EventType.RUN_FAILED,
+        payload={
+            "error": {
+                "code": "sandbox_command_failed",
+                "message": "the command failed",
+                "retryable": False,
+                "details": {},
+            }
+        },
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    class WebSocket:
+        async def recv(self) -> str:
+            return failed.model_dump_json()
+
+    class Connection:
+        async def __aenter__(self) -> WebSocket:
+            return WebSocket()
+
+        async def __aexit__(self, *errors: object) -> None:
+            del errors
+
+    monkeypatch.setattr("scripts.load_test.connect", lambda *args, **kwargs: Connection())
+    driver = LivePlatformDriver(
+        LiveLoadSettings(
+            api_base_url="https://example.test",
+            api_token="secret",  # noqa: S106 - test fixture
+            session_id="00000000-0000-0000-0000-000000000001",
+            stream_run_id=str(run_id),
+        )
+    )
+    try:
+        sample = await driver.execute(
+            profile(
+                scenario=LoadScenario.EVENT_THROUGHPUT,
+                operations=1,
+                max_events_per_connection=1,
+            ),
+            0,
+        )
+    finally:
+        await driver.aclose()
+
+    assert sample.success is False
+    assert sample.task_success is False
+    assert sample.error_category == "sandbox_failure"
 
 
 def test_durable_run_events_produce_task_latency_and_no_fabricated_usage() -> None:
