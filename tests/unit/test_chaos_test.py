@@ -14,10 +14,12 @@ from scripts.chaos_test import (
     ChaosScenario,
     ChaosScenarioSpec,
     DeterministicChaosDriver,
+    EvidenceSource,
     FinalRunState,
     InvariantFailure,
     PodmanServiceInjector,
     SignalEvidence,
+    _run_cli,
     load_scenarios,
     write_report,
 )
@@ -64,7 +66,11 @@ def passing_observation(spec: ChaosScenarioSpec) -> ChaosObservation:
         ),
         recovery_seconds=0.01,
         evidence=tuple(
-            SignalEvidence(signal=signal, observed_value=1)
+            SignalEvidence(
+                signal=signal,
+                source=EvidenceSource.PROMETHEUS,
+                observed_value=1,
+            )
             for signal in spec.expected.required_signals
         ),
     )
@@ -79,6 +85,7 @@ def test_versioned_manifest_covers_every_required_failure_scenario() -> None:
     assert all(item.expected.accepted_task_visible for item in scenarios)
     assert all(item.expected.durable_event_continuity for item in scenarios)
     assert all(item.expected.required_signals for item in scenarios)
+    assert all(item.fault_timeout_seconds == 30 for item in scenarios)
 
 
 @pytest.mark.asyncio
@@ -148,7 +155,6 @@ async def test_runner_evaluates_every_invariant_instead_of_fault_command_success
     assert set(result.failures) == {
         InvariantFailure.FAULT_NOT_OBSERVED,
         InvariantFailure.RECOVERY_NOT_OBSERVED,
-        InvariantFailure.RECOVERY_TIMEOUT,
         InvariantFailure.ACCEPTED_TASK_MISSING,
         InvariantFailure.DUPLICATE_COMMITTED_CHANGE,
         InvariantFailure.DURABLE_EVENT_GAP,
@@ -182,19 +188,63 @@ class TimeoutDriver:
         self.cleaned = True
 
 
+class RecoveryTimeoutDriver(TimeoutDriver):
+    async def inject(self, spec: ChaosScenarioSpec) -> None:
+        del spec
+
+    async def recover(self, spec: ChaosScenarioSpec) -> None:
+        del spec
+        await asyncio.Event().wait()
+
+
 @pytest.mark.asyncio
 async def test_timeout_is_opaque_and_cleanup_still_runs() -> None:
     driver = TimeoutDriver()
     report = await ChaosRunner().run(
-        (scenario(recovery_timeout_seconds=0.01),),
+        (scenario(fault_timeout_seconds=0.01),),
         driver,
     )
 
     result = report.results[0]
     assert result.observation is None
-    assert result.error_category == "recovery_timeout"
-    assert result.failures == (InvariantFailure.HARNESS_ERROR,)
+    assert result.error_category == "fault_timeout"
+    assert result.failures == (
+        InvariantFailure.FAULT_INJECTION_TIMEOUT,
+        InvariantFailure.HARNESS_ERROR,
+    )
     assert driver.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_has_an_independent_timeout_and_cleanup() -> None:
+    driver = RecoveryTimeoutDriver()
+    report = await ChaosRunner().run(
+        (scenario(fault_timeout_seconds=1, recovery_timeout_seconds=0.01),),
+        driver,
+    )
+
+    result = report.results[0]
+    assert result.error_category == "recovery_timeout"
+    assert result.failures == (
+        InvariantFailure.RECOVERY_TIMEOUT,
+        InvariantFailure.HARNESS_ERROR,
+    )
+    assert driver.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_runner_measures_recovery_instead_of_trusting_driver_value() -> None:
+    spec = scenario(recovery_timeout_seconds=0.1)
+    observation = ChaosObservation.model_validate(
+        {**passing_observation(spec).model_dump(), "recovery_seconds": 60}
+    )
+
+    report = await ChaosRunner().run((spec,), ObservationDriver(observation))
+
+    result = report.results[0]
+    assert result.passed is True
+    assert result.observation is not None
+    assert result.observation.recovery_seconds < 0.1
 
 
 @pytest.mark.asyncio
@@ -244,6 +294,14 @@ def test_scenario_and_report_contracts_fail_closed(tmp_path: Path) -> None:
         scenario(fault={"action": "terminate", "target": "gateway_route"})
     with pytest.raises(ValidationError):
         scenario(unknown=True)
+    with pytest.raises(ValidationError, match="fault target"):
+        scenario(fault={"action": "return_429", "target": "redis"})
+    with pytest.raises(ValidationError):
+        SignalEvidence(
+            signal="gateway_retry",
+            source="prometheus",
+            observed_value=0,
+        )
 
     duplicate = tmp_path / "duplicate.yaml"
     source = (ROOT / "benchmarks" / "chaos" / "scenarios.yaml").read_text(encoding="utf-8")
@@ -285,6 +343,70 @@ async def test_report_write_is_atomic_and_json(tmp_path: Path) -> None:
     assert await asyncio.to_thread(lambda: list(tmp_path.glob(".chaos.json.*"))) == []
     with pytest.raises(ValueError, match="JSON file"):
         write_report(report, tmp_path / "chaos.txt")
+
+
+@pytest.mark.asyncio
+async def test_live_cli_requires_factory_closes_driver_and_writes_measurement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = next(
+        item
+        for item in load_scenarios(ROOT / "benchmarks" / "chaos" / "scenarios.yaml")
+        if item.name == "gateway-rate-limit"
+    )
+
+    class CloseableDriver(ObservationDriver):
+        def __init__(self) -> None:
+            super().__init__(passing_observation(selected))
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    driver = CloseableDriver()
+    monkeypatch.setattr(
+        "scripts.chaos_test.load_chaos_driver_factory",
+        lambda specification: lambda: driver,
+    )
+    output = tmp_path / "live-chaos.json"
+    arguments = (
+        "--scenarios",
+        str(ROOT / "benchmarks" / "chaos" / "scenarios.yaml"),
+        "--scenario",
+        selected.name,
+        "--mode",
+        "live",
+        "--driver-factory",
+        "test_factory:create",
+        "--report",
+        str(output),
+    )
+
+    await _run_cli(arguments)
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["synthetic"] is False
+    assert report["result_claim"] == "measurement"
+    assert report["results"][0]["passed"] is True
+    assert driver.closed is True
+    report["results"][0]["observation"]["evidence"][0]["source"] = "simulation"
+    with pytest.raises(ValidationError, match="Prometheus evidence"):
+        ChaosReport.model_validate(report)
+
+    with pytest.raises(ValueError, match="requires --driver-factory"):
+        await _run_cli(
+            (
+                "--scenarios",
+                str(ROOT / "benchmarks" / "chaos" / "scenarios.yaml"),
+                "--scenario",
+                selected.name,
+                "--mode",
+                "live",
+                "--report",
+                str(output),
+            )
+        )
 
 
 class FakeProcessRunner:
@@ -329,7 +451,6 @@ async def test_podman_injector_uses_only_exact_allowlisted_bounded_argv(tmp_path
             process_result(),
             process_result("false\n"),
             process_result(),
-            process_result("true\n"),
         ]
     )
     podman = executable(tmp_path)
@@ -350,6 +471,9 @@ async def test_podman_injector_uses_only_exact_allowlisted_bounded_argv(tmp_path
 
     await injector.inject(spec)
     await injector.recover(spec)
+    assert [call[0][1:] for call in fake.calls] == [
+        ("kill", "--signal", "TERM", "agent-worker-1"),
+    ]
     await injector.cleanup(spec)
     await injector.aclose()
 
@@ -357,11 +481,51 @@ async def test_podman_injector_uses_only_exact_allowlisted_bounded_argv(tmp_path
         ("kill", "--signal", "TERM", "agent-worker-1"),
         ("inspect", "--format", "{{.State.Running}}", "agent-worker-1"),
         ("start", "agent-worker-1"),
-        ("inspect", "--format", "{{.State.Running}}", "agent-worker-1"),
     ]
     assert all(call[0][0] == str(podman) for call in fake.calls)
     assert all("CONTAINER_HOST" not in call[1] for call in fake.calls)
     assert fake.closed is False
+
+
+@pytest.mark.asyncio
+async def test_postgres_is_restored_before_recovery_observation(tmp_path: Path) -> None:
+    fake = FakeProcessRunner(
+        [
+            process_result(),
+            process_result("false\n"),
+            process_result(),
+            process_result("true\n"),
+        ]
+    )
+    injector = PodmanServiceInjector(
+        podman_executable=executable(tmp_path),
+        containers={ChaosScenario.POSTGRES_INTERRUPTION: "postgres-1"},
+        cwd=tmp_path,
+        process_runner=fake,
+    )
+    spec = scenario(
+        scenario="postgres_interruption",
+        fault={"action": "block", "target": "postgres"},
+        expected={
+            "allowed_final_states": ["completed"],
+            "required_signals": ["api_error", "queue_recovery"],
+        },
+    )
+
+    await injector.inject(spec)
+    await injector.recover(spec)
+    assert [call[0][1:] for call in fake.calls] == [
+        ("stop", "--time", "1", "postgres-1"),
+        ("inspect", "--format", "{{.State.Running}}", "postgres-1"),
+        ("start", "postgres-1"),
+    ]
+    await injector.cleanup(spec)
+    assert fake.calls[-1][0][1:] == (
+        "inspect",
+        "--format",
+        "{{.State.Running}}",
+        "postgres-1",
+    )
 
 
 @pytest.mark.asyncio

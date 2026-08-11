@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
+import inspect
 import math
 import os
 import platform
+import re
 import stat
 import sys
 import tempfile
+import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self, cast
 
 import yaml
 from pydantic import (
@@ -29,7 +33,9 @@ from pydantic import (
 from sandbox_runtime import BoundedProcessRunner, ProcessResult
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
+
+    type ChaosDriverFactory = Callable[[], ChaosDriver | Awaitable[ChaosDriver]]
 
 MAX_SCENARIO_BYTES = 1024 * 1024
 MAX_REPORT_BYTES = 16 * 1024 * 1024
@@ -39,6 +45,7 @@ MAX_CLEANUP_SECONDS = 120.0
 MAX_PODMAN_OUTPUT_BYTES = 1024 * 1024
 MAX_PODMAN_TIMEOUT_SECONDS = 300.0
 MAX_CONTAINER_NAME_LENGTH = 63
+_FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 type BoundedName = Annotated[
     str,
     StringConstraints(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_-]*$"),
@@ -94,6 +101,11 @@ class EvidenceSignal(StrEnum):
     CHECKPOINT_RECOVERY = "checkpoint_recovery"
 
 
+class EvidenceSource(StrEnum):
+    SIMULATION = "simulation"
+    PROMETHEUS = "prometheus"
+
+
 class InvariantFailure(StrEnum):
     FAULT_NOT_OBSERVED = "fault_not_observed"
     RECOVERY_NOT_OBSERVED = "recovery_not_observed"
@@ -106,6 +118,7 @@ class InvariantFailure(StrEnum):
     DASHBOARD_EVIDENCE_MISSING = "dashboard_evidence_missing"
     HARNESS_ERROR = "harness_error"
     CLEANUP_FAILED = "cleanup_failed"
+    FAULT_INJECTION_TIMEOUT = "fault_injection_timeout"
 
 
 _EXPECTED_ACTION = {
@@ -119,6 +132,19 @@ _EXPECTED_ACTION = {
     ChaosScenario.DUPLICATE_TASK_DELIVERY: FaultAction.DUPLICATE_TASK,
     ChaosScenario.DUPLICATE_TOOL_CALL: FaultAction.DUPLICATE_TOOL,
     ChaosScenario.CHECKPOINT_INTERRUPTION: FaultAction.INTERRUPT_CHECKPOINT,
+}
+
+_EXPECTED_TARGET = {
+    ChaosScenario.WORKER_TERMINATION: "active_worker",
+    ChaosScenario.REDIS_RESTART: "redis",
+    ChaosScenario.POSTGRES_INTERRUPTION: "postgres",
+    ChaosScenario.PRIMARY_PROVIDER_DISABLED: "primary_provider",
+    ChaosScenario.GATEWAY_RATE_LIMIT: "gateway_route",
+    ChaosScenario.WEBSOCKET_DISCONNECT: "event_client",
+    ChaosScenario.SANDBOX_OOM: "sandbox_process",
+    ChaosScenario.DUPLICATE_TASK_DELIVERY: "durable_task",
+    ChaosScenario.DUPLICATE_TOOL_CALL: "tool_delivery",
+    ChaosScenario.CHECKPOINT_INTERRUPTION: "checkpoint_worker",
 }
 
 
@@ -146,6 +172,7 @@ class ChaosScenarioSpec(_Model):
     name: BoundedName
     scenario: ChaosScenario
     fault: FaultDefinition
+    fault_timeout_seconds: float = Field(default=30, gt=0, le=MAX_PODMAN_TIMEOUT_SECONDS)
     recovery_timeout_seconds: float = Field(gt=0, le=MAX_RECOVERY_SECONDS)
     cleanup_timeout_seconds: float = Field(default=30, gt=0, le=MAX_CLEANUP_SECONDS)
     preconditions: tuple[Annotated[str, StringConstraints(min_length=1, max_length=500)], ...] = (
@@ -157,6 +184,8 @@ class ChaosScenarioSpec(_Model):
     def validate_fault_action(self) -> Self:
         if self.fault.action is not _EXPECTED_ACTION[self.scenario]:
             raise ValueError("fault action does not match the selected chaos scenario")
+        if self.fault.target != _EXPECTED_TARGET[self.scenario]:
+            raise ValueError("fault target does not match the selected chaos scenario")
         if len(set(self.expected.required_signals)) != len(self.expected.required_signals):
             raise ValueError("required evidence signals must be unique")
         if len(set(self.expected.retry_categories)) != len(self.expected.retry_categories):
@@ -186,7 +215,8 @@ class ChaosObservation(_Model):
 
 class SignalEvidence(_Model):
     signal: EvidenceSignal
-    observed_value: float = Field(ge=0)
+    source: EvidenceSource
+    observed_value: float = Field(gt=0)
 
 
 class ChaosScenarioResult(_Model):
@@ -249,6 +279,13 @@ class ChaosReport(_Model):
         names = tuple(result.scenario.name for result in self.results)
         if len(set(names)) != len(names):
             raise ValueError("chaos report scenarios must be uniquely named")
+        if not self.synthetic and any(
+            evidence.source is not EvidenceSource.PROMETHEUS
+            for result in self.results
+            if result.passed and result.observation is not None
+            for evidence in result.observation.evidence
+        ):
+            raise ValueError("passing live results require Prometheus evidence")
         return self
 
 
@@ -299,7 +336,11 @@ class DeterministicChaosDriver:
             retry_category=expected.retry_categories[0] if expected.retry_categories else None,
             recovery_seconds=min(0.01, scenario.recovery_timeout_seconds),
             evidence=tuple(
-                SignalEvidence(signal=signal, observed_value=1)
+                SignalEvidence(
+                    signal=signal,
+                    source=EvidenceSource.SIMULATION,
+                    observed_value=1,
+                )
                 for signal in expected.required_signals
             ),
         )
@@ -359,18 +400,14 @@ class ChaosRunner:
         error_category: BoundedName | None = None
         cancelled: asyncio.CancelledError | None = None
         cleanup_failed = False
+        phase_failure: InvariantFailure | None = None
         try:
             try:
-                async with asyncio.timeout(scenario.recovery_timeout_seconds):
-                    await driver.inject(scenario)
-                    await driver.recover(scenario)
-                    observation = await driver.observe(scenario)
-            except TimeoutError:
-                error_category = "recovery_timeout"
+                observation, error_category, phase_failure = await self._execute_scenario(
+                    scenario, driver
+                )
             except asyncio.CancelledError as error:
                 cancelled = error
-            except Exception:
-                error_category = "driver_error"
         finally:
             cleanup_task = asyncio.create_task(
                 self._cleanup(driver, scenario),
@@ -389,6 +426,8 @@ class ChaosRunner:
         if cancelled is not None:
             raise cancelled
         failures = list(_evaluate(scenario, observation))
+        if phase_failure is not None:
+            failures.append(phase_failure)
         if cleanup_failed:
             failures.append(InvariantFailure.CLEANUP_FAILED)
             error_category = error_category or "cleanup_failed"
@@ -405,6 +444,40 @@ class ChaosRunner:
             error_category=error_category,
             passed=not unique_failures,
         )
+
+    @staticmethod
+    async def _execute_scenario(
+        scenario: ChaosScenarioSpec,
+        driver: ChaosDriver,
+    ) -> tuple[
+        ChaosObservation | None,
+        BoundedName | None,
+        InvariantFailure | None,
+    ]:
+        try:
+            async with asyncio.timeout(scenario.fault_timeout_seconds):
+                await driver.inject(scenario)
+        except TimeoutError:
+            return None, "fault_timeout", InvariantFailure.FAULT_INJECTION_TIMEOUT
+        except Exception:
+            return None, "driver_error", None
+
+        recovery_started = time.monotonic()
+        try:
+            async with asyncio.timeout(scenario.recovery_timeout_seconds):
+                await driver.recover(scenario)
+                observation = await driver.observe(scenario)
+            measured = ChaosObservation.model_validate(
+                {
+                    **observation.model_dump(),
+                    "recovery_seconds": time.monotonic() - recovery_started,
+                }
+            )
+        except TimeoutError:
+            return None, "recovery_timeout", InvariantFailure.RECOVERY_TIMEOUT
+        except Exception:
+            return None, "driver_error", None
+        return measured, None, None
 
     @staticmethod
     async def _cleanup(driver: ChaosDriver, scenario: ChaosScenarioSpec) -> None:
@@ -531,7 +604,8 @@ class PodmanServiceInjector:
         target = self._target(scenario)
         if self._active_target != target:
             raise RuntimeError("Podman fault target is not active")
-        await self._ensure_running(target)
+        if scenario.scenario is ChaosScenario.POSTGRES_INTERRUPTION:
+            await self._ensure_running(target)
 
     async def cleanup(self, scenario: ChaosScenarioSpec) -> None:
         target = self._target(scenario)
@@ -704,11 +778,46 @@ def _source_state() -> ChaosSourceState:
     return ChaosSourceState(revision=revision, dirty=dirty)
 
 
+def load_chaos_driver_factory(specification: str) -> ChaosDriverFactory:
+    """Load a trusted live-driver composition root by ``module:attribute``."""
+
+    if not _FACTORY_PATTERN.fullmatch(specification):
+        raise ValueError("chaos driver factory must use a bounded module:attribute reference")
+    module_name, _, attribute = specification.partition(":")
+    factory = getattr(importlib.import_module(module_name), attribute, None)
+    if not callable(factory):
+        raise TypeError("chaos driver factory reference must be callable")
+    return cast("ChaosDriverFactory", factory)
+
+
+async def _create_live_driver(specification: str) -> ChaosDriver:
+    candidate = load_chaos_driver_factory(specification)()
+    if inspect.isawaitable(candidate):
+        candidate = await candidate
+    if getattr(candidate, "mode", None) != "live" or any(
+        not callable(getattr(candidate, name, None))
+        for name in ("inject", "recover", "observe", "cleanup")
+    ):
+        raise TypeError("chaos driver factory must return a live ChaosDriver")
+    return candidate
+
+
+async def _close_driver(driver: ChaosDriver) -> None:
+    close = getattr(driver, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        async with asyncio.timeout(MAX_CLEANUP_SECONDS):
+            await result
+
+
 async def _run_cli(arguments: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenarios", type=Path, required=True)
     parser.add_argument("--scenario")
-    parser.add_argument("--mode", choices=("simulation",), required=True)
+    parser.add_argument("--mode", choices=("simulation", "live"), required=True)
+    parser.add_argument("--driver-factory")
     parser.add_argument("--report", type=Path, required=True)
     options = parser.parse_args(arguments)
     scenarios = load_scenarios(options.scenarios)
@@ -716,7 +825,18 @@ async def _run_cli(arguments: Sequence[str] | None = None) -> None:
         scenarios = tuple(item for item in scenarios if item.name == options.scenario)
         if not scenarios:
             raise ValueError("requested chaos scenario was not found")
-    report = await ChaosRunner().run(scenarios, DeterministicChaosDriver())
+    if options.mode == "simulation":
+        if options.driver_factory is not None:
+            raise ValueError("simulation mode does not accept a live driver factory")
+        report = await ChaosRunner().run(scenarios, DeterministicChaosDriver())
+    else:
+        if options.driver_factory is None:
+            raise ValueError("live mode requires --driver-factory")
+        driver = await _create_live_driver(options.driver_factory)
+        try:
+            report = await ChaosRunner().run(scenarios, driver)
+        finally:
+            await _close_driver(driver)
     write_report(report, options.report)
 
 
@@ -742,6 +862,7 @@ __all__ = [
     "ChaosSourceState",
     "DeterministicChaosDriver",
     "EvidenceSignal",
+    "EvidenceSource",
     "ExpectedOutcome",
     "FaultAction",
     "FaultDefinition",
@@ -750,6 +871,7 @@ __all__ = [
     "PodmanServiceChaosDriver",
     "PodmanServiceInjector",
     "SignalEvidence",
+    "load_chaos_driver_factory",
     "load_scenarios",
     "main",
     "write_report",

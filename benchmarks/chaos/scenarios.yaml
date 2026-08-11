@@ -3,6 +3,7 @@
   fault:
     action: terminate
     target: active_worker
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
@@ -19,6 +20,7 @@
   fault:
     action: restart
     target: redis
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 60
   cleanup_timeout_seconds: 30
   preconditions:
@@ -33,6 +35,7 @@
   fault:
     action: block
     target: postgres
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
@@ -47,6 +50,7 @@
   fault:
     action: disable
     target: primary_provider
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
@@ -63,6 +67,7 @@
   fault:
     action: return_429
     target: gateway_route
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
@@ -78,6 +83,7 @@
   fault:
     action: disconnect
     target: event_client
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 60
   cleanup_timeout_seconds: 15
   preconditions:
@@ -92,6 +98,7 @@
   fault:
     action: force_oom
     target: sandbox_process
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
@@ -108,6 +115,7 @@
   fault:
     action: duplicate_task
     target: durable_task
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 60
   cleanup_timeout_seconds: 15
   preconditions:
@@ -122,6 +130,7 @@
   fault:
     action: duplicate_tool
     target: tool_delivery
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 60
   cleanup_timeout_seconds: 15
   preconditions:
@@ -136,6 +145,7 @@
   fault:
     action: interrupt_checkpoint
     target: checkpoint_worker
+  fault_timeout_seconds: 30
   recovery_timeout_seconds: 120
   cleanup_timeout_seconds: 30
   preconditions:
