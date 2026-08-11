@@ -6,8 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 
+from agent_core.capacity import QueueDepth, QueueSnapshot
 from agent_core.context import (
     ContextBudgetRegistry,
     ContextBuildRequest,
@@ -61,6 +63,7 @@ from agent_worker import (
     WorkerService,
 )
 from agent_worker.process import _wait_for_processes, load_worker_factory, run_worker_fleet
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -1110,6 +1113,48 @@ async def test_worker_claims_restores_completes_and_releases_workspace() -> None
 
 
 @pytest.mark.asyncio
+async def test_worker_records_correlated_run_queue_and_capacity_telemetry() -> None:
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="agent-worker"),
+        span_exporter=exporter,
+    )
+    traceparent = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    lease = run_lease().model_copy(
+        update={
+            "queued_at": NOW - timedelta(seconds=2),
+            "traceparent": traceparent,
+        }
+    )
+    worker = WorkerService(
+        config=WorkerConfig(worker_id="worker-1"),
+        queue=FakeQueue(lease),
+        workspace_leases=FakeWorkspaceLeases(),
+        recovery=FakeRecovery(),
+        restorer=FakeRestorer(),
+        executor=FakeExecutor(RunExecutionResult(status=RunStatus.COMPLETED)),
+        clock=MutableClock(),
+        telemetry=telemetry,
+    )
+
+    assert await worker.run_once() is True
+    await wait_for_idle(worker)
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert {"queue.wait", "worker.run"} <= spans.keys()
+    worker_attributes = spans["worker.run"].attributes
+    assert worker_attributes is not None
+    assert worker_attributes["agent.run.id"] == str(RUN_ID)
+    assert worker_attributes["agent.tenant.id"] == str(TENANT_ID)
+    assert spans["worker.run"].context.trace_id == int("1" * 32, 16)
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert "agent_platform_queue_wait_seconds_count 1.0" in payload
+    assert "agent_platform_worker_utilization_ratio 0.0" in payload
+    assert str(TENANT_ID) not in payload
+    telemetry.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_worker_bounds_sandbox_phases_separately_from_agent_run_slots() -> None:
     first = run_lease()
     second = first.model_copy(
@@ -1401,6 +1446,33 @@ async def test_scheduler_uses_bounded_expiry_recovery() -> None:
 
     assert await scheduler.recover_once() == 0
     assert queue.recoveries == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_exports_bounded_queue_pressure_metrics() -> None:
+    class QueueMonitorFake:
+        async def snapshot(self, *, occurred_at: datetime) -> QueueSnapshot:
+            return QueueSnapshot(
+                depth=QueueDepth(interactive=3, background=2, evaluation=1),
+                oldest_age_seconds=12.5,
+                captured_at=occurred_at,
+            )
+
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="agent-scheduler"))
+    scheduler = SchedulerService(
+        queue=FakeQueue(None),
+        queue_monitor=QueueMonitorFake(),
+        clock=MutableClock(),
+        telemetry=telemetry,
+    )
+
+    assert await scheduler.recover_once() == 0
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'agent_platform_queue_depth{priority="interactive"} 3.0' in payload
+    assert 'agent_platform_queue_depth{priority="background"} 2.0' in payload
+    assert 'agent_platform_queue_depth{priority="evaluation"} 1.0' in payload
+    assert "agent_platform_oldest_queued_seconds 12.5" in payload
+    telemetry.shutdown()
 
 
 def test_worker_and_scheduler_configuration_reject_unsafe_values() -> None:

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from starlette.websockets import WebSocketDisconnect
 
 from agent_api import (
@@ -38,6 +39,7 @@ from agent_core.domain.models import Run, Session
 from agent_core.domain.status import ApprovalMode, RunStatus, SessionStatus
 from agent_core.domain.transitions import transition_run
 from agent_core.event_store import EventPage, StoredEvent
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -976,6 +978,97 @@ def test_unexpected_repository_failure_is_opaque() -> None:
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "database-secret-must-not-escape" not in response.text
+
+
+def test_metrics_endpoint_is_bounded_and_optionally_authenticated() -> None:
+    api_services, _, _, _ = services()
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="agent-api"))
+    token = "metrics-token-value"  # noqa: S105 - inert test credential
+    client = TestClient(create_app(api_services, telemetry=telemetry, metrics_token=token))
+
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers=authorization("wrong-token")).status_code == 401
+    assert client.get("/health/live").status_code == 200
+    response = client.get("/metrics", headers=authorization(token))
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "agent_platform_api_requests_total" in response.text
+    assert 'route="/health/live"' in response.text
+    assert 'method="GET"' in response.text
+    assert 'status="200"' in response.text
+    assert token not in response.text
+    telemetry.shutdown()
+
+
+def test_api_trace_uses_route_and_authenticated_tenant_correlation() -> None:
+    api_services, _, _, _ = services()
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="agent-api"),
+        span_exporter=exporter,
+    )
+    client = TestClient(create_app(api_services, telemetry=telemetry))
+
+    response = client.post(
+        "/v1/sessions",
+        headers={
+            **authorization(),
+            "traceparent": "00-11111111111111111111111111111111-2222222222222222-01",
+        },
+        json={"workspace_id": str(WORKSPACE_ID)},
+    )
+
+    assert response.status_code == 201
+    request_span = next(
+        span for span in exporter.get_finished_spans() if span.name == "api.request"
+    )
+    assert request_span.context.trace_id == int("1" * 32, 16)
+    attributes = request_span.attributes
+    assert attributes is not None
+    assert attributes["http.route"] == "/v1/sessions"
+    assert attributes["http.response.status_code"] == 201
+    assert attributes["agent.tenant.id"] == str(TENANT_A)
+    assert str(WORKSPACE_ID) not in repr(attributes)
+    telemetry.shutdown()
+
+
+def test_run_creation_persists_current_w3c_context_for_worker_handoff() -> None:
+    api_services, _, _, _ = services()
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="agent-api"),
+        span_exporter=exporter,
+    )
+    client = TestClient(create_app(api_services, telemetry=telemetry))
+    session_response = client.post(
+        "/v1/sessions",
+        headers=authorization(),
+        json={"workspace_id": str(WORKSPACE_ID)},
+    )
+    session_id = session_response.json()["id"]
+    exporter.clear()
+
+    response = client.post(
+        f"/v1/sessions/{session_id}/runs",
+        headers={
+            **authorization(),
+            "Idempotency-Key": "trace-handoff",
+            "traceparent": "00-33333333333333333333333333333333-4444444444444444-01",
+        },
+        json={},
+    )
+
+    assert response.status_code == 200
+    run = response.json()["run"]
+    traceparent = run["traceparent"]
+    assert traceparent.startswith("00-" + "3" * 32 + "-")
+    request_span = next(
+        span for span in exporter.get_finished_spans() if span.name == "api.request"
+    )
+    assert traceparent.split("-")[2] == f"{request_span.context.span_id:016x}"
+    assert run["tracestate"] is None
+    telemetry.shutdown()
 
 
 def _session(tenant_id: uuid.UUID, now: datetime) -> Session:

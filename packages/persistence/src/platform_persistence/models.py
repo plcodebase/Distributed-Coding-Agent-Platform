@@ -109,6 +109,18 @@ class RunRecord(Base):
         CheckConstraint("next_event_sequence >= 1", name="next_event_sequence"),
         CheckConstraint("creation_hash ~ '^[0-9a-f]{64}$'", name="creation_hash"),
         CheckConstraint(
+            "traceparent IS NULL OR (traceparent ~ "
+            "'^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$' "
+            "AND split_part(traceparent, '-', 2) <> repeat('0', 32) "
+            "AND split_part(traceparent, '-', 3) <> repeat('0', 16))",
+            name="traceparent",
+        ),
+        CheckConstraint(
+            "tracestate IS NULL OR (traceparent IS NOT NULL AND octet_length(tracestate) "
+            "BETWEEN 1 AND 512)",
+            name="tracestate",
+        ),
+        CheckConstraint(
             "started_at IS NULL OR started_at >= created_at",
             name="started_timestamp",
         ),
@@ -173,6 +185,8 @@ class RunRecord(Base):
         nullable=False,
         server_default=text("false"),
     )
+    traceparent: Mapped[str | None] = mapped_column(String(55))
+    tracestate: Mapped[str | None] = mapped_column(String(512))
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     creation_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     next_event_sequence: Mapped[int] = mapped_column(

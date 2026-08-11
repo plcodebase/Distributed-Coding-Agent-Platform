@@ -39,6 +39,11 @@ type ToolName = Annotated[
     ),
 ]
 type Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+type TraceParent = Annotated[
+    str,
+    StringConstraints(pattern=r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"),
+]
+type TraceState = Annotated[str, StringConstraints(min_length=1, max_length=512)]
 
 _TERMINAL_RUN_STATUSES = frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED})
 _STARTED_RUN_STATUSES = frozenset(
@@ -110,6 +115,8 @@ class Run(DomainModel):
     lease_expires_at: AwareTimestamp | None = None
     last_checkpoint_id: uuid.UUID | None = None
     cancellation_requested: bool = False
+    traceparent: TraceParent | None = None
+    tracestate: TraceState | None = None
     created_at: AwareTimestamp
     started_at: AwareTimestamp | None = None
     completed_at: AwareTimestamp | None = None
@@ -145,6 +152,12 @@ class Run(DomainModel):
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
+        if self.tracestate is not None and self.traceparent is None:
+            raise ValueError("tracestate requires traceparent")
+        if self.traceparent is not None:
+            _, trace_id, parent_id, _ = self.traceparent.split("-")
+            if int(trace_id, 16) == 0 or int(parent_id, 16) == 0:
+                raise ValueError("traceparent identifiers must be nonzero")
         if self.started_at is not None and self.started_at < self.created_at:
             raise ValueError("started_at may not precede created_at")
         comparison_start = self.started_at or self.created_at

@@ -1,7 +1,9 @@
 """FastAPI control plane for durable sessions, runs, approvals, and events."""
 
 import asyncio
+import hmac
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -55,8 +57,12 @@ from agent_core.domain.errors import DomainOperationError
 from agent_core.domain.models import Run, Session
 from agent_core.domain.status import RunStatus, SessionStatus
 from agent_core.event_store import MAX_EVENT_PAGE_SIZE, StoredEvent
+from platform_telemetry import PlatformTelemetry, TelemetryContext
 
 type CloseCallback = Callable[[], Awaitable[None]]
+type RequestHandler = Callable[[Request], Awaitable[Response]]
+MIN_METRICS_TOKEN_BYTES = 16
+MAX_METRICS_TOKEN_BYTES = 4_096
 
 
 def create_app(  # noqa: PLR0915 - explicit route table remains locally auditable
@@ -64,6 +70,8 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
     *,
     close: CloseCallback | None = None,
     max_request_body_bytes: int = MAX_HTTP_REQUEST_BODY_BYTES,
+    telemetry: PlatformTelemetry | None = None,
+    metrics_token: str | None = None,
 ) -> FastAPI:
     """Compose one dependency-injected API instance without global mutable state."""
 
@@ -75,6 +83,10 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             "max_request_body_bytes must be an integer in "
             f"[1, {MAX_CONFIGURED_HTTP_REQUEST_BODY_BYTES}]"
         )
+    if metrics_token is not None and not (
+        MIN_METRICS_TOKEN_BYTES <= len(metrics_token.encode("utf-8")) <= MAX_METRICS_TOKEN_BYTES
+    ):
+        raise ValueError("metrics_token must be between 16 bytes and 4 KiB")
     active_event_sockets: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -99,6 +111,48 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         RequestBodyLimitMiddleware,
         max_body_bytes=max_request_body_bytes,
     )
+
+    if telemetry is not None:
+
+        @app.middleware("http")
+        async def telemetry_middleware(
+            request: Request,
+            call_next: RequestHandler,
+        ) -> Response:
+            started = time.monotonic()
+            parent = telemetry.extract(dict(request.headers))
+            route = "unmatched"
+            status = 500
+            with telemetry.span(
+                "api.request",
+                parent=parent,
+                attributes={
+                    "http.request.method": request.method,
+                },
+            ) as span:
+                request.state.telemetry_span = span
+                try:
+                    response = await call_next(request)
+                    status = response.status_code
+                    return response
+                finally:
+                    route_object = request.scope.get("route")
+                    route_path = getattr(route_object, "path", None)
+                    if isinstance(route_path, str):
+                        route = route_path
+                    route_label = telemetry.metrics.route(route)
+                    method = telemetry.metrics.method(request.method)
+                    telemetry.metrics.api_requests.labels(
+                        route=route_label,
+                        method=method,
+                        status=str(status),
+                    ).inc()
+                    telemetry.metrics.api_duration.labels(
+                        route=route_label,
+                        method=method,
+                    ).observe(time.monotonic() - started)
+                    span.set_attribute("http.route", route)
+                    span.set_attribute("http.response.status_code", status)
 
     @app.exception_handler(DomainOperationError)
     async def domain_error_handler(
@@ -145,8 +199,38 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             },
         )
 
-    async def principal(authorization: Annotated[str | None, Header()] = None) -> Principal:
-        return await services.authenticator.authenticate(authorization)
+    async def principal(
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> Principal:
+        authenticated = await services.authenticator.authenticate(authorization)
+        if telemetry is not None:
+            span = getattr(request.state, "telemetry_span", None)
+            if span is not None:
+                telemetry.annotate(
+                    span,
+                    TelemetryContext(tenant_id=str(authenticated.tenant_id)),
+                )
+        return authenticated
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        if telemetry is None:
+            return Response(status_code=404)
+        if metrics_token is not None:
+            scheme, separator, candidate = (authorization or "").partition(" ")
+            if (
+                not separator
+                or scheme.lower() != "bearer"
+                or not hmac.compare_digest(candidate, metrics_token)
+            ):
+                return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        return Response(
+            content=telemetry.metrics.render(),
+            media_type=telemetry.metrics.content_type,
+        )
 
     @app.get("/health/live", response_model=HealthResponse)
     async def live() -> HealthResponse:
@@ -329,6 +413,9 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
                 message="runs may only be created for active sessions",
             )
         now = datetime.now(UTC)
+        trace_carrier: dict[str, str] = {}
+        if telemetry is not None:
+            telemetry.inject(trace_carrier)
         run = Run(
             id=uuid.uuid4(),
             session_id=session.id,
@@ -337,6 +424,8 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             priority=body.priority,
             priority_class=body.priority_class,
             attempt=1,
+            traceparent=trace_carrier.get("traceparent"),
+            tracestate=trace_carrier.get("tracestate"),
             created_at=now,
         )
         result = await services.runs.create_idempotent(

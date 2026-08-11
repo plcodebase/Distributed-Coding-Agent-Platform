@@ -24,6 +24,7 @@ from platform_persistence import (
     PostgresSessionRepository,
     PostgresTaskRepository,
 )
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -53,6 +54,9 @@ class AgentApiSettings(BaseSettings):
     tenant_gateway_request_limit: int = Field(default=4, ge=1, le=10_000)
     global_queue_limit: int = Field(default=10_000, ge=1, le=1_000_000)
     overload_retry_after_seconds: float = Field(default=1, gt=0, le=3600)
+    telemetry_environment: str = Field(default="development", min_length=1, max_length=128)
+    otlp_http_endpoint: str | None = Field(default=None, max_length=2_048)
+    metrics_token: SecretStr | None = None
 
 
 def create_production_app(
@@ -84,6 +88,13 @@ def create_production_app(
     tasks = PostgresTaskRepository(database.sessions)
     memories = PostgresMemoryRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(
+            service_name="agent-api",
+            environment=resolved_api.telemetry_environment,
+            otlp_http_endpoint=resolved_api.otlp_http_endpoint,
+        )
+    )
     services = ApiServices(
         authenticator=authenticator,
         sessions=sessions,
@@ -95,7 +106,23 @@ def create_production_app(
         tasks=tasks,
         memories=memories,
     )
-    return create_app(services, close=database.aclose)
+
+    async def close() -> None:
+        try:
+            await database.aclose()
+        finally:
+            telemetry.shutdown()
+
+    return create_app(
+        services,
+        close=close,
+        telemetry=telemetry,
+        metrics_token=(
+            resolved_api.metrics_token.get_secret_value()
+            if resolved_api.metrics_token is not None
+            else None
+        ),
+    )
 
 
 def _credentials(settings: AgentApiSettings) -> dict[str, Principal]:

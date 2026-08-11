@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from agent_core.domain import DomainOperationError, ErrorDetail, JsonObject, ToolCallStatus
 from agent_core.events import (
@@ -45,7 +46,7 @@ from agent_core.tools import (
     ToolOutputChunk,
     ToolRegistry,
 )
-from platform_telemetry import Redactor
+from platform_telemetry import PlatformTelemetry, Redactor, TelemetrySettings
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 RUN_ID = UUID("10000000-0000-0000-0000-000000000001")
@@ -168,6 +169,7 @@ def make_loop(
     handler: ToolHandler[ReadArguments] | None = None,
     config: AgentLoopConfig | None = None,
     redactor: Redactor | None = None,
+    telemetry: PlatformTelemetry | None = None,
 ) -> tuple[AgentLoop, ScriptedModelGateway]:
     gateway = ScriptedModelGateway(turns)
     tools = ToolRegistry((read_tool(handler),)) if handler is not None else ToolRegistry()
@@ -179,6 +181,7 @@ def make_loop(
             id_generator=SequentialIdGenerator(),
             config=config,
             redactor=redactor,
+            telemetry=telemetry,
         ),
         gateway,
     )
@@ -268,6 +271,44 @@ async def test_one_tool_call_is_validated_executed_and_returned_to_model() -> No
     ]
     assert '"ok":true' in gateway.requests[1].messages[-1].content
     assert events[-1].event_type is EventType.RUN_COMPLETED
+
+
+async def test_tool_execution_emits_correlated_content_free_telemetry() -> None:
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="agent-core"),
+        span_exporter=exporter,
+    )
+    handler = ScriptedReadHandler(result={"content": "sensitive source text"})
+    loop, _ = make_loop(
+        [
+            ScriptedGatewayTurn.tool_calls(
+                GatewayToolCall(
+                    id="tool-call-observed",
+                    name="read_file",
+                    arguments={"path": "secret/path.py"},
+                )
+            ),
+            ScriptedGatewayTurn.text("done"),
+        ],
+        handler=handler,
+        telemetry=telemetry,
+    )
+
+    await collect_events(loop)
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["tool.execute"]
+    attributes = spans[0].attributes
+    assert attributes is not None
+    assert attributes["agent.run.id"] == str(RUN_ID)
+    assert attributes["agent.tool_call.id"] == "tool-call-observed"
+    assert attributes["agent.tool.name"] == "read_file"
+    assert "secret/path.py" not in repr(attributes)
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'outcome="success",tool="read_file"} 1.0' in payload
+    assert "sensitive source text" not in payload
+    telemetry.shutdown()
 
 
 async def test_multiple_tool_calls_execute_sequentially_before_next_turn() -> None:

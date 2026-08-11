@@ -192,6 +192,8 @@ def _run_row(
         lease_expires_at=NOW + timedelta(seconds=30) if assigned else None,
         last_checkpoint_id=None,
         cancellation_requested=cancellation_requested,
+        traceparent=None,
+        tracestate=None,
         created_at=NOW - timedelta(minutes=1),
         started_at=started_at,
         completed_at=None,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -21,6 +22,7 @@ from agent_core.tools import (
     ToolOutputChannel,
     ToolOutputChunk,
 )
+from platform_telemetry import PlatformTelemetry, Redactor, TelemetryContext
 
 _WORKSPACE_RESULT_METADATA_RESERVE_BYTES = 2048
 _MAX_WORKSPACE_REVISION_CHARACTERS = 255
@@ -35,7 +37,6 @@ if TYPE_CHECKING:
     from agent_core.events import AnyAgentEvent
     from agent_core.gateway import GatewayMessage, GatewayToolCall
     from agent_core.tools import ToolRegistry
-    from platform_telemetry import Redactor
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,11 +187,13 @@ class ToolTurnExecutor:
         config: AgentLoopConfig,
         redactor: Redactor,
         checkpoints: CheckpointCoordinator | None = None,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._tools = tools
         self._config = config
         self._redactor = redactor
         self._checkpoints = checkpoints
+        self._telemetry = telemetry
 
     async def execute(  # noqa: PLR0911, PLR0912, PLR0915 - fail-closed orchestration paths
         self,
@@ -201,7 +204,10 @@ class ToolTurnExecutor:
         transcript: list[GatewayMessage],
         outcomes: dict[str, ToolOutcome],
         semantic_retry_count: int,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
         run_id: uuid.UUID,
+        turn_number: int,
         task_plan: FrozenJsonObject,
         context_summary: str | None,
     ) -> ToolTurnReport:
@@ -229,6 +235,13 @@ class ToolTurnExecutor:
         emitted: list[AnyAgentEvent] = []
         last_checkpoint_id: uuid.UUID | None = None
         for item in prepared_calls:
+            telemetry_context = TelemetryContext(
+                tenant_id=str(tenant_id),
+                session_id=str(session_id),
+                run_id=str(run_id),
+                turn_id=str(turn_number),
+                tool_call_id=item.tool_call.id,
+            )
             prior = outcomes.get(item.tool_call.id)
             if prior is not None:
                 emitted.append(self._completion_from_outcome(events, item.tool_call.id, prior))
@@ -264,7 +277,8 @@ class ToolTurnExecutor:
                     emitted.append(events.run_failed(error=error))
                     return ToolTurnReport(events=tuple(emitted), terminal=True)
                 try:
-                    checkpoint = await self._checkpoints.create_before_tool(
+                    checkpoint = await self._create_checkpoint(
+                        telemetry_context=telemetry_context,
                         run_id=run_id,
                         tool_call_id=item.tool_call.id,
                         messages=tuple(transcript),
@@ -335,11 +349,12 @@ class ToolTurnExecutor:
 
             emitted.append(events.tool_started(tool_call=item.tool_call))
             try:
-                run_result = await self._run_tool(
+                run_result = await self._run_tool_observed(
                     item.prepared,
                     tool_call=item.tool_call,
                     run_id=run_id,
                     checkpoint=checkpoint,
+                    telemetry_context=telemetry_context,
                 )
             except asyncio.CancelledError as cancelled:
                 if checkpoint is not None:
@@ -716,6 +731,84 @@ class ToolTurnExecutor:
             semantic_failures=1,
             terminal=terminal,
         )
+
+    async def _create_checkpoint(
+        self,
+        *,
+        telemetry_context: TelemetryContext,
+        run_id: uuid.UUID,
+        tool_call_id: str,
+        messages: tuple[GatewayMessage, ...],
+        task_plan: FrozenJsonObject,
+        context_summary: str | None,
+    ) -> Checkpoint:
+        coordinator = self._checkpoints
+        if coordinator is None:
+            raise AssertionError("checkpoint creation requires a coordinator")
+        if self._telemetry is None:
+            return await coordinator.create_before_tool(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                messages=messages,
+                task_plan=task_plan,
+                context_summary=context_summary,
+            )
+        started = time.monotonic()
+        outcome = "error"
+        try:
+            with self._telemetry.span("checkpoint.create", context=telemetry_context):
+                checkpoint = await coordinator.create_before_tool(
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    messages=messages,
+                    task_plan=task_plan,
+                    context_summary=context_summary,
+                )
+            outcome = "success"
+            return checkpoint
+        finally:
+            self._telemetry.metrics.checkpoints.labels(outcome=outcome).inc()
+            self._telemetry.metrics.checkpoint_duration.observe(time.monotonic() - started)
+
+    async def _run_tool_observed(
+        self,
+        prepared: PreparedToolExecution,
+        *,
+        tool_call: GatewayToolCall,
+        run_id: uuid.UUID,
+        checkpoint: Checkpoint | None,
+        telemetry_context: TelemetryContext,
+    ) -> _ToolRunResult:
+        if self._telemetry is None:
+            return await self._run_tool(
+                prepared,
+                tool_call=tool_call,
+                run_id=run_id,
+                checkpoint=checkpoint,
+            )
+        started = time.monotonic()
+        outcome = "error"
+        try:
+            with self._telemetry.span(
+                "tool.execute",
+                context=telemetry_context,
+                attributes={"agent.tool.name": tool_call.name},
+            ):
+                result = await self._run_tool(
+                    prepared,
+                    tool_call=tool_call,
+                    run_id=run_id,
+                    checkpoint=checkpoint,
+                )
+            if result.error is None:
+                outcome = "success"
+            return result
+        finally:
+            tool = self._telemetry.metrics.tool(tool_call.name)
+            self._telemetry.metrics.tool_calls.labels(tool=tool, outcome=outcome).inc()
+            self._telemetry.metrics.tool_duration.labels(tool=tool).observe(
+                time.monotonic() - started
+            )
 
     async def _run_tool(  # noqa: PLR0911, PLR0912 - fail-closed stream protocol
         self,

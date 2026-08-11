@@ -7,6 +7,7 @@ from agent_core.capacity import (
     GatewayCapacityLease,
     GatewayCapacityStore,
     QueueDepth,
+    QueueMonitor,
     QueueSnapshot,
     TenantQuota,
 )
@@ -268,6 +269,7 @@ __all__ = [
     "ProjectInstructionsContributor",
     "QueueAdmissionPolicy",
     "QueueDepth",
+    "QueueMonitor",
     "QueueSnapshot",
     "RecentToolResultsContributor",
     "RecoveryStore",

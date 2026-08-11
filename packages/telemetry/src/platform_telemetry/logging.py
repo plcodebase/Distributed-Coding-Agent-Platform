@@ -6,9 +6,23 @@ from dataclasses import dataclass
 from typing import TextIO, cast
 
 import structlog
-from structlog.typing import FilteringBoundLogger
+from opentelemetry import trace
+from structlog.typing import EventDict, FilteringBoundLogger
 
 from platform_telemetry.redaction import Redactor
+
+
+def _add_trace_context(
+    logger: object,
+    method_name: str,
+    event_dict: EventDict,
+) -> EventDict:
+    del logger, method_name
+    context = trace.get_current_span().get_span_context()
+    if context.is_valid:
+        event_dict["trace.id"] = f"{context.trace_id:032x}"
+        event_dict["span.id"] = f"{context.span_id:016x}"
+    return event_dict
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +55,7 @@ def configure_logging(
 
     processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
+        _add_trace_context,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True, key="timestamp"),
         active_redactor.structlog_processor,

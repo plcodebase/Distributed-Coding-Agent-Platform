@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from agent_core.sandbox import (
     CommandSpec,
     WorkspaceSnapshot,
 )
+from platform_telemetry import PlatformTelemetry, TelemetryContext
 from sandbox_runtime._process import (
     BoundedProcessRunner,
     ProcessChunk,
@@ -216,6 +218,8 @@ class PodmanSandbox:
         runner: BoundedProcessRunner | None = None,
         control_environment: Mapping[str, str] | None = None,
         id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+        telemetry: PlatformTelemetry | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ) -> Self:
         """Validate the rootless runtime and configured image before returning."""
 
@@ -237,12 +241,27 @@ class PodmanSandbox:
             owns_runner=runner is None,
             id_factory=id_factory,
         )
+        started = time.monotonic()
+        outcome = "error"
         try:
-            await sandbox._verify_runtime()
+            if telemetry is None:
+                await sandbox._verify_runtime()
+            else:
+                with telemetry.span(
+                    "sandbox.startup",
+                    context=telemetry_context or TelemetryContext(),
+                ):
+                    await sandbox._verify_runtime()
+            outcome = "success"
         except BaseException:
             if sandbox._owns_runner:
                 await actual_runner.close()
             raise
+        finally:
+            if telemetry is not None:
+                telemetry.metrics.sandbox_startup.labels(outcome=outcome).observe(
+                    time.monotonic() - started
+                )
         return sandbox
 
     @property

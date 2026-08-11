@@ -237,6 +237,13 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
             "memories",
             "memory_extraction_jobs",
         ),
+        "0007_run_trace_context.py": (
+            'revision: str = "0007"',
+            'down_revision: str | None = "0006"',
+            "traceparent",
+            "tracestate",
+            "ck_runs_traceparent",
+        ),
     }
     migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"
     for filename, required_values in migration_requirements.items():

@@ -5,6 +5,7 @@ description = "Lease-expiry recovery scheduler for the coding-agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
+  "platform-telemetry",
 ]
 
 [build-system]
@@ -16,3 +17,4 @@ packages = ["src/agent_scheduler"]
 
 [tool.uv.sources]
 agent-core = { workspace = true }
+platform-telemetry = { workspace = true }

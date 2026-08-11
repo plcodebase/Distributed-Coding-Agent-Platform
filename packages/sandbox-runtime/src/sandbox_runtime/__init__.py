@@ -1,5 +1,6 @@
 """Concrete local workspace and execution adapters."""
 
+from sandbox_runtime._process import BoundedProcessRunner, ProcessChunk, ProcessResult
 from sandbox_runtime.access import WorkspaceAccessPolicy
 from sandbox_runtime.checkpoints import InMemoryCheckpointCoordinator
 from sandbox_runtime.git_workspace import GitWorktreeManager, GitWorktreeWorkspace
@@ -25,6 +26,7 @@ from sandbox_runtime.workspace import (
 )
 
 __all__ = [
+    "BoundedProcessRunner",
     "EditFileArguments",
     "EditFileResult",
     "GitWorktreeManager",
@@ -35,6 +37,8 @@ __all__ = [
     "LocalSandbox",
     "PodmanSandbox",
     "PodmanSandboxConfig",
+    "ProcessChunk",
+    "ProcessResult",
     "ReadFileArguments",
     "ReadResult",
     "RootedWorkspace",

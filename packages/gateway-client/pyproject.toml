@@ -6,6 +6,7 @@ requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
   "agents-sdk-adapter",
+  "platform-telemetry",
 ]
 
 [build-system]
@@ -18,3 +19,4 @@ packages = ["src/gateway_client"]
 [tool.uv.sources]
 agent-core = { workspace = true }
 agents-sdk-adapter = { workspace = true }
+platform-telemetry = { workspace = true }

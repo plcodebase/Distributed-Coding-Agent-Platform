@@ -5,6 +5,7 @@ description = "Rooted workspace, Git checkpoint, and local execution adapters"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
+  "platform-telemetry",
 ]
 
 [build-system]
@@ -16,3 +17,4 @@ packages = ["src/sandbox_runtime"]
 
 [tool.uv.sources]
 agent-core = { workspace = true }
+platform-telemetry = { workspace = true }

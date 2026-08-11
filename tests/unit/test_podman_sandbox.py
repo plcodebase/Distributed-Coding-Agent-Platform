@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 
 from agent_core.domain import DomainOperationError, FrozenJsonObject
 from agent_core.sandbox import CommandCompleted, CommandOutput, CommandSpec, WorkspaceSnapshot
 from agent_core.tools import ToolExecutionContext, ToolOutputChannel
+from platform_telemetry import PlatformTelemetry, TelemetryContext, TelemetrySettings
 from sandbox_runtime import PodmanSandbox, PodmanSandboxConfig, WorkspaceToolset
 from sandbox_runtime._process import BoundedProcessRunner, ProcessChunk, ProcessResult
 
@@ -179,6 +181,7 @@ async def _create(
     runner: _FakePodmanRunner,
     *,
     config: PodmanSandboxConfig | None = None,
+    telemetry: PlatformTelemetry | None = None,
 ) -> tuple[PodmanSandbox, _FakeWorkspace]:
     workspace = _FakeWorkspace(tmp_path)
     sandbox = await PodmanSandbox.create(
@@ -191,8 +194,30 @@ async def _create(
             "PROVIDER_API_KEY": "must-not-propagate",
         },
         id_factory=lambda: SANDBOX_ID,
+        telemetry=telemetry,
+        telemetry_context=TelemetryContext(run_id="run-observed"),
     )
     return sandbox, workspace
+
+
+async def test_podman_startup_records_correlated_runtime_telemetry(tmp_path: Path) -> None:
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="sandbox-runtime"),
+        span_exporter=exporter,
+    )
+    sandbox, _ = await _create(tmp_path, _FakePodmanRunner(), telemetry=telemetry)
+    await sandbox.destroy()
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["sandbox.startup"]
+    attributes = spans[0].attributes
+    assert attributes is not None
+    assert attributes["agent.run.id"] == "run-observed"
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'outcome="success"} 1.0' in payload
+    assert "agent-platform-sandbox:test" not in payload
+    telemetry.shutdown()
 
 
 async def _collect(

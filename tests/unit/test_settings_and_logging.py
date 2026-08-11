@@ -5,7 +5,14 @@ import pytest
 from pydantic import ValidationError
 
 from agent_core.settings import PlatformSettings
-from platform_telemetry import LoggingSettings, Redactor, configure_logging
+from platform_telemetry import (
+    LoggingSettings,
+    PlatformTelemetry,
+    Redactor,
+    TelemetryContext,
+    TelemetrySettings,
+    configure_logging,
+)
 
 
 def test_settings_read_prefixed_environment_and_hide_secrets(
@@ -78,6 +85,25 @@ def test_structured_logger_emits_redacted_json() -> None:
     assert event["api_key"] == "[REDACTED]"
     assert event["service"] == "unit-test"
     assert event["safe"] == "value"
+
+
+def test_structured_logger_includes_active_trace_and_platform_context() -> None:
+    output = StringIO()
+    logger = configure_logging(LoggingSettings(service_name="unit-test"), stream=output)
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="unit-test"))
+
+    with telemetry.span(
+        "worker.run",
+        context=TelemetryContext(tenant_id="tenant-a", run_id="run-a"),
+    ):
+        logger.info("run_started")
+
+    event = json.loads(output.getvalue())
+    assert len(event["trace.id"]) == 32
+    assert len(event["span.id"]) == 16
+    assert event["agent.tenant.id"] == "tenant-a"
+    assert event["agent.run.id"] == "run-a"
+    telemetry.shutdown()
 
 
 def test_logging_validates_level_and_supports_console_output() -> None:

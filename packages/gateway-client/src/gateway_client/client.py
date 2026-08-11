@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+import time
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
@@ -34,6 +35,7 @@ from gateway_client.reliability import (
     InMemoryGatewayRateLimiter,
     InMemoryGatewayRequestStore,
 )
+from platform_telemetry import ErrorCategory, PlatformTelemetry, TelemetryContext
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -138,6 +140,7 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         capacity_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_value: Callable[[], float] = random.random,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._gateway = gateway
         self._config = config or GatewayClientConfig()
@@ -162,6 +165,7 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         self._sleep = sleep
         self._capacity_sleep = capacity_sleep
         self._random_value = random_value
+        self._telemetry = telemetry
         self._close_lock = asyncio.Lock()
         self._closing = False
         self._cleanup_required = False
@@ -210,7 +214,63 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
             self._cleanup_required = False
             self._closed = True
 
-    async def stream(  # noqa: PLR0912, PLR0915 - one auditable resource lifecycle
+    async def stream(self, request: GatewayRequest) -> AsyncIterator[GatewayEvent]:
+        """Execute one request with content-free platform telemetry when configured."""
+
+        if self._telemetry is None:
+            execution = self._stream_internal(request)
+            try:
+                async for event in execution:
+                    yield event
+            finally:
+                await _close_stream(execution, request=request)
+            return
+        route = self._telemetry.metrics.route(request.route_name)
+        started = time.monotonic()
+        first_output = False
+        outcome = "error"
+        context = TelemetryContext(
+            tenant_id=str(request.tenant_id),
+            session_id=str(request.session_id),
+            run_id=str(request.run_id),
+            turn_id=str(request.turn_number),
+            model_call_id=request.model_call_id,
+        )
+        with self._telemetry.span(
+            "model.request",
+            context=context,
+            attributes={"agent.model.route": request.route_name},
+        ) as span:
+            execution = self._stream_internal(request)
+            try:
+                async for event in execution:
+                    if not first_output and not isinstance(event, GatewayResponseCompleted):
+                        first_output = True
+                        self._telemetry.metrics.model_first_token.labels(route=route).observe(
+                            time.monotonic() - started
+                        )
+                    if isinstance(event, GatewayResponseCompleted):
+                        outcome = "success"
+                    yield event
+            except DomainOperationError as error:
+                self._telemetry.record_error(
+                    span,
+                    category=_gateway_error_category(error.code),
+                    component="gateway-client",
+                    retryable=error.retryable,
+                )
+                raise
+            finally:
+                await _close_stream(execution, request=request)
+                duration = time.monotonic() - started
+                self._telemetry.metrics.model_requests.labels(
+                    route=route,
+                    outcome=outcome,
+                ).inc()
+                self._telemetry.metrics.model_latency.labels(route=route).observe(duration)
+                self._telemetry.metrics.gateway_wait.labels(route=route).observe(duration)
+
+    async def _stream_internal(  # noqa: PLR0912, PLR0915 - one auditable resource lifecycle
         self,
         request: GatewayRequest,
     ) -> AsyncIterator[GatewayEvent]:
@@ -458,13 +518,27 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 finally:
                     await _close_stream(attempt_stream, request=request)
             except DomainOperationError as error:
+                self._record_provider_attempt(request, outcome="error")
                 if error.retryable:
                     await self._record_circuit_failure(request)
                 if not self._can_retry(attempt, attempt_events, error):
                     raise
+                if self._telemetry is not None:
+                    self._telemetry.metrics.gateway_retries.labels(
+                        route=self._telemetry.metrics.route(request.route_name),
+                        category=_gateway_error_category(error.code).value,
+                    ).inc()
                 await self._sleep(self._retry_delay(attempt))
                 continue
 
+            self._record_provider_attempt(request, outcome="success")
+            terminal = _require_terminal_event(retained_events, request)
+            self._record_completion_metrics(
+                self._telemetry.metrics.route(request.route_name)
+                if self._telemetry is not None
+                else request.route_name,
+                terminal,
+            )
             await self._record_circuit_success(request)
             await self._complete_request(
                 request,
@@ -472,7 +546,7 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 tuple(retained_events),
                 execution_state,
             )
-            yield _require_terminal_event(retained_events, request)
+            yield terminal
             return
 
         raise DomainOperationError(
@@ -518,6 +592,8 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 details={"request_id": request.request_id},
             ) from error
         if not allowed:
+            if self._telemetry is not None:
+                self._telemetry.metrics.set_circuit(route=request.route_name, state="open")
             raise DomainOperationError(
                 code="gateway_circuit_open",
                 message="the model route circuit is open",
@@ -531,6 +607,8 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
     async def _record_circuit_success(self, request: GatewayRequest) -> None:
         try:
             await self._circuit_breaker.record_success(request.route_name)
+            if self._telemetry is not None:
+                self._telemetry.metrics.set_circuit(route=request.route_name, state="closed")
         except Exception as error:
             raise DomainOperationError(
                 code="gateway_circuit_unavailable",
@@ -752,6 +830,30 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 details=({"request_id": request.request_id} if request is not None else None),
             )
 
+    def _record_completion_metrics(
+        self,
+        route: str,
+        event: GatewayResponseCompleted,
+    ) -> None:
+        if self._telemetry is None:
+            return
+        self._telemetry.metrics.model_tokens.labels(route=route, direction="input").inc(
+            event.input_tokens
+        )
+        self._telemetry.metrics.model_tokens.labels(route=route, direction="output").inc(
+            event.output_tokens
+        )
+        self._telemetry.metrics.model_tokens.labels(route=route, direction="cached").inc(
+            event.cached_tokens
+        )
+
+    def _record_provider_attempt(self, request: GatewayRequest, *, outcome: str) -> None:
+        if self._telemetry is not None:
+            self._telemetry.metrics.provider_requests.labels(
+                route=self._telemetry.metrics.route(request.route_name),
+                outcome=outcome,
+            ).inc()
+
 
 def _event_size(event: GatewayEvent) -> int:
     payload = json.dumps(
@@ -762,6 +864,23 @@ def _event_size(event: GatewayEvent) -> int:
         sort_keys=True,
     )
     return len(payload.encode("utf-8"))
+
+
+def _gateway_error_category(code: str) -> ErrorCategory:
+    category = ErrorCategory.PROVIDER
+    if "rate_limit" in code:
+        category = ErrorCategory.RATE_LIMIT
+    elif "capacity" in code or "circuit_open" in code:
+        category = ErrorCategory.CAPACITY
+    elif "timeout" in code:
+        category = ErrorCategory.TIMEOUT
+    elif "conflict" in code or "in_progress" in code:
+        category = ErrorCategory.CONFLICT
+    elif "invalid" in code or "limit" in code or "route_not_allowed" in code:
+        category = ErrorCategory.VALIDATION
+    elif "idempotency" in code:
+        category = ErrorCategory.PERSISTENCE
+    return category
 
 
 def _request_size(request: GatewayRequest) -> int:

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
@@ -27,6 +28,7 @@ from gateway_client import (
     InMemoryGatewayRateLimiter,
     InMemoryGatewayRequestStore,
 )
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
@@ -335,6 +337,11 @@ async def test_retry_uses_bounded_exponential_backoff_before_any_stream_event() 
     async def sleep(delay: float) -> None:
         delays.append(delay)
 
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="gateway-client"),
+        span_exporter=exporter,
+    )
     client = GatewayClient(
         gateway,
         config=GatewayClientConfig(
@@ -344,6 +351,7 @@ async def test_retry_uses_bounded_exponential_backoff_before_any_stream_event() 
             retry_jitter_ratio=0,
         ),
         sleep=sleep,
+        telemetry=telemetry,
     )
 
     result = [event async for event in client.stream(request("retry-request"))]
@@ -352,6 +360,12 @@ async def test_retry_uses_bounded_exponential_backoff_before_any_stream_event() 
     assert len(gateway.requests) == 3
     assert gateway.closed_attempts == 3
     assert delays == [0.25, 0.5]
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'category="provider",route="coding-default"} 2.0' in payload
+    assert 'outcome="error",route="coding-default"} 2.0' in payload
+    assert 'outcome="success",route="coding-default"} 1.0' in payload
+    assert [span.name for span in exporter.get_finished_spans()] == ["model.request"]
+    telemetry.shutdown()
 
 
 @pytest.mark.asyncio

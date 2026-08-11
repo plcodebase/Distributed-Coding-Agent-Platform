@@ -28,6 +28,7 @@ from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves fields
     IdentifierString,
 )
 from agent_core.domain.status import RunStatus
+from platform_telemetry import PlatformTelemetry, TelemetryContext
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -78,6 +79,7 @@ class WorkerService:
         executor: RunExecutor,
         clock: Clock,
         sleep: Sleep = asyncio.sleep,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -87,6 +89,7 @@ class WorkerService:
         self._executor = executor
         self._clock = clock
         self._sleep = sleep
+        self._telemetry = telemetry
         self._active: set[asyncio.Task[None]] = set()
         self._sandbox_slots = asyncio.BoundedSemaphore(config.sandbox_slots)
         self._fatal_error: BaseException | None = None
@@ -138,12 +141,14 @@ class WorkerService:
         )
         if lease is None:
             return False
+        self._observe_queue_wait(lease)
         task = asyncio.create_task(
             self._process(lease),
             name=f"agent-run-{lease.run_id}",
         )
         self._active.add(task)
         task.add_done_callback(self._observe_task)
+        self._observe_worker_capacity()
         return True
 
     async def serve(self, stop: asyncio.Event) -> None:
@@ -191,6 +196,26 @@ class WorkerService:
         )
 
     async def _process(self, original_lease: RunLease) -> None:
+        if self._telemetry is None:
+            await self._process_owned(original_lease)
+            return
+        context = TelemetryContext(
+            tenant_id=str(original_lease.tenant_id),
+            session_id=str(original_lease.session_id),
+            run_id=str(original_lease.run_id),
+        )
+        with self._telemetry.span(
+            "worker.run",
+            context=context,
+            parent=self._telemetry.extract(_trace_carrier(original_lease)),
+            attributes={
+                "agent.run.attempt": original_lease.attempt,
+                "agent.worker.id": original_lease.worker_id,
+            },
+        ):
+            await self._process_owned(original_lease)
+
+    async def _process_owned(self, original_lease: RunLease) -> None:
         lease = original_lease
         heartbeat: asyncio.Task[None] | None = None
         workspace_lease: WorkspaceWriterLease | None = None
@@ -416,11 +441,39 @@ class WorkerService:
 
     def _observe_task(self, task: asyncio.Task[None]) -> None:
         self._active.discard(task)
+        self._observe_worker_capacity()
         if task.cancelled():
             return
         error = task.exception()
         if error is not None and self._fatal_error is None:
             self._fatal_error = error
+
+    def _observe_worker_capacity(self) -> None:
+        if self._telemetry is not None:
+            self._telemetry.metrics.observe_worker(
+                active=self.active_count,
+                total=self._config.total_slots,
+            )
+
+    def _observe_queue_wait(self, lease: RunLease) -> None:
+        if self._telemetry is None or lease.queued_at is None:
+            return
+        seconds = max(0.0, (lease.acquired_at - lease.queued_at).total_seconds())
+        self._telemetry.metrics.queue_wait.observe(seconds)
+        with self._telemetry.span(
+            "queue.wait",
+            context=TelemetryContext(
+                tenant_id=str(lease.tenant_id),
+                session_id=str(lease.session_id),
+                run_id=str(lease.run_id),
+            ),
+            attributes={
+                "agent.queue.wait_seconds": seconds,
+                "agent.queue.priority": lease.priority_class.value,
+            },
+            parent=self._telemetry.extract(_trace_carrier(lease)),
+        ):
+            pass
 
     def _raise_fatal_error(self) -> None:
         if self._fatal_error is not None:
@@ -432,3 +485,12 @@ class WorkerService:
 
 
 __all__ = ["WorkerConfig", "WorkerService"]
+
+
+def _trace_carrier(lease: RunLease) -> dict[str, str]:
+    carrier: dict[str, str] = {}
+    if lease.traceparent is not None:
+        carrier["traceparent"] = lease.traceparent
+    if lease.tracestate is not None:
+        carrier["tracestate"] = lease.tracestate
+    return carrier

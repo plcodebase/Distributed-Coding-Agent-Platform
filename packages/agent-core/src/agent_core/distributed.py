@@ -80,15 +80,25 @@ class RunLease(DomainModel):
     attempt: int = Field(ge=1)
     priority: int = Field(ge=-100, le=100)
     priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
+    queued_at: AwareTimestamp | None = None
     acquired_at: AwareTimestamp
     expires_at: AwareTimestamp
     checkpoint_id: uuid.UUID | None = None
     cancellation_requested: bool = False
+    traceparent: str | None = Field(
+        default=None,
+        pattern=r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+    )
+    tracestate: str | None = Field(default=None, min_length=1, max_length=512)
 
     @model_validator(mode="after")
     def validate_window(self) -> Self:
         if self.expires_at <= self.acquired_at:
             raise ValueError("run lease expiry must follow acquisition")
+        if self.queued_at is not None and self.queued_at > self.acquired_at:
+            raise ValueError("run lease queue time may not follow acquisition")
+        if self.tracestate is not None and self.traceparent is None:
+            raise ValueError("tracestate requires traceparent")
         return self
 
 

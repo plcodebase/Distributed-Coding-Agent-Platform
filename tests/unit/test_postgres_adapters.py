@@ -210,6 +210,8 @@ def _run_row(run: Run, *, creation_hash: str | None = None) -> SimpleNamespace:
         lease_expires_at=run.lease_expires_at,
         last_checkpoint_id=run.last_checkpoint_id,
         cancellation_requested=run.cancellation_requested,
+        traceparent=run.traceparent,
+        tracestate=run.tracestate,
         idempotency_key="request-1",
         creation_hash=creation_hash
         or run_creation_hash(

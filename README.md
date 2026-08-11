@@ -395,6 +395,17 @@ time, and optional closed metadata. Tenant or session disablement suppresses ext
 and context retrieval. Direct compaction status and tenant-scoped memory archival APIs
 complete the control surface.
 
+### Sequence 25: OpenTelemetry and Prometheus metrics
+
+Sequence 25 adds an explicitly owned OpenTelemetry provider with optional OTLP/HTTP
+export, W3C propagation across durable run handoff, structured log correlation, stable
+error categories, and a bounded-cardinality Prometheus registry. Traces cover API
+requests, queue wait, worker execution, context construction, model and gateway wait,
+tool execution, checkpoint creation, and Podman sandbox startup. Prompt text, source
+content, tool arguments/results, exception messages, and credentials are excluded.
+Raw tenant/run/call identifiers are trace-only; tenant cost labels are opaque, capped,
+and overflow safely. `/metrics` can be protected with a dedicated bearer token.
+
 ## Local setup
 
 ```shell
@@ -425,7 +436,10 @@ uv run python -m agent_scheduler --factory your_app.scheduler:create_scheduler
 The worker command starts three OS processes by default. A production factory must
 inject the PostgreSQL queue/stores, gateway client, durable checkpoint coordinator,
 workspace snapshot restorer, and sandbox; each worker index must map to a unique worker
-ID. These are deployment composition references, not model- or user-controlled values.
+ID. The same application-owned `PlatformTelemetry` instance should be injected into
+the worker, executor, agent loop, gateway client, queue monitor, and sandbox so child
+spans and metrics share one lifecycle. These are deployment composition references,
+not model- or user-controlled values.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
 sandbox environments.

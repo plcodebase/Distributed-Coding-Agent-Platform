@@ -31,7 +31,7 @@ from agent_core.gateway import (
     MessageRole,
     ModelGateway,
 )
-from platform_telemetry import Redactor
+from platform_telemetry import PlatformTelemetry, Redactor
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -76,6 +76,7 @@ class AgentLoop:
         config: AgentLoopConfig | None = None,
         redactor: Redactor | None = None,
         checkpoints: CheckpointCoordinator | None = None,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._tools = tools
         self._clock = clock
@@ -92,6 +93,7 @@ class AgentLoop:
             config=self._config,
             redactor=self._redactor,
             checkpoints=checkpoints,
+            telemetry=telemetry,
         )
 
     async def run(  # noqa: PLR0911, PLR0912, PLR0915 - explicit terminal policy paths
@@ -225,7 +227,10 @@ class AgentLoop:
                     transcript=transcript,
                     outcomes=outcomes,
                     semantic_retry_count=semantic_retry_count,
+                    tenant_id=loop_input.tenant_id,
+                    session_id=loop_input.session_id,
                     run_id=loop_input.run_id,
+                    turn_number=turn_number,
                     task_plan=loop_input.task_plan,
                     context_summary=loop_input.context_summary,
                 )

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import ValidationError
 
 from agent_core.domain import FrozenJsonObject
@@ -22,6 +23,7 @@ from agent_core.gateway import (
     MessageRole,
 )
 from gateway_client import GatewayClient, GatewayClientConfig
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
@@ -123,6 +125,72 @@ async def test_client_returns_only_valid_normalized_events_and_closes_once() -> 
     with pytest.raises(DomainOperationError) as closed:
         _ = [event async for event in client.stream(request())]
     assert closed.value.code == "gateway_closed"
+
+
+@pytest.mark.asyncio
+async def test_client_records_content_free_model_latency_and_token_telemetry() -> None:
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="gateway-client"),
+        span_exporter=exporter,
+    )
+    delegate = ScriptedGateway(
+        [
+            GatewayTextDelta(delta="sensitive model output"),
+            GatewayResponseCompleted(
+                finish_reason=GatewayFinishReason.STOP,
+                input_tokens=11,
+                output_tokens=7,
+                cached_tokens=3,
+            ),
+        ]
+    )
+    client = GatewayClient(delegate, telemetry=telemetry)
+
+    events = [event async for event in client.stream(request(content="sensitive prompt"))]
+
+    assert len(events) == 2
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["model.request"]
+    attributes = spans[0].attributes
+    assert attributes is not None
+    assert attributes["agent.model_call.id"] == "model-call-2"
+    assert attributes["agent.run.id"] == str(request().run_id)
+    assert "sensitive" not in repr(attributes)
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'direction="input",route="coding-default"} 11.0' in payload
+    assert 'direction="output",route="coding-default"} 7.0' in payload
+    assert 'direction="cached",route="coding-default"} 3.0' in payload
+    assert 'outcome="success",route="coding-default"} 1.0' in payload
+    assert "sensitive" not in payload
+    telemetry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_replayed_gateway_completion_does_not_double_count_provider_tokens() -> None:
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="gateway-client"))
+    delegate = ScriptedGateway(
+        [
+            GatewayResponseCompleted(
+                finish_reason=GatewayFinishReason.STOP,
+                input_tokens=11,
+                output_tokens=7,
+            )
+        ]
+    )
+    client = GatewayClient(delegate, telemetry=telemetry)
+    logical_request = request()
+
+    first = [event async for event in client.stream(logical_request)]
+    replay = [event async for event in client.stream(logical_request)]
+
+    assert replay == first
+    assert delegate.requests == [logical_request]
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'direction="input",route="coding-default"} 11.0' in payload
+    assert 'direction="output",route="coding-default"} 7.0' in payload
+    assert 'outcome="success",route="coding-default"} 2.0' in payload
+    telemetry.shutdown()
 
 
 @pytest.mark.asyncio

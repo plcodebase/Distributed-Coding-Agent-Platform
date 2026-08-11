@@ -12,9 +12,11 @@ from agent_core.domain.base import DomainModel
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from agent_core.capacity import QueueMonitor
     from agent_core.distributed import RunQueue
     from agent_core.loop import Clock
     from agent_scheduler.memory import MemoryExtractionProcessor
+    from platform_telemetry import PlatformTelemetry
 
 type Sleep = Callable[[float], Awaitable[None]]
 
@@ -37,18 +39,32 @@ class SchedulerService:
         config: SchedulerConfig | None = None,
         sleep: Sleep = asyncio.sleep,
         memory_processor: MemoryExtractionProcessor | None = None,
+        queue_monitor: QueueMonitor | None = None,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._queue = queue
         self._clock = clock
         self._config = config or SchedulerConfig()
         self._sleep = sleep
         self._memory_processor = memory_processor
+        self._queue_monitor = queue_monitor
+        self._telemetry = telemetry
 
     async def recover_once(self) -> int:
         recovered = await self._queue.recover_expired(
             occurred_at=self._clock.now(),
             limit=self._config.recovery_batch_size,
         )
+        if self._queue_monitor is not None and self._telemetry is not None:
+            snapshot = await self._queue_monitor.snapshot(occurred_at=self._clock.now())
+            self._telemetry.metrics.observe_queue(
+                depth={
+                    "interactive": snapshot.depth.interactive,
+                    "background": snapshot.depth.background,
+                    "evaluation": snapshot.depth.evaluation,
+                },
+                oldest_seconds=snapshot.oldest_age_seconds,
+            )
         return len(recovered)
 
     async def serve(self, stop: asyncio.Event) -> None:

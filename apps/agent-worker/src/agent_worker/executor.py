@@ -30,6 +30,7 @@ from agent_core.events import (
     ToolStartedEvent,
 )
 from agent_core.loop import AgentLoop, AgentLoopInput
+from platform_telemetry import PlatformTelemetry, TelemetryContext
 
 if TYPE_CHECKING:
     import uuid
@@ -82,6 +83,7 @@ class AgentLoopRunExecutor:
         events: IdempotentEventStore,
         tool_calls: ToolCallStore,
         context_builder: RunContextBuilder | None = None,
+        telemetry: PlatformTelemetry | None = None,
     ) -> None:
         if not callable(loop_factory):
             raise TypeError("loop_factory must be callable")
@@ -89,6 +91,7 @@ class AgentLoopRunExecutor:
         self._events = events
         self._tool_calls = tool_calls
         self._context_builder = context_builder
+        self._telemetry = telemetry
         self._active: dict[uuid.UUID, asyncio.Task[object]] = {}
         self._cancel_requested: set[uuid.UUID] = set()
         self._lock = asyncio.Lock()
@@ -113,11 +116,7 @@ class AgentLoopRunExecutor:
                 loop = await loop
             if not isinstance(loop, AgentLoop):
                 raise TypeError("loop_factory must return AgentLoop")
-            context = (
-                await self._context_builder.build(lease, writer_lease, recovery)
-                if self._context_builder is not None
-                else None
-            )
+            context = await self._build_context(lease, writer_lease, recovery)
             return await self._run_loop(loop, lease, recovery, context=context)
         except asyncio.CancelledError:
             async with self._lock:
@@ -129,6 +128,29 @@ class AgentLoopRunExecutor:
             async with self._lock:
                 self._active.pop(lease.lease_token, None)
                 self._cancel_requested.discard(lease.lease_token)
+
+    async def _build_context(
+        self,
+        lease: RunLease,
+        writer_lease: WorkspaceWriterLease,
+        recovery: RunRecoveryState,
+    ) -> ContextBuildResult | None:
+        if self._context_builder is None:
+            return None
+        if self._telemetry is None:
+            return await self._context_builder.build(lease, writer_lease, recovery)
+        started = asyncio.get_running_loop().time()
+        with self._telemetry.span(
+            "context.build",
+            context=TelemetryContext(
+                tenant_id=str(lease.tenant_id),
+                session_id=str(lease.session_id),
+                run_id=str(lease.run_id),
+            ),
+        ):
+            result = await self._context_builder.build(lease, writer_lease, recovery)
+        self._telemetry.metrics.context_build.observe(asyncio.get_running_loop().time() - started)
+        return result
 
     async def cancel(self, lease: RunLease) -> None:
         async with self._lock:

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         GatewayRateLimiter,
         GatewayRequestStore,
     )
+    from platform_telemetry import PlatformTelemetry
 
 
 def create_gateway_client(
@@ -28,6 +29,7 @@ def create_gateway_client(
     circuit_breaker: GatewayCircuitBreaker,
     config: GatewayClientConfig | None = None,
     http_client: AsyncClient | None = None,
+    telemetry: PlatformTelemetry | None = None,
 ) -> GatewayClient:
     """Create the sole worker-to-LiteLLM model access path."""
 
@@ -43,6 +45,7 @@ def create_gateway_client(
         rate_limiter=rate_limiter,
         capacity_store=capacity_store,
         circuit_breaker=circuit_breaker,
+        telemetry=telemetry,
     )
 
 

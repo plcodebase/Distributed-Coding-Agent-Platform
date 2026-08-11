@@ -822,6 +822,8 @@ def _run_values(
         "lease_expires_at": run.lease_expires_at,
         "last_checkpoint_id": run.last_checkpoint_id,
         "cancellation_requested": run.cancellation_requested,
+        "traceparent": run.traceparent,
+        "tracestate": run.tracestate,
         "idempotency_key": idempotency_key,
         "creation_hash": creation_hash,
         "created_at": run.created_at,
@@ -843,6 +845,8 @@ def _run_domain(record: RunRecord) -> Run:
         lease_expires_at=record.lease_expires_at,
         last_checkpoint_id=record.last_checkpoint_id,
         cancellation_requested=record.cancellation_requested,
+        traceparent=record.traceparent,
+        tracestate=record.tracestate,
         created_at=record.created_at,
         started_at=record.started_at,
         completed_at=record.completed_at,
@@ -856,6 +860,8 @@ def _apply_run(record: RunRecord, run: Run) -> None:
     record.lease_expires_at = run.lease_expires_at
     record.last_checkpoint_id = run.last_checkpoint_id
     record.cancellation_requested = run.cancellation_requested
+    record.traceparent = run.traceparent
+    record.tracestate = run.tracestate
     record.started_at = run.started_at
     record.completed_at = run.completed_at
 

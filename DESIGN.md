@@ -1243,7 +1243,7 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 24: the worker uses a contributor-based,
+Implementation status through Sequence 25: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
@@ -1257,6 +1257,14 @@ jobs can be recovered without accepting stale writes.
 Status, compact/compaction-status, rewind, new-session, task-plan, memory-control, and
 memory-archive HTTP operations are available. Shell-style command aliases remain a CLI
 concern.
+
+Sequence 25 adds content-free platform tracing and bounded-cardinality metrics. The
+API persists a validated W3C carrier with each newly accepted run, and the worker
+extracts it before queue/run/model/tool/checkpoint/sandbox spans are created. Tenant,
+session, run, turn, model-call, and tool-call identifiers are trace and structured-log
+fields, never raw metric labels. OpenTelemetry exporters and Prometheus registries have
+explicit application-owned lifecycles. SDK remote tracing remains disabled; the
+platform span surrounding the Agents SDK model layer is authoritative.
 
 ---
 

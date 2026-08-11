@@ -431,6 +431,33 @@ def test_run_model_rejects_inconsistent_persisted_state() -> None:
         )
     with pytest.raises(ValidationError, match="may not retain"):
         Run.model_validate({**values, "assigned_worker_id": "worker-1"})
+    with pytest.raises(ValidationError, match="tracestate requires traceparent"):
+        Run.model_validate({**values, "tracestate": "vendor=value"})
+    with pytest.raises(ValidationError, match="nonzero"):
+        Run.model_validate(
+            {
+                **values,
+                "traceparent": "00-" + "0" * 32 + "-" + "1" * 16 + "-01",
+            }
+        )
+
+
+def test_run_accepts_and_preserves_bounded_w3c_trace_context() -> None:
+    traceparent = "00-" + "1" * 32 + "-" + "2" * 16 + "-01"
+    run = queued_run().model_copy(update={"traceparent": traceparent, "tracestate": "vendor=value"})
+
+    assert run.traceparent == traceparent
+    assert run.tracestate == "vendor=value"
+    assert (
+        transition_run(
+            run,
+            RunStatus.LEASED,
+            occurred_at=NOW,
+            worker_id="worker-1",
+            lease_expires_at=NOW + timedelta(seconds=30),
+        ).traceparent
+        == traceparent
+    )
 
 
 @pytest.mark.parametrize(

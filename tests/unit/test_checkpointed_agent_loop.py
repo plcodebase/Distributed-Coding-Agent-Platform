@@ -5,6 +5,7 @@ from typing import cast
 from uuid import UUID
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from agent_core.checkpoints import RewindState
 from agent_core.domain import (
@@ -40,6 +41,7 @@ from agent_core.tools import (
     ToolOutputChunk,
     ToolRegistry,
 )
+from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 RUN_ID = UUID("10000000-0000-0000-0000-000000000001")
 SESSION_ID = UUID("20000000-0000-0000-0000-000000000002")
@@ -159,6 +161,7 @@ def build_loop(
     *,
     checkpoints: RecordingCheckpointCoordinator | None,
     turns: list[ScriptedGatewayTurn],
+    telemetry: PlatformTelemetry | None = None,
 ) -> AgentLoop:
     registration = RegisteredTool(
         name="edit_file",
@@ -173,6 +176,7 @@ def build_loop(
         clock=SteppingClock(NOW),
         id_generator=SequentialIdGenerator(),
         checkpoints=checkpoints,
+        telemetry=telemetry,
     )
 
 
@@ -225,6 +229,44 @@ async def test_mutation_creates_checkpoint_before_execution_and_records_revision
     completed_run = events[-1]
     assert isinstance(completed_run, RunCompletedEvent)
     assert completed_run.payload.checkpoint_id == CHECKPOINT_ID
+
+
+async def test_checkpoint_creation_has_correlated_span_and_metrics() -> None:
+    exporter = InMemorySpanExporter()
+    telemetry = PlatformTelemetry(
+        TelemetrySettings(service_name="agent-core"),
+        span_exporter=exporter,
+    )
+    events = await collect(
+        build_loop(
+            EditHandler(),
+            checkpoints=RecordingCheckpointCoordinator(),
+            turns=[
+                ScriptedGatewayTurn.tool_calls(
+                    GatewayToolCall(
+                        id="edit-observed",
+                        name="edit_file",
+                        arguments={"path": "main.py", "content": "changed"},
+                    )
+                ),
+                ScriptedGatewayTurn.text("done"),
+            ],
+            telemetry=telemetry,
+        )
+    )
+
+    assert isinstance(events[-1], RunCompletedEvent)
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["checkpoint.create", "tool.execute"]
+    checkpoint_attributes = spans[0].attributes
+    assert checkpoint_attributes is not None
+    assert checkpoint_attributes["agent.run.id"] == str(RUN_ID)
+    assert checkpoint_attributes["agent.tool_call.id"] == "edit-observed"
+    payload = telemetry.metrics.render().decode("utf-8")
+    assert 'agent_platform_checkpoints_total{outcome="success"} 1.0' in payload
+    assert "agent_platform_checkpoint_duration_seconds_count 1.0" in payload
+    assert "changed" not in payload
+    telemetry.shutdown()
 
 
 async def test_failed_mutation_rolls_back_and_returns_sanitized_tool_failure() -> None:

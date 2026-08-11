@@ -114,10 +114,13 @@ def _run_lease_domain(
         attempt=run.attempt,
         priority=run.priority,
         priority_class=RunPriorityClass(run.priority_class),
+        queued_at=run.created_at,
         acquired_at=record.acquired_at,
         expires_at=record.expires_at,
         checkpoint_id=run.last_checkpoint_id,
         cancellation_requested=run.cancellation_requested,
+        traceparent=run.traceparent,
+        tracestate=run.tracestate,
     )
 
 

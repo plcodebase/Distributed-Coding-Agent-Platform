@@ -13,7 +13,7 @@ from agent_core.domain.models import IdentifierString  # noqa: TC001 - runtime f
 from agent_core.gateway import GatewayRequestIdentifier  # noqa: TC001 - runtime field
 
 if TYPE_CHECKING:
-    from datetime import timedelta
+    from datetime import datetime, timedelta
 
 
 class CapacityScope(StrEnum):
@@ -127,6 +127,13 @@ class QueueSnapshot(DomainModel):
     captured_at: AwareTimestamp
 
 
+class QueueMonitor(Protocol):
+    """Read-only queue pressure boundary used by metrics and admission control."""
+
+    async def snapshot(self, *, occurred_at: datetime) -> QueueSnapshot:
+        """Return one point-in-time bounded queue snapshot."""
+
+
 __all__ = [
     "CapacityRejection",
     "CapacityScope",
@@ -134,6 +141,7 @@ __all__ = [
     "GatewayCapacityLease",
     "GatewayCapacityStore",
     "QueueDepth",
+    "QueueMonitor",
     "QueueSnapshot",
     "TenantQuota",
 ]
