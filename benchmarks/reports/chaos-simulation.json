@@ -1,0 +1,579 @@
+{
+  "report_version": "agent-chaos-v1",
+  "synthetic": true,
+  "result_claim": "simulation_only",
+  "started_at": "2026-08-12T01:45:36.030447Z",
+  "completed_at": "2026-08-12T01:45:36.032771Z",
+  "methodology": [
+    "Scenarios execute serially so infrastructure faults cannot overlap.",
+    "A successful fault command is insufficient; every expected invariant is evaluated.",
+    "Cleanup has an independent deadline and runs after success, failure, or cancellation.",
+    "Synthetic observations validate harness behavior only."
+  ],
+  "environment": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "python": "3.12.13",
+    "logical_cpus": 8,
+    "physical_memory_bytes": 34359738368
+  },
+  "source": {
+    "revision": "unavailable",
+    "dirty": null
+  },
+  "results": [
+    {
+      "scenario": {
+        "name": "active-worker-termination",
+        "scenario": "worker_termination",
+        "fault": {
+          "action": "terminate",
+          "target": "active_worker"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "An accepted run is actively leased by the exact allowlisted worker container.",
+          "At least one replacement worker is healthy and can claim expired leases."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [
+            "worker_lost"
+          ],
+          "required_signals": [
+            "worker_recovery",
+            "queue_recovery"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.030910Z",
+      "completed_at": "2026-08-12T01:45:36.031644Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": "worker_lost",
+        "recovery_seconds": 0.0005651669343933463,
+        "evidence": [
+          {
+            "signal": "worker_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          },
+          {
+            "signal": "queue_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "redis-restart",
+        "scenario": "redis_restart",
+        "fault": {
+          "action": "restart",
+          "target": "redis"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 60.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "Redis is healthy and the accepted run is durably queued in PostgreSQL."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "queue_recovery"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.031659Z",
+      "completed_at": "2026-08-12T01:45:36.031807Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.00004841596819460392,
+        "evidence": [
+          {
+            "signal": "queue_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "postgres-interruption",
+        "scenario": "postgres_interruption",
+        "fault": {
+          "action": "block",
+          "target": "postgres"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "PostgreSQL is healthy and an accepted run ID has been recorded before interruption."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending",
+            "failed"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "api_error",
+            "queue_recovery"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.031813Z",
+      "completed_at": "2026-08-12T01:45:36.031942Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.00003970903344452381,
+        "evidence": [
+          {
+            "signal": "api_error",
+            "source": "simulation",
+            "observed_value": 1.0
+          },
+          {
+            "signal": "queue_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "primary-provider-disabled",
+        "scenario": "primary_provider_disabled",
+        "fault": {
+          "action": "disable",
+          "target": "primary_provider"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "The primary and secondary deterministic providers are healthy before the fault.",
+          "The route has bounded fallback enabled."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [
+            "provider_unavailable"
+          ],
+          "required_signals": [
+            "provider_fallback"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.031947Z",
+      "completed_at": "2026-08-12T01:45:36.032070Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": "provider_unavailable",
+        "recovery_seconds": 0.000039958045817911625,
+        "evidence": [
+          {
+            "signal": "provider_fallback",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "gateway-rate-limit",
+        "scenario": "gateway_rate_limit",
+        "fault": {
+          "action": "return_429",
+          "target": "gateway_route"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "The deterministic gateway route is configured to return a bounded sequence of 429 responses."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending",
+            "failed"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [
+            "rate_limit"
+          ],
+          "required_signals": [
+            "gateway_retry"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032075Z",
+      "completed_at": "2026-08-12T01:45:36.032191Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": "rate_limit",
+        "recovery_seconds": 0.00003583403304219246,
+        "evidence": [
+          {
+            "signal": "gateway_retry",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "websocket-disconnect",
+        "scenario": "websocket_disconnect",
+        "fault": {
+          "action": "disconnect",
+          "target": "event_client"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 60.0,
+        "cleanup_timeout_seconds": 15.0,
+        "preconditions": [
+          "The client has persisted the last observed event sequence before disconnecting."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "running",
+            "completed",
+            "failed"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "event_replay"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032195Z",
+      "completed_at": "2026-08-12T01:45:36.032307Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "running",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.00003487500362098217,
+        "evidence": [
+          {
+            "signal": "event_replay",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "sandbox-oom",
+        "scenario": "sandbox_oom",
+        "fault": {
+          "action": "force_oom",
+          "target": "sandbox_process"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "The test sandbox uses a deliberately small documented memory limit.",
+          "The workload allocates memory only inside the isolated sandbox."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "failed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 0,
+          "durable_event_continuity": true,
+          "retry_categories": [
+            "sandbox_oom"
+          ],
+          "required_signals": [
+            "sandbox_failure"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032310Z",
+      "completed_at": "2026-08-12T01:45:36.032424Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "failed",
+        "committed_changes": 0,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": "sandbox_oom",
+        "recovery_seconds": 0.000034374999813735485,
+        "evidence": [
+          {
+            "signal": "sandbox_failure",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "duplicate-task-delivery",
+        "scenario": "duplicate_task_delivery",
+        "fault": {
+          "action": "duplicate_task",
+          "target": "durable_task"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 60.0,
+        "cleanup_timeout_seconds": 15.0,
+        "preconditions": [
+          "The same durable task identity and generation are delivered twice."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "queue_recovery"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032428Z",
+      "completed_at": "2026-08-12T01:45:36.032538Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.00003408303018659353,
+        "evidence": [
+          {
+            "signal": "queue_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "duplicate-tool-call",
+        "scenario": "duplicate_tool_call",
+        "fault": {
+          "action": "duplicate_tool",
+          "target": "tool_delivery"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 60.0,
+        "cleanup_timeout_seconds": 15.0,
+        "preconditions": [
+          "The same tool-call ID and canonical argument hash are delivered twice."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "tool_replay"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032541Z",
+      "completed_at": "2026-08-12T01:45:36.032651Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.000034208991564810276,
+        "evidence": [
+          {
+            "signal": "tool_replay",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    },
+    {
+      "scenario": {
+        "name": "checkpoint-interruption",
+        "scenario": "checkpoint_interruption",
+        "fault": {
+          "action": "interrupt_checkpoint",
+          "target": "checkpoint_worker"
+        },
+        "fault_timeout_seconds": 30.0,
+        "recovery_timeout_seconds": 120.0,
+        "cleanup_timeout_seconds": 30.0,
+        "preconditions": [
+          "A worker is interrupted between checkpoint intent and durable completion.",
+          "A replacement worker can acquire a newer lease generation."
+        ],
+        "expected": {
+          "allowed_final_states": [
+            "completed",
+            "retry_pending"
+          ],
+          "accepted_task_visible": true,
+          "max_committed_changes": 1,
+          "durable_event_continuity": true,
+          "retry_categories": [],
+          "required_signals": [
+            "checkpoint_recovery",
+            "worker_recovery"
+          ]
+        }
+      },
+      "started_at": "2026-08-12T01:45:36.032655Z",
+      "completed_at": "2026-08-12T01:45:36.032767Z",
+      "observation": {
+        "fault_observed": true,
+        "recovered": true,
+        "accepted_task_visible": true,
+        "final_state": "completed",
+        "committed_changes": 1,
+        "durable_event_count": 3,
+        "durable_event_contiguous": true,
+        "retry_category": null,
+        "recovery_seconds": 0.00003533298149704933,
+        "evidence": [
+          {
+            "signal": "checkpoint_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          },
+          {
+            "signal": "worker_recovery",
+            "source": "simulation",
+            "observed_value": 1.0
+          }
+        ]
+      },
+      "failures": [],
+      "error_category": null,
+      "passed": true
+    }
+  ]
+}

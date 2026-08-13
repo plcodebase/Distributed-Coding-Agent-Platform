@@ -1,0 +1,26 @@
+FROM python:3.12.11-slim-bookworm AS build
+
+ARG UV_VERSION=0.8.14
+WORKDIR /workspace
+
+RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
+
+COPY pyproject.toml uv.lock ./
+COPY apps ./apps
+COPY packages ./packages
+RUN uv sync --frozen --no-dev
+
+FROM python:3.12.11-slim-bookworm
+
+ENV PATH="/workspace/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN groupadd --gid 65532 agent-platform \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin agent-platform
+
+WORKDIR /workspace
+COPY --from=build --chown=65532:65532 /workspace /workspace
+USER 65532:65532
+
+ENTRYPOINT ["python"]

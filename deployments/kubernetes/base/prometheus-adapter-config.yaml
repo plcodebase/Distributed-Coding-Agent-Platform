@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: agent-platform-prometheus-adapter-rules}
+data:
+  config.yaml: |
+    externalRules:
+      - seriesQuery: 'agent_platform_queue_depth{priority!=""}'
+        resources: {overrides: {namespace: {resource: namespace}}}
+        name: {matches: '^agent_platform_queue_depth$', as: agent_platform_queue_depth_total}
+        metricsQuery: 'sum(agent_platform_queue_depth{<<.LabelMatchers>>})'
+      - seriesQuery: 'agent_platform_oldest_queued_seconds'
+        resources: {overrides: {namespace: {resource: namespace}}}
+        name: {matches: '^agent_platform_oldest_queued_seconds$'}
+        metricsQuery: 'max(agent_platform_oldest_queued_seconds{<<.LabelMatchers>>})'
+      - seriesQuery: 'agent_platform_api_requests_total{route!=""}'
+        resources: {overrides: {namespace: {resource: namespace}}}
+        name: {matches: '^agent_platform_api_requests_total$', as: agent_platform_api_requests_per_second}
+        metricsQuery: 'sum(rate(agent_platform_api_requests_total{<<.LabelMatchers>>}[2m]))'
+      - seriesQuery: 'litellm_active_requests'
+        resources: {overrides: {namespace: {resource: namespace}}}
+        name: {matches: '^litellm_active_requests$'}
+        metricsQuery: 'sum(litellm_active_requests{<<.LabelMatchers>>})'
+      - seriesQuery: 'litellm_request_total_latency_metric_bucket'
+        resources: {overrides: {namespace: {resource: namespace}}}
+        name: {matches: '^litellm_request_total_latency_metric_bucket$', as: litellm_request_latency_p95_seconds}
+        metricsQuery: 'histogram_quantile(0.95, sum(rate(litellm_request_total_latency_metric_bucket{<<.LabelMatchers>>}[2m])) by (le))'

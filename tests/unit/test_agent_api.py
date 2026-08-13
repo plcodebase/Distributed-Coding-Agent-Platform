@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import uuid
 from collections import deque
@@ -14,10 +15,16 @@ from starlette.websockets import WebSocketDisconnect
 
 from agent_api import (
     ApiServices,
+    EventGatewayServices,
     Principal,
     RequestBodyLimitMiddleware,
     StaticTokenAuthenticator,
     create_app,
+    create_event_gateway_app,
+)
+from agent_api.event_factory import (
+    EventGatewaySettings,
+    create_production_event_gateway_app,
 )
 from agent_api.factory import AgentApiSettings, _credentials
 from agent_core.control import (
@@ -473,6 +480,163 @@ def test_health_and_authentication_boundary() -> None:
     assert unauthenticated.status_code == 401
     assert unauthenticated.headers["www-authenticate"] == "Bearer"
     assert unauthenticated.json()["error"]["code"] == "authentication_required"
+
+
+def test_event_gateway_exposes_only_health_metrics_and_event_routes() -> None:
+    api_services, sessions, runs, events = services()
+    now = datetime.now(UTC)
+    session = _session(TENANT_A, now)
+    run = _run(session, now)
+    sessions.values[(TENANT_A, session.id)] = session
+    runs.values[(TENANT_A, run.id)] = run
+    events.values[(TENANT_A, run.id)] = (_event(run.id, 1, now),)
+    event_services = EventGatewayServices(
+        authenticator=api_services.authenticator,
+        runs=runs,
+        events=events,
+        readiness=api_services.readiness,
+    )
+    application = create_event_gateway_app(event_services)
+    client = TestClient(application)
+
+    response = client.get(f"/v1/runs/{run.id}/events", headers=authorization())
+    assert response.status_code == 200
+    assert len(response.json()["events"]) == 1
+    assert client.get("/health/ready").status_code == 200
+    assert client.post("/v1/sessions", headers=authorization(), json={}).status_code == 404
+    paths = {
+        path
+        for route in application.routes
+        if isinstance(path := getattr(route, "path", None), str)
+    }
+    assert "/v1/sessions" not in paths
+    assert "/v1/runs/{run_id}/cancel" not in paths
+
+
+def test_event_gateway_health_auth_validation_metrics_and_close() -> None:
+    api_services, _, runs, events = services()
+    close_calls = 0
+
+    async def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    event_services = EventGatewayServices(
+        authenticator=api_services.authenticator,
+        runs=runs,
+        events=events,
+        readiness=ReadinessFake(False),
+    )
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="event-gateway"))
+    token = "event-metrics-token"  # noqa: S105 - inert test credential
+    application = create_event_gateway_app(
+        event_services,
+        close=close,
+        telemetry=telemetry,
+        metrics_token=token,
+    )
+    with TestClient(application) as client:
+        assert client.get("/health/live").json() == {"status": "ok"}
+        assert client.get("/health/ready").status_code == 503
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/metrics", headers=authorization("wrong-token")).status_code == 401
+        metrics = client.get("/metrics", headers=authorization(token))
+        assert metrics.status_code == 200
+        assert "agent_platform" in metrics.text
+        run_id = uuid.uuid4()
+        assert client.get(f"/v1/runs/{run_id}/events").status_code == 401
+        assert (
+            client.get(
+                f"/v1/runs/{run_id}/events?limit=0",
+                headers=authorization(),
+            ).status_code
+            == 422
+        )
+        missing = client.get(f"/v1/runs/{run_id}/events", headers=authorization())
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "resource_not_found"
+    assert close_calls == 1
+    telemetry.shutdown()
+
+    no_metrics = TestClient(create_event_gateway_app(event_services))
+    assert no_metrics.get("/metrics").status_code == 404
+    with pytest.raises(ValueError, match="body_bytes"):
+        create_event_gateway_app(event_services, max_request_body_bytes=0)
+    with pytest.raises(ValueError, match="metrics_token"):
+        create_event_gateway_app(
+            event_services,
+            metrics_token="short",  # noqa: S106 - deliberately invalid test value
+        )
+
+
+def test_event_gateway_websocket_auth_not_found_replay_and_reconnect_metric() -> None:
+    api_services, sessions, runs, events = services()
+    now = datetime.now(UTC)
+    session = _session(TENANT_A, now)
+    run = _run(session, now)
+    sessions.values[(TENANT_A, session.id)] = session
+    runs.values[(TENANT_A, run.id)] = run
+    events.values[(TENANT_A, run.id)] = (_event(run.id, 1, now), _event(run.id, 2, now))
+    event_services = EventGatewayServices(
+        authenticator=api_services.authenticator,
+        runs=runs,
+        events=events,
+        readiness=api_services.readiness,
+    )
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="event-gateway-websocket"))
+    client = TestClient(create_event_gateway_app(event_services, telemetry=telemetry))
+
+    with (
+        pytest.raises(WebSocketDisconnect) as unauthenticated,
+        client.websocket_connect(f"/v1/runs/{run.id}/stream"),
+    ):
+        pass
+    assert unauthenticated.value.code == 4401
+    with (
+        pytest.raises(WebSocketDisconnect) as missing,
+        client.websocket_connect(
+            f"/v1/runs/{uuid.uuid4()}/stream",
+            headers=authorization(),
+        ),
+    ):
+        pass
+    assert missing.value.code == 4404
+    with client.websocket_connect(
+        f"/v1/runs/{run.id}/stream?after=1",
+        headers=authorization(),
+    ) as websocket:
+        assert websocket.receive_json()["sequence"] == 2
+    rendered = telemetry.metrics.render().decode("utf-8")
+    assert "agent_platform_event_reconnects_total 1.0" in rendered
+    telemetry.shutdown()
+
+
+def test_production_event_gateway_factory_builds_event_only_graph() -> None:
+    credentials = json.dumps(
+        {
+            TOKEN_A: {
+                "tenant_id": str(TENANT_A),
+                "subject": "event-reader",
+            }
+        }
+    )
+    application = create_production_event_gateway_app(
+        event_settings=EventGatewaySettings(
+            event_credentials_json=credentials,
+            telemetry_environment="test",
+            metrics_token="event-metrics-token",  # noqa: S106 - inert test credential
+        )
+    )
+
+    with TestClient(application) as client:
+        assert client.get("/health/live").status_code == 200
+        paths = {
+            path
+            for route in application.routes
+            if isinstance(path := getattr(route, "path", None), str)
+        }
+        assert "/v1/runs/{run_id}/events" in paths
+        assert "/v1/sessions" not in paths
 
 
 def test_authentication_and_validation_failures_are_header_safe_and_opaque() -> None:

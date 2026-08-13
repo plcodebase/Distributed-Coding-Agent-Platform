@@ -1,0 +1,219 @@
+- id: failing-test-01
+  category: fix_failing_test
+  fixture_template: fix_failing_test
+  variant: 1
+  instruction: Fix the arithmetic defect and preserve the typed public API.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [calculator_1.py]
+- id: failing-test-02
+  category: fix_failing_test
+  fixture_template: fix_failing_test
+  variant: 2
+  instruction: Diagnose the failing addition test and implement the smallest correct fix.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [calculator_2.py]
+- id: failing-test-03
+  category: fix_failing_test
+  fixture_template: fix_failing_test
+  variant: 3
+  instruction: Make the existing calculator test pass without weakening its assertion.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [calculator_3.py]
+
+- id: api-endpoint-01
+  category: api_endpoint
+  fixture_template: api_endpoint
+  variant: 1
+  instruction: Add the requested health route to the small typed route registry.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [api_1.py, test_api_1.py]
+- id: api-endpoint-02
+  category: api_endpoint
+  fixture_template: api_endpoint
+  variant: 2
+  instruction: Implement a status endpoint while preserving the existing route contract.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [api_2.py, test_api_2.py]
+- id: api-endpoint-03
+  category: api_endpoint
+  fixture_template: api_endpoint
+  variant: 3
+  instruction: Extend the API registry with a readiness endpoint and focused tests.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [api_3.py, test_api_3.py]
+
+- id: type-error-01
+  category: type_error
+  fixture_template: type_error
+  variant: 1
+  instruction: Resolve the return-type error without suppressing the type checker.
+  verification: [{argv: [python, -m, mypy, --strict, typed_1.py]}]
+  expected_changed_paths: [typed_1.py]
+- id: type-error-02
+  category: type_error
+  fixture_template: type_error
+  variant: 2
+  instruction: Correct the typed length helper and retain its declared interface.
+  verification: [{argv: [python, -m, mypy, --strict, typed_2.py]}]
+  expected_changed_paths: [typed_2.py]
+- id: type-error-03
+  category: type_error
+  fixture_template: type_error
+  variant: 3
+  instruction: Fix the strict typing failure with executable behavior unchanged.
+  verification: [{argv: [python, -m, mypy, --strict, typed_3.py]}]
+  expected_changed_paths: [typed_3.py]
+
+- id: multi-file-rename-01
+  category: multi_file_rename
+  fixture_template: multi_file_rename
+  variant: 1
+  instruction: Rename old_name to current_name across implementation, consumers, and tests.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [service_1.py, consumer_1.py, test_rename_1.py]
+- id: multi-file-rename-02
+  category: multi_file_rename
+  fixture_template: multi_file_rename
+  variant: 2
+  instruction: Perform the requested public-symbol rename without leaving stale imports.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [service_2.py, consumer_2.py, test_rename_2.py]
+- id: multi-file-rename-03
+  category: multi_file_rename
+  fixture_template: multi_file_rename
+  variant: 3
+  instruction: Apply a repository-wide function rename and update its focused coverage.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [service_3.py, consumer_3.py, test_rename_3.py]
+
+- id: input-validation-01
+  category: input_validation
+  fixture_template: input_validation
+  variant: 1
+  instruction: Reject booleans and ports outside the valid TCP range with focused tests.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [validation_1.py, test_validation_1.py]
+- id: input-validation-02
+  category: input_validation
+  fixture_template: input_validation
+  variant: 2
+  instruction: Add closed integer validation to the port boundary.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [validation_2.py, test_validation_2.py]
+- id: input-validation-03
+  category: input_validation
+  fixture_template: input_validation
+  variant: 3
+  instruction: Harden the port parser against invalid types and out-of-range values.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [validation_3.py, test_validation_3.py]
+
+- id: dedup-refactor-01
+  category: dedup_refactor
+  fixture_template: dedup_refactor
+  variant: 1
+  instruction: Remove the duplicated increment logic without changing public behavior.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dedup_1.py, test_dedup_1.py]
+- id: dedup-refactor-02
+  category: dedup_refactor
+  fixture_template: dedup_refactor
+  variant: 2
+  instruction: Extract the duplicated behavior into one typed private helper.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dedup_2.py, test_dedup_2.py]
+- id: dedup-refactor-03
+  category: dedup_refactor
+  fixture_template: dedup_refactor
+  variant: 3
+  instruction: Refactor the duplicate functions while preserving both entry points.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dedup_3.py, test_dedup_3.py]
+
+- id: dependency-usage-01
+  category: dependency_usage
+  fixture_template: dependency_usage
+  variant: 1
+  instruction: Use the existing JSON dependency to produce deterministic encoded output.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dependency_1.py, test_dependency_1.py]
+- id: dependency-usage-02
+  category: dependency_usage
+  fixture_template: dependency_usage
+  variant: 2
+  instruction: Replace the ad hoc string conversion with canonical JSON encoding.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dependency_2.py, test_dependency_2.py]
+- id: dependency-usage-03
+  category: dependency_usage
+  fixture_template: dependency_usage
+  variant: 3
+  instruction: Correctly apply the already-imported serializer and add edge-case coverage.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [dependency_3.py, test_dependency_3.py]
+
+- id: concurrency-bug-01
+  category: concurrency_bug
+  fixture_template: concurrency_bug
+  variant: 1
+  instruction: Make concurrent increments deterministic without blocking the event loop.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [counter_1.py, test_counter_1.py]
+- id: concurrency-bug-02
+  category: concurrency_bug
+  fixture_template: concurrency_bug
+  variant: 2
+  instruction: Protect the shared asynchronous counter from lost updates.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [counter_2.py, test_counter_2.py]
+- id: concurrency-bug-03
+  category: concurrency_bug
+  fixture_template: concurrency_bug
+  variant: 3
+  instruction: Fix the counter race and add a deterministic concurrent regression test.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [counter_3.py, test_counter_3.py]
+
+- id: missing-tests-01
+  category: missing_tests
+  fixture_template: missing_tests
+  variant: 1
+  instruction: Add boundary-focused tests for normalization without changing its API.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [test_normalize_1.py]
+- id: missing-tests-02
+  category: missing_tests
+  fixture_template: missing_tests
+  variant: 2
+  instruction: Expand coverage for whitespace, case folding, and empty input.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [test_normalize_2.py]
+- id: missing-tests-03
+  category: missing_tests
+  fixture_template: missing_tests
+  variant: 3
+  instruction: Write concise regression tests for the existing normalize helper.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [test_normalize_3.py]
+
+- id: diagnose-exception-01
+  category: diagnose_exception
+  fixture_template: diagnose_exception
+  variant: 1
+  instruction: Diagnose the malformed-input exception and return a structured validation error.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [parser_1.py, test_parser_1.py]
+- id: diagnose-exception-02
+  category: diagnose_exception
+  fixture_template: diagnose_exception
+  variant: 2
+  instruction: Reproduce and fix the parser index exception without hiding valid errors.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [parser_2.py, test_parser_2.py]
+- id: diagnose-exception-03
+  category: diagnose_exception
+  fixture_template: diagnose_exception
+  variant: 3
+  instruction: Explain the parser failure in code and add focused malformed-input handling.
+  verification: [{argv: [python, -m, pytest, -q]}]
+  expected_changed_paths: [parser_3.py, test_parser_3.py]

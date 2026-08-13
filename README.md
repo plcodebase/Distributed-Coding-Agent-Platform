@@ -457,6 +457,62 @@ and passing live evidence must contain positive Prometheus observations. Live dr
 are supplied through a trusted composition factory and service restoration is ordered
 so the intended fault remains active during observation where required.
 
+### Sequence 29: Kubernetes deployment manifests
+
+Sequence 29 adds a Kustomize base for independently scaled API, event gateway,
+scheduler, worker, and LiteLLM workloads. Every workload has a separate token-free
+ServiceAccount, zero Kubernetes API privileges, non-root/read-only/seccomp security
+contexts, resource bounds, probes, disruption budgets, topology spread, and anti-affinity. Workers
+target dedicated sandbox nodes. NetworkPolicy defaults to deny; only LiteLLM receives
+provider credentials and public provider egress. Secrets use exact key references, metrics producers
+declare scrape endpoints, and the event gateway has an event-only route/dependency graph. Managed
+data services, durable workspace snapshots, Secrets,
+ingress/TLS, image digests, and cluster-specific sandbox composition remain
+operator-supplied overlays. A fail-closed static validator checks these contracts
+without requiring a cluster.
+
+### Sequence 30: autoscaling, draining, and deployment verification
+
+Sequence 30 adds API request/CPU, worker queue-depth/oldest-age, and LiteLLM
+active-request/p95-latency HPAs plus Prometheus Adapter rules. A bounded operations
+server provides liveness, readiness, metrics, and a loopback-only idempotent drain
+operation. Kubernetes `preStop` removes worker readiness and signals the existing
+durable service drain; force termination remains recoverable through leases and
+checkpoints. The concrete bounded Kubernetes deployment driver preflights custom metrics and records
+HPA desired replicas, pod identities, task state, recovery timing, and commit counts through an
+injected authenticated task probe. It separates live cluster evidence from
+a deterministic CI state machine that proves accepted-task conservation, scale-up,
+active drain, abrupt recovery, and duplicate suppression.
+
+### Sequence 31: deterministic coding-task evaluation
+
+Sequence 31 versions 30 tasks across all ten design categories. Every fixture has a meaningful
+deficiency and a hidden immutable reference verifier; placeholder tests are forbidden. Fixtures are
+bounded, private, contained, and supplied to an injected evaluation driver; verification
+commands are declarative and never run on the host. The harness derives changed paths from bounded
+pre/post workspace manifests and requires exact typed verification evidence. Reports record
+task/test outcome,
+iterations, tool calls, tokens, cost, queue/first-token/total latency, retries,
+fallbacks, permission denials, changed paths, commit counts, and task/fixture/verifier/corpus
+digests. Driver failures and
+timeouts remain per-task structured results. CI simulation verifies the harness only;
+live coding-success measurements require a deployment identity and hardened Podman
+verification.
+
+### Sequence 32: evidence-gated final report and architecture documentation
+
+Sequence 32 validates and combines deployment, coding, load, chaos, and quality-gate artifacts under
+one revision-aware report. It records SHA-256 artifact integrity, methodology,
+environment/hardware, acceptance status, measured metrics, and limitations. Duplicate
+JSON keys, schema/version conflicts, mixed revisions, inconsistent outcomes, and
+optional trusted-index digest mismatches fail closed. Campaign completeness requires both deployment
+modes, all coding categories, every load/chaos scenario, and all fixed quality gates. Load outcomes
+use scenario-specific expectations. Performance metrics can come only from live artifacts;
+simulation-only inputs leave the report explicitly incomplete. Unchanged source artifacts compile
+to byte-identical final reports.
+Consolidated architecture, deployment, reliability, and evaluation guides record the
+production boundaries and remaining external acceptance work.
+
 ## Local setup
 
 ```shell
@@ -491,6 +547,12 @@ ID. The same application-owned `PlatformTelemetry` instance should be injected i
 the worker, executor, agent loop, gateway client, queue monitor, and sandbox so child
 spans and metrics share one lifecycle. These are deployment composition references,
 not model- or user-controlled values.
+
+Kubernetes deployment starts at
+[`deployments/kubernetes/README.md`](deployments/kubernetes/README.md). The base must
+be completed by a production overlay and a trusted worker/scheduler composition; it is
+not safe to give worker pods a broad host Podman socket. Static manifests and simulated
+benchmark reports are not evidence of live horizontal scaling or coding performance.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
 sandbox environments.

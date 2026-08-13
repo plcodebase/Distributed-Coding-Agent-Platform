@@ -12,6 +12,7 @@ import signal
 from typing import TYPE_CHECKING, cast
 
 from agent_worker.service import WorkerService
+from platform_telemetry import OperationsServer, OperationsServerSettings
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -29,6 +30,7 @@ type WorkerServiceFactory = Callable[[int], WorkerService | Awaitable[WorkerServ
 _FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_LOCAL_WORKER_PROCESSES = 3
 MAX_LOCAL_WORKER_PROCESSES = 64
+DEFAULT_OPERATIONS_PORT = 9090
 
 
 def load_worker_factory(specification: str) -> WorkerServiceFactory:
@@ -47,17 +49,22 @@ def run_worker_fleet(
     factory_specification: str,
     *,
     process_count: int = DEFAULT_LOCAL_WORKER_PROCESSES,
+    operations_port: int | None = None,
 ) -> None:
     """Run a local multi-process worker fleet until every child exits."""
 
     if type(process_count) is not int or not 1 <= process_count <= MAX_LOCAL_WORKER_PROCESSES:
         raise ValueError(f"process_count must be in [1, {MAX_LOCAL_WORKER_PROCESSES}]")
+    if operations_port is not None and (
+        type(operations_port) is not int or not 1 <= operations_port <= 65_535 - process_count + 1
+    ):
+        raise ValueError("operations_port does not leave one valid port per process")
     load_worker_factory(factory_specification)
     context = multiprocessing.get_context("spawn")
     processes = [
         context.Process(
             target=_worker_process_main,
-            args=(factory_specification, index),
+            args=(factory_specification, index, operations_port),
             name=f"agent-worker-{index + 1}",
         )
         for index in range(process_count)
@@ -91,11 +98,26 @@ def _wait_for_processes(
         pending = still_running
 
 
-def _worker_process_main(factory_specification: str, index: int) -> None:
-    asyncio.run(_serve_worker(load_worker_factory(factory_specification), index))
+def _worker_process_main(
+    factory_specification: str,
+    index: int,
+    operations_port: int | None,
+) -> None:
+    asyncio.run(
+        _serve_worker(
+            load_worker_factory(factory_specification),
+            index,
+            operations_port=(operations_port + index if operations_port is not None else None),
+        )
+    )
 
 
-async def _serve_worker(factory: WorkerServiceFactory, index: int) -> None:
+async def _serve_worker(
+    factory: WorkerServiceFactory,
+    index: int,
+    *,
+    operations_port: int | None = None,
+) -> None:
     service = factory(index)
     if inspect.isawaitable(service):
         service = await service
@@ -105,7 +127,24 @@ async def _serve_worker(factory: WorkerServiceFactory, index: int) -> None:
     loop = asyncio.get_running_loop()
     for signal_number in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signal_number, stop.set)
-    await service.serve(stop)
+    operations: OperationsServer | None = None
+    if operations_port is not None:
+        operations = OperationsServer(
+            live=lambda: True,
+            ready=lambda: service.ready,
+            metrics=service.render_metrics,
+            drain=stop.set,
+            settings=OperationsServerSettings(
+                host="0.0.0.0",  # noqa: S104 - ingress is restricted by NetworkPolicy
+                port=operations_port,
+            ),
+        )
+        await operations.start()
+    try:
+        await service.serve(stop)
+    finally:
+        if operations is not None:
+            await operations.aclose()
 
 
 def main(arguments: Sequence[str] | None = None) -> None:
@@ -116,12 +155,18 @@ def main(arguments: Sequence[str] | None = None) -> None:
         type=int,
         default=DEFAULT_LOCAL_WORKER_PROCESSES,
     )
+    parser.add_argument("--operations-port", type=int)
     parsed = parser.parse_args(arguments)
-    run_worker_fleet(parsed.factory, process_count=parsed.processes)
+    run_worker_fleet(
+        parsed.factory,
+        process_count=parsed.processes,
+        operations_port=parsed.operations_port,
+    )
 
 
 __all__ = [
     "DEFAULT_LOCAL_WORKER_PROCESSES",
+    "DEFAULT_OPERATIONS_PORT",
     "MAX_LOCAL_WORKER_PROCESSES",
     "WorkerServiceFactory",
     "load_worker_factory",

@@ -105,6 +105,17 @@ class WorkerService:
     def draining(self) -> bool:
         return self._draining
 
+    @property
+    def ready(self) -> bool:
+        """A worker is ready only after registration and before drain begins."""
+
+        return self._registered and not self._draining and self._fatal_error is None
+
+    def render_metrics(self) -> bytes:
+        """Render this process's bounded Prometheus registry."""
+
+        return self._telemetry.metrics.render() if self._telemetry is not None else b""
+
     async def register(self) -> WorkerRegistration:
         async with self._lifecycle_lock:
             if self._registered:

@@ -195,10 +195,21 @@ class ApiServices:
     memories: MemoryRepository | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EventGatewayServices:
+    """Least-privilege dependency graph for event replay and streaming only."""
+
+    authenticator: Authenticator
+    runs: RunRepository
+    events: EventStore
+    readiness: ReadinessProbe
+
+
 __all__ = [
     "ApiServices",
     "ApprovalRepository",
     "ContextRepository",
+    "EventGatewayServices",
     "EventStore",
     "MemoryRepository",
     "ReadinessProbe",

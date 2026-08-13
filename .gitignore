@@ -19,3 +19,11 @@ benchmarks/reports/*.json
 benchmarks/reports/*.md
 !benchmarks/reports/.gitkeep
 !benchmarks/reports/README.md
+!benchmarks/reports/deployment-simulation.json
+!benchmarks/reports/coding-simulation.json
+!benchmarks/reports/load-simulation.json
+!benchmarks/reports/load-simulation-*.json
+!benchmarks/reports/chaos-simulation.json
+!benchmarks/reports/quality-gates.json
+!benchmarks/reports/final-benchmark-report.json
+!benchmarks/reports/final-benchmark-report.md

@@ -49,6 +49,14 @@ class SchedulerService:
         self._memory_processor = memory_processor
         self._queue_monitor = queue_monitor
         self._telemetry = telemetry
+        self._started = False
+
+    @property
+    def ready(self) -> bool:
+        return self._started
+
+    def render_metrics(self) -> bytes:
+        return self._telemetry.metrics.render() if self._telemetry is not None else b""
 
     async def recover_once(self) -> int:
         recovered = await self._queue.recover_expired(
@@ -70,15 +78,19 @@ class SchedulerService:
         return len(recovered)
 
     async def serve(self, stop: asyncio.Event) -> None:
-        while not stop.is_set():
-            recovered = await self.recover_once()
-            memory_processed = (
-                await self._memory_processor.process_once()
-                if self._memory_processor is not None
-                else False
-            )
-            if recovered == 0 and not memory_processed:
-                await self._sleep(self._config.poll_seconds)
+        self._started = True
+        try:
+            while not stop.is_set():
+                recovered = await self.recover_once()
+                memory_processed = (
+                    await self._memory_processor.process_once()
+                    if self._memory_processor is not None
+                    else False
+                )
+                if recovered == 0 and not memory_processed:
+                    await self._sleep(self._config.poll_seconds)
+        finally:
+            self._started = False
 
 
 __all__ = ["SchedulerConfig", "SchedulerService"]

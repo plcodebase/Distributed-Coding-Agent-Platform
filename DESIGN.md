@@ -1243,7 +1243,7 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 28: the worker uses a contributor-based,
+Implementation status through Sequence 32: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
@@ -1305,6 +1305,43 @@ Fault injection has its own deadline, recovery time is measured by the runner, s
 targets are exact, and successful live signal evidence must be positive and sourced
 from Prometheus. The live CLI loads a trusted driver factory and delays target
 restoration until after observation for faults whose continued presence is the test.
+
+Sequences 29 and 30 add a Kustomize base for API, event gateway, scheduler, workers,
+and LiteLLM with separate token-free identities, zero Kubernetes API privileges,
+non-root/read-only/seccomp defaults, resource/probe/disruption/topology policies,
+default-deny networking, explicit anti-affinity, exact Secret-key references, dedicated worker-node
+scheduling, HPA policies, and external
+Prometheus metric rules. Provider credentials and public model-provider egress belong
+only to LiteLLM. The event gateway uses a read-only route/dependency graph rather than the control
+API. Worker and scheduler operations endpoints expose bounded health,
+metrics, and local drain behavior. An offline deployment state machine proves task
+conservation, queue-driven scale decisions, graceful drain, and forced-lease recovery;
+it is labelled simulation-only. A real cluster, external metrics adapter, managed
+service CIDRs, immutable image overlay, externally managed Secrets, and a safe
+cluster-specific Podman sandbox composition and object-backed cross-pod workspace checkpoints remain
+required for live acceptance. A concrete bounded Kubernetes driver can perform the rolling campaign
+when supplied an authenticated task probe; local tests inject fakes and do not contact a cluster.
+
+Sequence 31 adds 30 versioned deterministic coding tasks covering the ten specified
+categories. Each fixture has a real deficiency and hidden immutable verifier. The harness
+materializes private bounded repositories, independently fingerprints pre/post contents, and
+delegates agent
+submission plus sandboxed verification to an injected trusted driver. Per-task reports
+record test outcome, iterations, tools, tokens, cost, queue/first-token/total latency,
+retries, fallbacks, permission denials, measured changed paths, commit count, and task/fixture/
+verifier/corpus digests. Exact verification evidence is required and live evidence identifies
+Podman. Host execution
+of model-authored verification commands is prohibited. CI output is simulation-only;
+a measured success rate requires a live deployment identity.
+
+Sequence 32 adds an evidence compiler for the deployment, coding, load, chaos, and fixed quality-gate
+schemas. It enforces one source revision, records artifact SHA-256 digests, rejects
+duplicate JSON keys and optional trusted-index mismatches, and admits performance
+metrics only from live artifacts. It requires complete mode/category/scenario/gate coverage and
+uses scenario-aware load expectations. Compilation is deterministic for unchanged inputs. The
+committed baseline report is intentionally
+incomplete until external Kubernetes and provider evidence exists. Architecture,
+deployment, reliability, and evaluation guides record the final system boundaries.
 
 ---
 

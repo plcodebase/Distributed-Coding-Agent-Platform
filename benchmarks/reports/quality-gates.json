@@ -1,0 +1,240 @@
+{
+  "report_version": "agent-quality-gates-v1",
+  "result_claim": "measurement",
+  "source_revision": "unavailable",
+  "source_dirty": true,
+  "started_at": "2026-08-13T19:40:34.339382Z",
+  "completed_at": "2026-08-13T19:42:45.935039Z",
+  "environment": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "python": "3.12.13"
+  },
+  "gates": [
+    {
+      "name": "ruff_format",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/ruff",
+            "format",
+            "--check",
+            "apps",
+            "packages",
+            "scripts",
+            "tests",
+            "services/fake-llm/app.py"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 28,
+          "output_sha256": "182404fa45902870dd16303d0beca3229aef8d2e5c0ca3c296d30ddcd1752efd",
+          "duration_seconds": 0.06466591699995661
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "ruff_lint",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/ruff",
+            "check",
+            "apps",
+            "packages",
+            "scripts",
+            "tests",
+            "services/fake-llm/app.py"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 19,
+          "output_sha256": "4295368dcbaf7e5ce5db4c7fb1d41b905335400c2d186b07970fa536f5a7edfa",
+          "duration_seconds": 0.029429374999949687
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "strict_mypy",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/mypy",
+            "apps",
+            "packages",
+            "scripts",
+            "tests"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 45,
+          "output_sha256": "0e5f0fbbd40d4c296e5d4261c8276ccf3154926bb85b32dabec1a11b3797150f",
+          "duration_seconds": 0.8792324580000468
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "unit_coverage",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/pytest",
+            "tests/unit",
+            "--cov",
+            "--cov-report=term-missing"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 17766,
+          "output_sha256": "a04936170687a5613adbdc5dbcda22df9567bcf14170821be494d89f9ef8fd6f",
+          "duration_seconds": 60.93107474999999
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "integration",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/pytest",
+            "tests/integration"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 730,
+          "output_sha256": "881fce7e4947f14240ea2770fd0df1c3ccd5ebd9750b191d3cf1c217249fd81a",
+          "duration_seconds": 5.6823138329999665
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "pre_commit",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/pre-commit",
+            "run",
+            "--all-files"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 320,
+          "output_sha256": "f863a76631d31e0dd7d79e03e0d65453e305826e3aa88f18cfa7aa7caa372436",
+          "duration_seconds": 59.60436025000001
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "dependency_audit",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/uv",
+            "export",
+            "--all-packages",
+            "--frozen",
+            "--no-emit-workspace",
+            "--no-hashes",
+            "--output-file",
+            ".cache/audit-requirements.txt"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 6654,
+          "output_sha256": "de2b8f6f15111e31f500ac06cefb75f3312447899cb91a45953a483bc64652f8",
+          "duration_seconds": 0.039172916999973495
+        },
+        {
+          "argv": [
+            ".venv/bin/pip-audit",
+            "--requirement",
+            ".cache/audit-requirements.txt",
+            "--no-deps",
+            "--disable-pip",
+            "--cache-dir",
+            ".cache/pip-audit"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 265,
+          "output_sha256": "d1d3c35f553d87b1cbc1c8088c9f7d7ddc8191549ab219dc48e001a160af737b",
+          "duration_seconds": 0.8581608750000669
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "frozen_lock",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/uv",
+            "lock",
+            "--check"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 30,
+          "output_sha256": "04defb6694456ce643bf9269f232461f5781437b2594495ee16416f5327209ba",
+          "duration_seconds": 0.05243691700002273
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "package_builds",
+      "commands": [
+        {
+          "argv": [
+            ".venv/bin/uv",
+            "build",
+            "--all-packages"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 2238,
+          "output_sha256": "9993100da9181f2f9b12c9ab907a78b01c44bbdf368b9b966409976f2852b544",
+          "duration_seconds": 3.4088840000000573
+        }
+      ],
+      "passed": true
+    },
+    {
+      "name": "diff_check",
+      "commands": [
+        {
+          "argv": [
+            "/usr/bin/git",
+            "diff",
+            "--check"
+          ],
+          "exit_code": 0,
+          "timed_out": false,
+          "output_truncated": false,
+          "output_bytes": 0,
+          "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "duration_seconds": 0.04395766699997239
+        }
+      ],
+      "passed": true
+    }
+  ],
+  "passed": true
+}

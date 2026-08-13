@@ -1,0 +1,1631 @@
+{
+  "report_version": "agent-coding-eval-v2",
+  "mode": "simulation",
+  "result_claim": "simulation_only",
+  "campaign_id": "baseline-coding",
+  "source_revision": "unavailable",
+  "corpus_sha256": "9fc0567ff5aec5cbed59db9ceca50651f8bad6f45bb290a2c96d00ca4fd2bb2d",
+  "started_at": "2026-08-12T01:45:28.906611Z",
+  "completed_at": "2026-08-12T01:45:29.098377Z",
+  "methodology": [
+    "Materialize each versioned fixture into a private temporary workspace.",
+    "Delegate agent and sandbox execution to an injected trusted driver.",
+    "Record every expected and unexpected outcome with bounded per-task metrics."
+  ],
+  "environment": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "python": "3.12.13",
+    "logical_cpus": 8,
+    "physical_memory_bytes": null,
+    "deployment_id": null
+  },
+  "results": [
+    {
+      "task_id": "failing-test-01",
+      "category": "fix_failing_test",
+      "task_sha256": "e8fd416d1f5500f0ec0c328c25bba93facdc3cc140d5d875bc5d7ab84c57ca61",
+      "fixture_sha256": "1a07cb0d4ee045a70be8909a5c9693991910beb5d2e803c2f77194dd5c10ef19",
+      "verifier_sha256": "688f1d23e8795082ba85b9e513ca6054a24c5da1e167c1a908985c0788b313db",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "calculator_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "f17b3744c375044eeee7cf8bba8b416ee02dfe42371906b10245ae6a015a4836",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "failing-test-02",
+      "category": "fix_failing_test",
+      "task_sha256": "27cde0951bf538d76d1938dbb381ab28c3973e335444ba33b0cb47e4b48276ce",
+      "fixture_sha256": "e0b3d4a797d598e2631122ef7aa1a2cf15e485969b6da2c87a2b4bc3aaa2a349",
+      "verifier_sha256": "99299fc1509b7dca09ece8fbaf3d5c9c4cf3cc6f5c8b171e3f87a3017a25c1ec",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "calculator_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "e35cd711de32836b914b73990599d5c49a4343031f4da5cda17e92289a7510a4",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "failing-test-03",
+      "category": "fix_failing_test",
+      "task_sha256": "64bb48337ea647f88bdbd5b4b76054aca009c9dd8ddfae2956424be03c8349f7",
+      "fixture_sha256": "b64ae7e3f3e78a844981237faeea6100bbb3ae6b558e374d61312a44b0da658b",
+      "verifier_sha256": "0794baa4e689651a63630f8f2d3bec443cb137b71711cfbaedf1da88003f060a",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "calculator_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "93e4081fa0dca6822333d4951f34c2fe62b0460124909179f91f7dda5b08c03e",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "api-endpoint-01",
+      "category": "api_endpoint",
+      "task_sha256": "2fe24b31548db741ae9e91f5c75961001646837d14d961dbc939c832dea9069b",
+      "fixture_sha256": "daa9a242844c8ae780b6030531b4f8169a5e6d9fd54fe0d8ecc1275207bd49d3",
+      "verifier_sha256": "f9ff284d49c737e4adf8e2579615883b2e4519871323669120c3ed4a2fb8dc6f",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "api_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "b0ef610df7af6322750cc9f4d24faabae3c0e09867668599d9ba0eeea53a59b3",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "api-endpoint-02",
+      "category": "api_endpoint",
+      "task_sha256": "7312bce1ce753acfacdb80624f94e87b6ca861ec134c936205de0c986de29978",
+      "fixture_sha256": "423c94b51e13503d2649104ff9a597665a38a58edddc715beacc6eba87c52e68",
+      "verifier_sha256": "991b483368a6b28ae76eb85b4a9102f8d3f7a6b6ee950a325812a9846038a18d",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "api_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "5738ae7981cfe7c346b54cf9d23497da3e27b7f498e9e1888cc866027619bcac",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "api-endpoint-03",
+      "category": "api_endpoint",
+      "task_sha256": "450ad388ca8fa1eb92fcd7bc72b7557b8e7998fcc1b19cf4a63fb3ad6afc563f",
+      "fixture_sha256": "0ed42111dd2267683c5f3a2db970190d71b167c2731e7ae833e3a03e9d1ce0d7",
+      "verifier_sha256": "c0fab6b5612d7e44be0fbd422a2e5f93e9ac41f9176e90da307c4eef577e9334",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "api_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "fd46c90a427fa167f4450c2580138806d903bd530af705d615140dd0008497c4",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "type-error-01",
+      "category": "type_error",
+      "task_sha256": "36836282109d429f8f72c127921846154d74a9554fcda4a933a6604e8f19f8d1",
+      "fixture_sha256": "b4b677c75050702d88b56fc067a905231e125837fbcaaafdbe57ea82b482b552",
+      "verifier_sha256": "de102e305b9fc2c120596e9072837b505a28a4e92bd039aaa34c920f9bda5ad2",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "typed_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "mypy",
+              "--strict",
+              "typed_1.py"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "90e2b68afec9fb5acbed08e123e8c6572dae39bc99224188a08f737ed2af34db",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "type-error-02",
+      "category": "type_error",
+      "task_sha256": "4883601bc01e67072033e3df5045b9e67d6fdd427bac7a8f171309f7ffbb265e",
+      "fixture_sha256": "6eab62b4524f6b64e356f93cb390df78b15bedec6bee095d674af7a35ba74f44",
+      "verifier_sha256": "a5dc160130e58f0bf00562dc80f0db087a79546b4e800583597880d0d7e9f60f",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "typed_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "mypy",
+              "--strict",
+              "typed_2.py"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "41fda8391efb2519ed740fb299057df58285809b3798e8c8c66a289dfe312fd0",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "type-error-03",
+      "category": "type_error",
+      "task_sha256": "5b8599128471ed4d62d1dfb3bdb26dad849e39f32a4f6343637971b50097a66a",
+      "fixture_sha256": "b362d275dbcf46ce35449c75ee774de0ab2f28cba199e22e8042c13bbdb09ba5",
+      "verifier_sha256": "e28879ee4fc446f789b54574cd440cad63c4a0c07de55d9cac3ceff1752d79cc",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "typed_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "mypy",
+              "--strict",
+              "typed_3.py"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "aab0a96e4f5a101b6b90af3df853af89b0f3314ceabf8c4f2af9299b75dae131",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "multi-file-rename-01",
+      "category": "multi_file_rename",
+      "task_sha256": "3cfebbd726b61c49e9490ff22ceb59bb917f21b3c31de743b14e526730aa1da9",
+      "fixture_sha256": "a1c15274537e5da90601b2f580c723cbdc91f1b6e1df918d9c7b79dc5e452ff4",
+      "verifier_sha256": "40d8dee5d0157265bff3072398c452cfa50b0ec1e94dfa70fbf8704e38955f7c",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "consumer_1.py",
+          "service_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "4c06593a0425094a41825c08cc0989a10f4e754d4c9ac7e2b1b40c32f0e7c60a",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "multi-file-rename-02",
+      "category": "multi_file_rename",
+      "task_sha256": "1f355ae86134f1ab9181e86e9f50d9253e4169fadef26fa6f69020f456450bbb",
+      "fixture_sha256": "e73c800876df5b18a120f51a9cafbea09dfeae4d8789bf4808c7e2aecaa8dc72",
+      "verifier_sha256": "45b7ce55b1360e3cf9550583a9ca380b784bb6b3b9eb2a59c158218f5cb85fed",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "consumer_2.py",
+          "service_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "233ab7a8bfc75667cf09a2f9db8e53b5fc3f223ffe6e27e98d7e6434ad4cd902",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "multi-file-rename-03",
+      "category": "multi_file_rename",
+      "task_sha256": "4c5e2532a02f1d6112beec8481c121d4cfd03c7204774fd9090c6a9aabe44be3",
+      "fixture_sha256": "6f040b04c563b8cdeafe0c856fd96e9a8a45b2b5e655f569988906ec5cccdf67",
+      "verifier_sha256": "52895319b104585f6b9a62f092de6b386747138ff639a2944c8277953abc2b57",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "consumer_3.py",
+          "service_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "1cf66482384dabc4a94f63d9f9e6cc581d46a5f4aed36f7eda4769032b00a349",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "input-validation-01",
+      "category": "input_validation",
+      "task_sha256": "c5b17e61e1737c02e82e8a410d7402ab7cdbd90068ab17e31a7bd2aa56e0ca5d",
+      "fixture_sha256": "b8779c2e5adcfff58536bba46b678af09bb8d0ca9f99f283dc08c3aad14c0a22",
+      "verifier_sha256": "156c3482474e2c19631b2616e92c596ac46dc3031003424d2cdead20aa29686c",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "validation_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "598cdadd5b3479bc46f2f7b053e0fd702c260074677a6f3177c6d797fc64d5db",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "input-validation-02",
+      "category": "input_validation",
+      "task_sha256": "6f25d273ecfc675ef2675accc049ad844a862ac5506a4a21e2c4f4ce63042ec6",
+      "fixture_sha256": "3d186a8f029280039db2416fdb7f679a26ee417f616cb62bf9ecdf1f2848fa76",
+      "verifier_sha256": "d2f6eec6ccd49903c828b8e5d72d732925a8033cb1a7b64509dabe79378b751b",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "validation_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "222d8c3972e26b9b0a2d0a34a2adf172ae1f10fababf4ad00f2ec6d7a1125c59",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "input-validation-03",
+      "category": "input_validation",
+      "task_sha256": "31640f783e95992714d6beaa8e32cdf138292f074c73a7eb18d8bb6acc9c0bd2",
+      "fixture_sha256": "d4254b61b73837c9acd541cd6cbf36bcfa117e8cc23cfd7b194b95d02371357c",
+      "verifier_sha256": "8dd288e9d768cefab2b8c7732991c0e2a539b1b1e2fc7398ef3d7f9671f4ded0",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "validation_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "9d514e2173d7af25a9f77787e6c39d6af9e73cbbf6141ced687ac538669f73a9",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dedup-refactor-01",
+      "category": "dedup_refactor",
+      "task_sha256": "b3b20edaa2ca0657a4a4436f68d492f9c3ecdbc286061ce9d51b907df1dcbfaf",
+      "fixture_sha256": "4373102b5b50fde5b0dc2a71bf7015088747dae382a31368f00029c0f78f8579",
+      "verifier_sha256": "4e9c6624c5978f6b801a5f58f18a9cc41cf585b74292320bb2d9088c62fb62f7",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dedup_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "641aa9e9235e55a79a316dbeacf4d978df29c6e823a0a02ed134e87532e09d42",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dedup-refactor-02",
+      "category": "dedup_refactor",
+      "task_sha256": "4ff133761763a7da5dafbbcc8f755dcc9c3a236641fde494e7e4952fe77cce35",
+      "fixture_sha256": "6f28f7ce18a9f75ba826cb803e160c251f3031bbf7b339fb53c0c901784050f0",
+      "verifier_sha256": "937be79afcba56aa677d4d4c1c2cbfc4083cdedf5f31d1e4370092621a922430",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dedup_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "5cf8dc389d71b23e422dcfcc8c5d8d529477a6515eff655fdb57fd81920ba391",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dedup-refactor-03",
+      "category": "dedup_refactor",
+      "task_sha256": "6553c60106431ed589e3f6723e7a3308bf444c5393aa4ab71990f7b11b5cda62",
+      "fixture_sha256": "f8656ac27d9c68f051f445ecdc3bf3a2df3c2976adc6ea49b2b52da1a9600268",
+      "verifier_sha256": "c7e84b65f9d847a63048e71f7220c0e58ec0152422ba85d9bfbb4da08693f727",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dedup_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "a4ee80200ea24abb50eeedd036946c90fa20d35306f36e74baac3e233fda48f5",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dependency-usage-01",
+      "category": "dependency_usage",
+      "task_sha256": "ca92bcb540d04b10c80702383690d9b05b0714c44c471e1563b92545cae004cc",
+      "fixture_sha256": "afe7ccea2afe6b9344cc796b3530c540b4a9969fb377ea21405a147441ea8638",
+      "verifier_sha256": "e7d6dd01be8d0d19f7d1da03bb712e5309be2711c6c972e19579d3f96aa71869",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dependency_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "2a612ce2875614e06ab91b85c9530bbc8ce3ae862cf9bbf94f56c4c6cedb420f",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dependency-usage-02",
+      "category": "dependency_usage",
+      "task_sha256": "bdb0e3d3cbf8b30c2a70be2f49198e0cc47b220cdb0fa8efe3563e75e716df0e",
+      "fixture_sha256": "1b54a5afd5c53378cc539b321c0bbd717d55c5701fc1671d2f92a3c5c7769357",
+      "verifier_sha256": "a5e679a70f7ba3d391cee8bc273c58a2ab617058ffc677ecb8ecbba74ad66b8b",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dependency_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "e0aee7ec0a04c5a254592af60e6be63f1e796995dfb99ee80a4e3c4b897d2177",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "dependency-usage-03",
+      "category": "dependency_usage",
+      "task_sha256": "ebc930e920a9213cc393e6185060bbee3a9d2bf2337c11f6e3909baeada3f726",
+      "fixture_sha256": "9473b42f95fb4a100f224f3d744a1e5dfcc5d1b46d1f6716a056a250271ddb96",
+      "verifier_sha256": "aef6eb4b1313b27830044377801bf62a071dd01cb025cbb9129b82256552cd1e",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "dependency_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "cd9c990a7f280a663dbbb1a22401519476d4a97859bbe9a978d3e046b400b274",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "concurrency-bug-01",
+      "category": "concurrency_bug",
+      "task_sha256": "1ee73c64393dc0ec5dd1ff2eb08583c559e556b947d2a3fd2578fda954ca31f1",
+      "fixture_sha256": "0b104047cbf5846482e4818243e0d63a826aa3db10ea718b720f63b1500fe635",
+      "verifier_sha256": "ff5adb2d12a363db5fce1bee8aa9194891ef8def9205352b7d4a0a198354537c",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "counter_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "cde3a0bce772fa4847db5164aa372b188f8f94a5cbca0884d111d30511b10de8",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "concurrency-bug-02",
+      "category": "concurrency_bug",
+      "task_sha256": "57be8fbbf65ff48255649acfe843a9fa67addc2a20d048ba8fe3a467ee69122a",
+      "fixture_sha256": "a492156ec830eb1ccd106a1517c5f11ba83149dfd78eef6831aa07f8d2212027",
+      "verifier_sha256": "b91098789b3509e352454277a8287119f10037b7cc4c83f86bae00cb833e0f66",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "counter_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "1a90d8af8f9da66bed73c53a00eb64621e9b9165ad446af2a3d5652ac4220672",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "concurrency-bug-03",
+      "category": "concurrency_bug",
+      "task_sha256": "06f20870f429412a126ba5103601450a615c35c89cfdade12d8b84bb5fdca45b",
+      "fixture_sha256": "b5e681036384e433808f4323e237cc682dc7cd9ddecf620c125c5eb4d0f0f822",
+      "verifier_sha256": "35dbde10953ecd558e9faf92bdb276d37f3f06b9695691c3c4ed4bd01ae7b946",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "counter_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "0653f47018ac9e6e373edd2e5fa62fe8de2f3c8299afec926d9f6d2a4be45d4d",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "missing-tests-01",
+      "category": "missing_tests",
+      "task_sha256": "52e83b2fe9e263e04af897cce4244719f95c49c93672f56a69cd7f9e1abe7647",
+      "fixture_sha256": "904632869f1f9c03223ac7be32653529a8b8b69cffa4ace8f265ac2bf003a8ec",
+      "verifier_sha256": "e8a8f16bb53354868c3cb400133c4d53fc5e2d31af959e042865f600b3504b8d",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "test_normalize_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "ef075ac25bdfca1b3748ff52128a98c582e7bbd916b6fe50ec2c13b5bf141b51",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "missing-tests-02",
+      "category": "missing_tests",
+      "task_sha256": "e52ee689828ed1a868bdf0c0c67a7b38a6c5b74c435c0237053cf9ed1383befc",
+      "fixture_sha256": "fb0e1ce811169bf7f3d970458b0c8a1e086f396c74b05b724a9b4844a21ee02a",
+      "verifier_sha256": "ef26c7016c97e0afccf92cc34954f741c9dcf994668f826e91dc9205778c6122",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "test_normalize_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "c335725c2d0e88d7bdc97b3340100f5aca8532a46f0c615ad67ea92e35a6b76d",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "missing-tests-03",
+      "category": "missing_tests",
+      "task_sha256": "56a2e695a6af4b9d39d834a3a605b29039e88b3f5c28af4b936c8f2130454f95",
+      "fixture_sha256": "8358aaf4569a297331fc4dfc11a986ac1a0458b214a3ea775c82c8d1550958a5",
+      "verifier_sha256": "277387466d330bbbd12acfe8e2c0085eaa9029e510a9fed700f74101744f1b33",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "test_normalize_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "2d89b99f2033c4575ce716bc53fe09406faaa8e124236f057eec82d7820d21af",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "diagnose-exception-01",
+      "category": "diagnose_exception",
+      "task_sha256": "af0e89db5d89c3739bf8eb012741dc49e4a78d085f74f74e145763ec63e6612f",
+      "fixture_sha256": "181e47a2145a5fa68f69909abb25da75525ce732e1fc5ff1ded355d78c87a28a",
+      "verifier_sha256": "d399de2be75b21048086429858bceb77b21a450642a6fe9cbe8b3fe61ddeea2a",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "parser_1.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "3c10bcd49bfd75ff816ac57d670dcb35de3ad07225145d63d0c163ff28ffa0bd",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 2,
+          "tool_calls": 3,
+          "input_tokens": 1001,
+          "output_tokens": 201,
+          "cost_usd": 0.001,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.060000000000000005,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "diagnose-exception-02",
+      "category": "diagnose_exception",
+      "task_sha256": "e7b8a9f66f4c6e83d625676a9c7e82f250d030eeb89d2315ed43c011cbda5768",
+      "fixture_sha256": "b3d562c51ae8dfcf0e4d3133f1767907780dc2d00a7edb4ecf73a322b47b2801",
+      "verifier_sha256": "aa1427a1f512263a4cfd881acbc082c70f68a22a092a0d1e3c9fd104519f4c32",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "parser_2.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "4fbc8b47b79ed960ffac2d835b518cbd2f89b4b645363556feb8143eeb69d51e",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 3,
+          "tool_calls": 4,
+          "input_tokens": 1002,
+          "output_tokens": 202,
+          "cost_usd": 0.002,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.07,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    },
+    {
+      "task_id": "diagnose-exception-03",
+      "category": "diagnose_exception",
+      "task_sha256": "13ef6e45b155788712aa2857d39ab89cef1052fea8073ad6021bd55df8ee200c",
+      "fixture_sha256": "a21a2cbfd2e8843b39a4cc6324207c1db6d5f2ebe2bca00b35d92796e06d0719",
+      "verifier_sha256": "31b9290bb5864a753f67409791727feb868baba8f78f6d8468b08e58c1645acf",
+      "expected_outcomes": [
+        "completed"
+      ],
+      "observation": {
+        "outcome": "completed",
+        "tests_passed": true,
+        "committed_changes": 1,
+        "changed_paths": [
+          "parser_3.py"
+        ],
+        "verifications": [
+          {
+            "argv": [
+              "python",
+              "-m",
+              "pytest",
+              "-q"
+            ],
+            "backend": "simulation",
+            "exit_code": 0,
+            "timed_out": false,
+            "duration_seconds": 0.0,
+            "output_sha256": "e0a19368f684d79abd90a265b9ffd31af5109765cb5dec46178d2efcd13fcc07",
+            "output_truncated": false
+          }
+        ],
+        "metrics": {
+          "iterations": 4,
+          "tool_calls": 5,
+          "input_tokens": 1003,
+          "output_tokens": 203,
+          "cost_usd": 0.003,
+          "queue_wait_seconds": 0.01,
+          "first_token_seconds": 0.02,
+          "total_latency_seconds": 0.08,
+          "retries": 0,
+          "fallbacks": 0,
+          "permission_denials": 0
+        },
+        "error_category": null
+      },
+      "passed": true,
+      "failures": []
+    }
+  ],
+  "aggregate": {
+    "attempted": 30,
+    "passed": 30,
+    "tests_passed": 30,
+    "unexpected_failures": 0,
+    "duplicate_commits": 0,
+    "success_rate": 1.0,
+    "outcomes": {
+      "completed": 30
+    },
+    "total_latency_seconds": {
+      "count": 30,
+      "minimum": 0.060000000000000005,
+      "p50": 0.07,
+      "p95": 0.08,
+      "maximum": 0.08,
+      "mean": 0.07
+    },
+    "queue_wait_seconds": {
+      "count": 30,
+      "minimum": 0.01,
+      "p50": 0.01,
+      "p95": 0.01,
+      "maximum": 0.01,
+      "mean": 0.01
+    },
+    "first_token_seconds": {
+      "count": 30,
+      "minimum": 0.02,
+      "p50": 0.02,
+      "p95": 0.02,
+      "maximum": 0.02,
+      "mean": 0.02
+    },
+    "iterations": {
+      "count": 30,
+      "minimum": 2.0,
+      "p50": 3.0,
+      "p95": 4.0,
+      "maximum": 4.0,
+      "mean": 3.0
+    },
+    "tool_calls": {
+      "count": 30,
+      "minimum": 3.0,
+      "p50": 4.0,
+      "p95": 5.0,
+      "maximum": 5.0,
+      "mean": 4.0
+    },
+    "input_tokens": {
+      "count": 30,
+      "minimum": 1001.0,
+      "p50": 1002.0,
+      "p95": 1003.0,
+      "maximum": 1003.0,
+      "mean": 1002.0
+    },
+    "output_tokens": {
+      "count": 30,
+      "minimum": 201.0,
+      "p50": 202.0,
+      "p95": 203.0,
+      "maximum": 203.0,
+      "mean": 202.0
+    },
+    "cost_usd": {
+      "count": 30,
+      "minimum": 0.001,
+      "p50": 0.002,
+      "p95": 0.003,
+      "maximum": 0.003,
+      "mean": 0.002
+    },
+    "retries": {
+      "count": 30,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "maximum": 0.0,
+      "mean": 0.0
+    },
+    "fallbacks": {
+      "count": 30,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "maximum": 0.0,
+      "mean": 0.0
+    },
+    "permission_denials": {
+      "count": 30,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "maximum": 0.0,
+      "mean": 0.0
+    }
+  }
+}

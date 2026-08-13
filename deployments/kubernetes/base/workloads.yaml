@@ -1,0 +1,285 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app.kubernetes.io/name: agent-api}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: agent-api, agent-platform.openai.com/role: control-plane}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: agent-api
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: topology.kubernetes.io/zone, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: agent-api}}}
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: agent-api}}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app.kubernetes.io/name: agent-api}}}
+      containers:
+        - name: agent-api
+          image: agent-platform:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/workspace/.venv/bin/uvicorn"]
+          args: ["agent_api.factory:create_production_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+          ports: [{name: http, containerPort: 8000}]
+          envFrom: [{configMapRef: {name: agent-platform-config}}]
+          env:
+            - {name: AGENT_PLATFORM_API_CREDENTIALS_JSON, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: api-credentials-json}}}
+            - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: database-url}}}
+          readinessProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
+          livenessProbe: {httpGet: {path: /health/live, port: http}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 1Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app.kubernetes.io/name: event-gateway}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: event-gateway, agent-platform.openai.com/role: event-gateway}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: event-gateway
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: event-gateway}}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app.kubernetes.io/name: event-gateway}}}
+      containers:
+        - name: event-gateway
+          image: agent-platform:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/workspace/.venv/bin/uvicorn"]
+          args: ["agent_api.event_factory:create_production_event_gateway_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+          ports: [{name: http, containerPort: 8000}]
+          envFrom: [{configMapRef: {name: agent-platform-config}}]
+          env:
+            - {name: AGENT_PLATFORM_EVENT_CREDENTIALS_JSON, valueFrom: {secretKeyRef: {name: agent-platform-event-runtime, key: event-credentials-json}}}
+            - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-event-runtime, key: database-url}}}
+          readinessProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
+          livenessProbe: {httpGet: {path: /health/live, port: http}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 1Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1, maxSurge: 1}
+  selector:
+    matchLabels: {app.kubernetes.io/name: scheduler}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: scheduler, agent-platform.openai.com/role: scheduler}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: scheduler
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: scheduler}}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app.kubernetes.io/name: scheduler}}}
+      containers:
+        - name: scheduler
+          image: agent-platform:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["-m", "agent_scheduler", "--factory", "$(AGENT_PLATFORM_SCHEDULER_FACTORY)", "--operations-port", "9090"]
+          env:
+            - {name: AGENT_PLATFORM_SCHEDULER_FACTORY, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: scheduler-factory}}}
+            - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: database-url}}}
+            - {name: AGENT_PLATFORM_REDIS_URL, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: redis-url}}}
+          envFrom: [{configMapRef: {name: agent-platform-config}}]
+          readinessProbe: {httpGet: {path: /ready, port: ops}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
+          livenessProbe: {httpGet: {path: /live, port: ops}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          ports: [{name: ops, containerPort: 9090}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+      volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-worker
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1, maxSurge: 1}
+  selector:
+    matchLabels: {app.kubernetes.io/name: agent-worker}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: agent-worker, agent-platform.openai.com/role: worker}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: agent-worker
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 180
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      nodeSelector: {agent-platform.openai.com/sandbox-worker: "true"}
+      tolerations:
+        - {key: agent-platform.openai.com/sandbox-worker, operator: Equal, value: "true", effect: NoSchedule}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}
+      containers:
+        - name: agent-worker
+          image: agent-platform:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["-m", "agent_worker", "--factory", "$(AGENT_PLATFORM_WORKER_FACTORY)", "--processes", "1", "--operations-port", "9090"]
+          env:
+            - {name: AGENT_PLATFORM_WORKER_FACTORY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: worker-factory}}}
+            - {name: AGENT_PLATFORM_WORKER_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
+            - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: database-url}}}
+            - {name: AGENT_PLATFORM_REDIS_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: redis-url}}}
+            - {name: AGENT_PLATFORM_OBJECT_STORE_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-url}}}
+            - {name: AGENT_PLATFORM_OBJECT_STORE_ACCESS_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-access-key}}}
+            - {name: AGENT_PLATFORM_OBJECT_STORE_SECRET_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-secret-key}}}
+            - {name: AGENT_PLATFORM_GATEWAY_API_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: gateway-api-key}}}
+            - {name: AGENT_PLATFORM_WORKSPACE_SNAPSHOT_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: workspace-snapshot-url}}}
+          envFrom: [{configMapRef: {name: agent-platform-config}}]
+          ports: [{name: ops, containerPort: 9090}]
+          readinessProbe: {httpGet: {path: /ready, port: ops}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
+          livenessProbe: {httpGet: {path: /live, port: ops}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /workspace/.venv/bin/python
+                  - -c
+                  - "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:9090/drain', method='POST'), timeout=5).read()"
+          resources: {requests: {cpu: "1", memory: 2Gi, ephemeral-storage: 2Gi}, limits: {cpu: "4", memory: 8Gi, ephemeral-storage: 20Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: workspaces, mountPath: /workspaces}
+      volumes:
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+        - {name: workspaces, emptyDir: {sizeLimit: 20Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app.kubernetes.io/name: litellm}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: litellm, agent-platform.openai.com/role: model-gateway}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4000"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: litellm
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: litellm}}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app.kubernetes.io/name: litellm}}}
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-v1.74.9-stable
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/litellm/config.yaml", "--host", "0.0.0.0", "--port", "4000", "--num_workers", "1"]
+          env:
+            - {name: OPENAI_API_KEY, valueFrom: {secretKeyRef: {name: agent-platform-provider, key: openai-api-key}}}
+            - {name: OPENAI_MODEL, valueFrom: {secretKeyRef: {name: agent-platform-provider, key: openai-model}}}
+            - {name: ANTHROPIC_API_KEY, valueFrom: {secretKeyRef: {name: agent-platform-provider, key: anthropic-api-key}}}
+            - {name: ANTHROPIC_MODEL, valueFrom: {secretKeyRef: {name: agent-platform-provider, key: anthropic-model}}}
+            - {name: LITELLM_MASTER_KEY, valueFrom: {secretKeyRef: {name: agent-platform-provider, key: litellm-master-key}}}
+          ports: [{name: http, containerPort: 4000}]
+          readinessProbe: {httpGet: {path: /health/readiness, port: http}, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3}
+          livenessProbe: {httpGet: {path: /health/liveliness, port: http}, initialDelaySeconds: 15, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3}
+          resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "2", memory: 2Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/litellm, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: config, configMap: {name: litellm-config}}
+        - {name: tmp, emptyDir: {sizeLimit: 64Mi}}

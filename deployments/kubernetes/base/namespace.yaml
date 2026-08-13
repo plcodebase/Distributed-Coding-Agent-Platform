@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-platform
+  labels:
+    app.kubernetes.io/name: agent-platform
+    agent-platform.openai.com/network-zone: platform

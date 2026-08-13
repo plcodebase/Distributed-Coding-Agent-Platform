@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata: {name: agent-api}
+spec:
+  selector: {app.kubernetes.io/name: agent-api}
+  ports: [{name: http, port: 8000, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: event-gateway}
+spec:
+  selector: {app.kubernetes.io/name: event-gateway}
+  ports: [{name: http, port: 8000, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: scheduler}
+spec:
+  selector: {app.kubernetes.io/name: scheduler}
+  ports: [{name: ops, port: 9090, targetPort: ops}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: agent-worker}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: agent-worker}
+  ports: [{name: ops, port: 9090, targetPort: ops}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: litellm}
+spec:
+  selector: {app.kubernetes.io/name: litellm}
+  ports: [{name: http, port: 4000, targetPort: http}]

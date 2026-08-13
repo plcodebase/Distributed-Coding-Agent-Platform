@@ -1,0 +1,262 @@
+{
+  "report_version": "agent-final-benchmark-v2",
+  "generated_at": "2026-08-13T19:42:45.935039Z",
+  "source_revision": "unavailable",
+  "status": "incomplete",
+  "methodology": [
+    "Validate each input with its versioned closed report schema.",
+    "Require one source revision and retain the SHA-256 digest of every artifact.",
+    "Use simulation only for deterministic contract evidence and correctness checks.",
+    "Admit performance, capacity, latency, cost, and success-rate metrics only from live evidence."
+  ],
+  "environment_and_hardware": [
+    "deployment-baseline-deployment: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13",
+    "coding-baseline-coding: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8",
+    "load-simulation-api-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-websocket-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-event-throughput-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-worker-saturation-100: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-gateway-rate-limit-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-provider-fallback-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-postgres-contention-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-redis-contention-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "load-simulation-sandbox-saturation-50: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "chaos-d96748bf3f07: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13, logical_cpus=8, physical_memory_bytes=34359738368",
+    "quality-45ab34814d35: system=Darwin, release=25.5.0, machine=arm64, python=3.12.13"
+  ],
+  "artifacts": [
+    {
+      "name": "deployment-baseline-deployment",
+      "kind": "deployment",
+      "report_version": "agent-deployment-v2",
+      "path": "benchmarks/reports/deployment-simulation.json",
+      "sha256": "de46f50ff2d6230f9c4ccbd3555b3a65df62909a98c89c05d779823763e6c6c5",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:28.628352Z",
+      "completed_at": "2026-08-12T01:45:28.629057Z",
+      "passed": true
+    },
+    {
+      "name": "coding-baseline-coding",
+      "kind": "coding",
+      "report_version": "agent-coding-eval-v2",
+      "path": "benchmarks/reports/coding-simulation.json",
+      "sha256": "f57e5d39d8818af572ee265f3fed580457362ade43656cd42ca81c684263af8b",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:28.906611Z",
+      "completed_at": "2026-08-12T01:45:29.098377Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-api-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-api.json",
+      "sha256": "2430c160d2db348ba720a1582df1480e662dbf0d29d7b9d0b533684f3ec1e9aa",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:29.718183Z",
+      "completed_at": "2026-08-12T01:45:29.726954Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-websocket-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-websocket.json",
+      "sha256": "0c3d20f2422a6b70831fb891e4dd11518bd9c448e99ab2a080cc330cfc01c059",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:30.389928Z",
+      "completed_at": "2026-08-12T01:45:30.395423Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-event-throughput-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-events.json",
+      "sha256": "467d2a67f12e6dbebcb676df9adc196347a8f77c645db9cd268f03709870f78a",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:31.112695Z",
+      "completed_at": "2026-08-12T01:45:31.117236Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-worker-saturation-100",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-workers.json",
+      "sha256": "ff84a49c5b5b607a9cce9237300d8d06d628cdfa47cacb4ec8a2c17b02bc20e7",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:31.819293Z",
+      "completed_at": "2026-08-12T01:45:31.836190Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-gateway-rate-limit-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-rate-limit.json",
+      "sha256": "1ca7b9a4488fec59de2f67fc87d837da59e55442787f23129a9c8197d25def12",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:32.577621Z",
+      "completed_at": "2026-08-12T01:45:32.585743Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-provider-fallback-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-fallback.json",
+      "sha256": "226013aa47313b8982afe4f6327a2128263512a40e8fa5dc10c3c06209e389be",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:33.297303Z",
+      "completed_at": "2026-08-12T01:45:33.305509Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-postgres-contention-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-postgres.json",
+      "sha256": "b225bb049edbf5c28aa818e5499c7f7d702fd05c1e610da5c24f71859e39d641",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:33.992731Z",
+      "completed_at": "2026-08-12T01:45:34.001086Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-redis-contention-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-redis.json",
+      "sha256": "fa5482d8a202ddeb27cef2ffbd467cd84212bdb2578c26751a8109a1489a41ff",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:34.702878Z",
+      "completed_at": "2026-08-12T01:45:34.710795Z",
+      "passed": true
+    },
+    {
+      "name": "load-simulation-sandbox-saturation-50",
+      "kind": "load",
+      "report_version": "agent-load-v1",
+      "path": "benchmarks/reports/load-simulation-sandbox.json",
+      "sha256": "f652859085453b860b259d79befc406cbb0cebdf36c91ac6ce5a21725ac35a97",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:35.449760Z",
+      "completed_at": "2026-08-12T01:45:35.457998Z",
+      "passed": true
+    },
+    {
+      "name": "chaos-d96748bf3f07",
+      "kind": "chaos",
+      "report_version": "agent-chaos-v1",
+      "path": "benchmarks/reports/chaos-simulation.json",
+      "sha256": "d96748bf3f07c213d4fc5033a87c5167f5f63be86368728987eefc94db4c84a3",
+      "mode": "simulation",
+      "source_revision": "unavailable",
+      "source_dirty": null,
+      "started_at": "2026-08-12T01:45:36.030447Z",
+      "completed_at": "2026-08-12T01:45:36.032771Z",
+      "passed": true
+    },
+    {
+      "name": "quality-45ab34814d35",
+      "kind": "quality",
+      "report_version": "agent-quality-gates-v1",
+      "path": "benchmarks/reports/quality-gates.json",
+      "sha256": "45ab34814d3559b03069fc035799388081ce646888406ba8a550a1a077fd801e",
+      "mode": "live",
+      "source_revision": "unavailable",
+      "source_dirty": true,
+      "started_at": "2026-08-13T19:40:34.339382Z",
+      "completed_at": "2026-08-13T19:42:45.935039Z",
+      "passed": true
+    }
+  ],
+  "acceptance": [
+    {
+      "requirement": "queue_scale_and_worker_recovery",
+      "status": "verified_simulation",
+      "evidence": [
+        "deployment-baseline-deployment"
+      ],
+      "explanation": "Deployment scenarios conserve accepted tasks while exercising scale and recovery."
+    },
+    {
+      "requirement": "coding_task_campaign",
+      "status": "verified_simulation",
+      "evidence": [
+        "coding-baseline-coding"
+      ],
+      "explanation": "The versioned 30-task campaign records all required coding metrics."
+    },
+    {
+      "requirement": "bounded_load_campaign",
+      "status": "verified_simulation",
+      "evidence": [
+        "load-simulation-api-50",
+        "load-simulation-websocket-50",
+        "load-simulation-event-throughput-50",
+        "load-simulation-worker-saturation-100",
+        "load-simulation-gateway-rate-limit-50",
+        "load-simulation-provider-fallback-50",
+        "load-simulation-postgres-contention-50",
+        "load-simulation-redis-contention-50",
+        "load-simulation-sandbox-saturation-50"
+      ],
+      "explanation": "Bounded load profiles record throughput, latency, tokens, cost, and failures."
+    },
+    {
+      "requirement": "failure_recovery_campaign",
+      "status": "verified_simulation",
+      "evidence": [
+        "chaos-d96748bf3f07"
+      ],
+      "explanation": "Failure scenarios require task visibility, event continuity, and idempotent recovery."
+    },
+    {
+      "requirement": "repository_quality_gates",
+      "status": "verified",
+      "evidence": [
+        "quality-45ab34814d35"
+      ],
+      "explanation": "All fixed lint, typing, test, audit, lock, build, and diff gates passed."
+    },
+    {
+      "requirement": "production_measurement_coverage",
+      "status": "unverified",
+      "evidence": [
+        "quality-45ab34814d35"
+      ],
+      "explanation": "Production verification requires complete live campaigns and a clean passing quality report."
+    }
+  ],
+  "measured_metrics": [],
+  "limitations": [
+    "Simulation-only evidence cannot support production performance claims: chaos, coding, deployment, load.",
+    "The evidence set is not bound to a committed source revision.",
+    "A live Kubernetes cluster, external metrics adapter, managed data services, and real provider traffic are required to complete production acceptance."
+  ]
+}

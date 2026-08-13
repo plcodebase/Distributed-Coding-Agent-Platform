@@ -1,0 +1,24 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: agent-api}
+spec: {maxUnavailable: 1, selector: {matchLabels: {app.kubernetes.io/name: agent-api}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: event-gateway}
+spec: {maxUnavailable: 1, selector: {matchLabels: {app.kubernetes.io/name: event-gateway}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: scheduler}
+spec: {maxUnavailable: 1, selector: {matchLabels: {app.kubernetes.io/name: scheduler}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: agent-worker}
+spec: {maxUnavailable: 1, selector: {matchLabels: {app.kubernetes.io/name: agent-worker}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: litellm}
+spec: {maxUnavailable: 1, selector: {matchLabels: {app.kubernetes.io/name: litellm}}}

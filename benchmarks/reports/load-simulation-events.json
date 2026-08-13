@@ -1,0 +1,162 @@
+{
+  "report_version": "agent-load-v1",
+  "synthetic": true,
+  "result_claim": "simulation_only",
+  "campaign_id": "simulation",
+  "profile": {
+    "name": "event-throughput-50",
+    "scenario": "event_throughput",
+    "concurrency": 50,
+    "operations": 500,
+    "operation_timeout_seconds": 60.0,
+    "max_events_per_connection": 1000,
+    "preconditions": [
+      "The selected run produces a bounded stream and ends in a terminal event."
+    ]
+  },
+  "started_at": "2026-08-12T01:45:31.112695Z",
+  "completed_at": "2026-08-12T01:45:31.117236Z",
+  "methodology": [
+    "Fixed-count workload executed by a bounded set of asyncio worker tasks.",
+    "Each operation has an independent timeout and produces one validated sample.",
+    "Percentiles use nearest-rank selection over successful and failed samples.",
+    "Synthetic timings validate harness behavior only."
+  ],
+  "environment": {
+    "system": "Darwin",
+    "release": "25.5.0",
+    "machine": "arm64",
+    "python": "3.12.13",
+    "logical_cpus": 8,
+    "physical_memory_bytes": 34359738368
+  },
+  "source": {
+    "revision": "unavailable",
+    "dirty": null
+  },
+  "resources": {
+    "scope": "load_generator_process",
+    "wall_seconds": 0.0037886250065639615,
+    "process_cpu_seconds": 0.0036640000000000006,
+    "process_cpu_percent": 96.71054785448435,
+    "process_max_rss_bytes": 74137600
+  },
+  "aggregate": {
+    "attempted": 500,
+    "succeeded": 500,
+    "task_succeeded": 500,
+    "tests_passed": 500,
+    "tests_observed": 500,
+    "errors": {},
+    "error_rate": 0.0,
+    "throughput_per_second": 131974.00089312816,
+    "latency_seconds": {
+      "count": 500,
+      "minimum": 0.005,
+      "p50": 0.013000000000000001,
+      "p95": 0.021,
+      "p99": 0.021,
+      "maximum": 0.021,
+      "mean": 0.01293
+    },
+    "queue_wait_seconds": {
+      "count": 500,
+      "minimum": 0.0,
+      "p50": 0.01,
+      "p95": 0.02,
+      "p99": 0.02,
+      "maximum": 0.02,
+      "mean": 0.00994
+    },
+    "first_token_seconds": {
+      "count": 500,
+      "minimum": 0.0025,
+      "p50": 0.006500000000000001,
+      "p95": 0.0105,
+      "p99": 0.0105,
+      "maximum": 0.0105,
+      "mean": 0.006465
+    },
+    "iterations": {
+      "count": 500,
+      "minimum": 1.0,
+      "p50": 2.0,
+      "p95": 3.0,
+      "p99": 3.0,
+      "maximum": 3.0,
+      "mean": 1.998
+    },
+    "tool_calls": {
+      "count": 500,
+      "minimum": 0.0,
+      "p50": 2.0,
+      "p95": 4.0,
+      "p99": 4.0,
+      "maximum": 4.0,
+      "mean": 2.0
+    },
+    "input_tokens": {
+      "count": 500,
+      "minimum": 100.0,
+      "p50": 111.0,
+      "p95": 121.0,
+      "p99": 122.0,
+      "maximum": 122.0,
+      "mean": 110.898
+    },
+    "output_tokens": {
+      "count": 500,
+      "minimum": 20.0,
+      "p50": 23.0,
+      "p95": 26.0,
+      "p99": 26.0,
+      "maximum": 26.0,
+      "mean": 22.988
+    },
+    "cost_usd": {
+      "count": 500,
+      "minimum": 0.00012,
+      "p50": 0.000134,
+      "p95": 0.000148,
+      "p99": 0.000149,
+      "maximum": 0.000149,
+      "mean": 0.0001343
+    },
+    "retries": {
+      "count": 500,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "maximum": 0.0,
+      "mean": 0.0
+    },
+    "fallbacks": {
+      "count": 500,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "maximum": 0.0,
+      "mean": 0.0
+    },
+    "permission_denials": {
+      "count": 500,
+      "minimum": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 1.0,
+      "maximum": 1.0,
+      "mean": 0.012
+    },
+    "events_received": {
+      "count": 500,
+      "minimum": 1.0,
+      "p50": 250.0,
+      "p95": 475.0,
+      "p99": 495.0,
+      "maximum": 500.0,
+      "mean": 250.5
+    }
+  }
+}

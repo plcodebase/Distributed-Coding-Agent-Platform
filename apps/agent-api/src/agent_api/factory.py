@@ -126,7 +126,12 @@ def create_production_app(
 
 
 def _credentials(settings: AgentApiSettings) -> dict[str, Principal]:
-    raw = settings.api_credentials_json.get_secret_value()
+    return _credentials_json(settings.api_credentials_json.get_secret_value())
+
+
+def _credentials_json(raw: str) -> dict[str, Principal]:
+    """Parse one bounded credential map without consulting ambient settings."""
+
     if not MIN_CREDENTIALS_JSON_BYTES <= len(raw.encode("utf-8")) <= MAX_CREDENTIALS_JSON_BYTES:
         raise ValueError("api credentials JSON must be between 2 bytes and 64 KiB")
     try:

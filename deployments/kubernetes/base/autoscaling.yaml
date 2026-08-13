@@ -1,0 +1,59 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: agent-api}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: agent-api}
+  minReplicas: 2
+  maxReplicas: 20
+  behavior:
+    scaleUp: {stabilizationWindowSeconds: 0, policies: [{type: Percent, value: 100, periodSeconds: 60}, {type: Pods, value: 4, periodSeconds: 60}], selectPolicy: Max}
+    scaleDown: {stabilizationWindowSeconds: 300, policies: [{type: Percent, value: 25, periodSeconds: 60}]}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+    - type: External
+      external:
+        metric: {name: agent_platform_api_requests_per_second}
+        target: {type: AverageValue, averageValue: "20"}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: agent-worker}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: agent-worker}
+  minReplicas: 3
+  maxReplicas: 50
+  behavior:
+    scaleUp: {stabilizationWindowSeconds: 0, policies: [{type: Percent, value: 100, periodSeconds: 30}, {type: Pods, value: 10, periodSeconds: 30}], selectPolicy: Max}
+    scaleDown: {stabilizationWindowSeconds: 600, policies: [{type: Percent, value: 20, periodSeconds: 60}]}
+  metrics:
+    - type: External
+      external:
+        metric: {name: agent_platform_queue_depth_total}
+        target: {type: AverageValue, averageValue: "2"}
+    - type: External
+      external:
+        metric: {name: agent_platform_oldest_queued_seconds}
+        target: {type: Value, value: "30"}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: litellm}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: litellm}
+  minReplicas: 2
+  maxReplicas: 20
+  behavior:
+    scaleUp: {stabilizationWindowSeconds: 30, policies: [{type: Percent, value: 100, periodSeconds: 60}, {type: Pods, value: 4, periodSeconds: 60}], selectPolicy: Max}
+    scaleDown: {stabilizationWindowSeconds: 300, policies: [{type: Percent, value: 25, periodSeconds: 60}]}
+  metrics:
+    - type: External
+      external:
+        metric: {name: litellm_active_requests}
+        target: {type: AverageValue, averageValue: "10"}
+    - type: External
+      external:
+        metric: {name: litellm_request_latency_p95_seconds}
+        target: {type: Value, value: "2"}
