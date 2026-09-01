@@ -13,18 +13,22 @@ from agent_api.auth import OidcAuthenticator, Principal, StaticTokenAuthenticato
 from agent_api.dependencies import ApiServices
 from agent_core.capacity import TenantQuota
 from agent_core.scheduling import QueueAdmissionPolicy
+from artifact_store import S3ObjectStoreSettings, create_s3_object_store
 from event_store import PostgresEventStore
 from platform_persistence import (
     Database,
     DatabaseSettings,
     PostgresApprovalRepository,
+    PostgresAuditSink,
     PostgresContextRepository,
     PostgresMemoryRepository,
     PostgresRunRepository,
     PostgresSessionRepository,
     PostgresTaskRepository,
+    PostgresWorkspaceRepository,
 )
 from platform_telemetry import PlatformTelemetry, TelemetrySettings
+from queue_wakeup import RedisRunWakeup, RedisWakeupSettings
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -102,12 +106,17 @@ def create_production_app(
     *,
     api_settings: AgentApiSettings | None = None,
     database_settings: DatabaseSettings | None = None,
+    object_store_settings: S3ObjectStoreSettings | None = None,
 ) -> FastAPI:
     """Create an independently owned API and PostgreSQL dependency graph."""
 
     resolved_api = api_settings or AgentApiSettings()
     authenticator = _authenticator(resolved_api)
     database = Database(database_settings or DatabaseSettings())
+    object_store = create_s3_object_store(
+        object_store_settings or S3ObjectStoreSettings(environment=resolved_api.environment)
+    )
+    wakeup = RedisRunWakeup.create(RedisWakeupSettings())
     default_quota = TenantQuota(
         max_active_runs=resolved_api.tenant_active_run_limit,
         max_queued_runs=resolved_api.tenant_queued_run_limit,
@@ -121,11 +130,13 @@ def create_production_app(
             global_queue_limit=resolved_api.global_queue_limit,
             retry_after_seconds=resolved_api.overload_retry_after_seconds,
         ),
+        wakeup=wakeup.publish,
     )
-    approvals = PostgresApprovalRepository(database.sessions)
+    approvals = PostgresApprovalRepository(database.sessions, wakeup=wakeup.publish)
     context = PostgresContextRepository(database.sessions)
     tasks = PostgresTaskRepository(database.sessions)
     memories = PostgresMemoryRepository(database.sessions)
+    workspaces = PostgresWorkspaceRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
     telemetry = PlatformTelemetry(
         TelemetrySettings(
@@ -140,10 +151,13 @@ def create_production_app(
         runs=runs,
         approvals=approvals,
         events=events,
-        readiness=database,
+        readiness=_CompositeReadiness(database, object_store, wakeup),
         context=context,
         tasks=tasks,
         memories=memories,
+        workspaces=workspaces,
+        object_store=object_store,
+        audit=PostgresAuditSink(database.sessions),
     )
 
     async def close() -> None:
@@ -152,9 +166,15 @@ def create_production_app(
                 await authenticator.aclose()
         finally:
             try:
-                await database.aclose()
+                await wakeup.aclose()
             finally:
-                telemetry.shutdown()
+                try:
+                    await object_store.aclose()
+                finally:
+                    try:
+                        await database.aclose()
+                    finally:
+                        telemetry.shutdown()
 
     return create_app(
         services,
@@ -169,6 +189,22 @@ def create_production_app(
         snapshot_upload_ttl_seconds=resolved_api.snapshot_upload_ttl_seconds,
         artifact_download_ttl_seconds=resolved_api.artifact_download_ttl_seconds,
     )
+
+
+class _CompositeReadiness:
+    """Require both durable metadata and immutable object storage."""
+
+    def __init__(self, *dependencies: Any) -> None:
+        self._dependencies = dependencies
+
+    async def ready(self) -> bool:
+        for dependency in self._dependencies:
+            try:
+                if not await dependency.ready():
+                    return False
+            except Exception:
+                return False
+        return True
 
 
 def _credentials(settings: AgentApiSettings) -> dict[str, Principal]:

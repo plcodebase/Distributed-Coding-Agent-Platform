@@ -6,9 +6,16 @@ from agent_scheduler.process import (
     load_scheduler_factory,
     serve_scheduler,
 )
-from agent_scheduler.service import SchedulerConfig, SchedulerService
+from agent_scheduler.service import (
+    BackgroundProcessor,
+    CloseCallback,
+    SchedulerConfig,
+    SchedulerService,
+)
 
 __all__ = [
+    "BackgroundProcessor",
+    "CloseCallback",
     "MemoryExtractionProcessor",
     "MemoryExtractionStore",
     "SchedulerConfig",

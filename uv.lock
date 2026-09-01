@@ -157,13 +157,25 @@ version = "0.1.0"
 source = { editable = "apps/scheduler" }
 dependencies = [
     { name = "agent-core" },
+    { name = "agents-sdk-adapter" },
+    { name = "artifact-store" },
+    { name = "gateway-client" },
+    { name = "platform-persistence" },
     { name = "platform-telemetry" },
+    { name = "pydantic-settings" },
+    { name = "queue-wakeup" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "agent-core", editable = "packages/agent-core" },
+    { name = "agents-sdk-adapter", editable = "packages/agents-sdk-adapter" },
+    { name = "artifact-store", editable = "packages/artifact-store" },
+    { name = "gateway-client", editable = "packages/gateway-client" },
+    { name = "platform-persistence", editable = "packages/persistence" },
     { name = "platform-telemetry", editable = "packages/telemetry" },
+    { name = "pydantic-settings", specifier = ">=2.9,<3" },
+    { name = "queue-wakeup", editable = "packages/queue-wakeup" },
 ]
 
 [[package]]
@@ -172,13 +184,27 @@ version = "0.1.0"
 source = { editable = "apps/agent-worker" }
 dependencies = [
     { name = "agent-core" },
+    { name = "agents-sdk-adapter" },
+    { name = "event-store" },
+    { name = "gateway-client" },
+    { name = "platform-persistence" },
     { name = "platform-telemetry" },
+    { name = "pydantic-settings" },
+    { name = "queue-wakeup" },
+    { name = "sandbox-node-agent" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "agent-core", editable = "packages/agent-core" },
+    { name = "agents-sdk-adapter", editable = "packages/agents-sdk-adapter" },
+    { name = "event-store", editable = "packages/event-store" },
+    { name = "gateway-client", editable = "packages/gateway-client" },
+    { name = "platform-persistence", editable = "packages/persistence" },
     { name = "platform-telemetry", editable = "packages/telemetry" },
+    { name = "pydantic-settings", specifier = ">=2.9,<3" },
+    { name = "queue-wakeup", editable = "packages/queue-wakeup" },
+    { name = "sandbox-node-agent", editable = "packages/sandbox-node-agent" },
 ]
 
 [[package]]

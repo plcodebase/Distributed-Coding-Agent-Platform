@@ -61,8 +61,11 @@ async def serve_scheduler(
     try:
         await service.serve(stop)
     finally:
-        if operations is not None:
-            await operations.aclose()
+        try:
+            await service.aclose()
+        finally:
+            if operations is not None:
+                await operations.aclose()
 
 
 def main(arguments: Sequence[str] | None = None) -> None:
