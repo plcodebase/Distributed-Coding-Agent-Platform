@@ -1,5 +1,6 @@
 """Central run-state transition policy and state update operation."""
 
+import uuid
 from collections.abc import Mapping
 from datetime import datetime
 
@@ -32,6 +33,17 @@ RUN_STATUS_TRANSITIONS: Mapping[RunStatus, frozenset[RunStatus]] = {
     RunStatus.FAILED: frozenset(),
     RunStatus.CANCELLED: frozenset(),
 }
+
+_REWINDABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.RETRY_PENDING,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.LOST,
+    }
+)
 
 
 def _operation_timestamp(
@@ -126,4 +138,29 @@ def transition_run(
         if new_status is RunStatus.CANCELLED:
             data["cancellation_requested"] = True
 
+    return Run.model_validate(data)
+
+
+def rewind_run(run: Run, checkpoint_id: uuid.UUID) -> Run:
+    """Return a fresh queued attempt selected at one durable checkpoint."""
+
+    if run.status not in _REWINDABLE_RUN_STATUSES:
+        raise DomainOperationError(
+            code="run_rewind_state_conflict",
+            message="only suspended or terminal runs may be rewound",
+            details={"run_id": str(run.id), "status": run.status.value},
+        )
+    data = run.model_dump(mode="python")
+    data.update(
+        {
+            "status": RunStatus.QUEUED,
+            "attempt": run.attempt + 1,
+            "execution_epoch": run.execution_epoch + 1,
+            "assigned_worker_id": None,
+            "lease_expires_at": None,
+            "last_checkpoint_id": checkpoint_id,
+            "cancellation_requested": False,
+            "completed_at": None,
+        }
+    )
     return Run.model_validate(data)

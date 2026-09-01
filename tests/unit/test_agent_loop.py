@@ -6,13 +6,19 @@ from uuid import UUID
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from agent_core.distributed import DurablePendingToolCall
 from agent_core.domain import DomainOperationError, ErrorDetail, JsonObject, ToolCallStatus
+from agent_core.domain.models import canonical_argument_hash
+from agent_core.domain.status import ApprovalMode
 from agent_core.events import (
+    MAX_EVENT_PAYLOAD_BYTES,
     AnyAgentEvent,
     EventType,
+    ModelTextDeltaEvent,
     ModelToolCallReceivedEvent,
     RunCompletedEvent,
     RunFailedEvent,
+    ToolApprovalRequiredEvent,
     ToolCompletedEvent,
     ToolStderrEvent,
     ToolStdoutEvent,
@@ -136,6 +142,20 @@ class InvalidStreamHandler:
         yield ToolOutputChunk(channel=ToolOutputChannel.STDOUT, chunk="orphan")
 
 
+class RecordingTranscriptJournal:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, int, tuple[GatewayMessage, ...]]] = []
+
+    async def append(
+        self,
+        run_id: UUID,
+        *,
+        start_index: int,
+        messages: tuple[GatewayMessage, ...],
+    ) -> None:
+        self.calls.append((run_id, start_index, messages))
+
+
 def read_tool(handler: ToolHandler[ReadArguments]) -> RegisteredTool[ReadArguments]:
     return RegisteredTool(
         name="read_file",
@@ -170,6 +190,7 @@ def make_loop(
     config: AgentLoopConfig | None = None,
     redactor: Redactor | None = None,
     telemetry: PlatformTelemetry | None = None,
+    transcript_journal: RecordingTranscriptJournal | None = None,
 ) -> tuple[AgentLoop, ScriptedModelGateway]:
     gateway = ScriptedModelGateway(turns)
     tools = ToolRegistry((read_tool(handler),)) if handler is not None else ToolRegistry()
@@ -182,6 +203,7 @@ def make_loop(
             config=config,
             redactor=redactor,
             telemetry=telemetry,
+            transcript_journal=transcript_journal,
         ),
         gateway,
     )
@@ -205,8 +227,6 @@ async def test_final_text_stream_emits_contiguous_typed_events() -> None:
         EventType.CONTEXT_BUILD_STARTED,
         EventType.MODEL_REQUEST_STARTED,
         EventType.MODEL_TEXT_DELTA,
-        EventType.MODEL_TEXT_DELTA,
-        EventType.MODEL_TEXT_DELTA,
         EventType.RUN_COMPLETED,
     ]
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
@@ -218,6 +238,140 @@ async def test_final_text_stream_emits_contiguous_typed_events() -> None:
     assert gateway.requests[0].messages == default_input().messages
     assert gateway.requests[0].tools == ()
     assert gateway.requests[0].tenant_id == default_input().tenant_id
+
+
+async def test_post_rewind_execution_namespaces_gateway_request_identity() -> None:
+    loop, gateway = make_loop([ScriptedGatewayTurn.text("Replayed safely.")])
+
+    events = [
+        event async for event in loop.run(default_input().model_copy(update={"execution_epoch": 2}))
+    ]
+
+    assert isinstance(events[-1], RunCompletedEvent)
+    assert len(gateway.requests) == 1
+    request = gateway.requests[0]
+    assert request.execution_epoch == 2
+    assert request.model_call_id.startswith("e2-")
+    assert request.request_id.startswith("e2-")
+
+
+async def test_model_text_redaction_is_safe_across_provider_fragments() -> None:
+    known_value = "exact-secret-value"
+    journal = RecordingTranscriptJournal()
+    loop, _ = make_loop(
+        [
+            ScriptedGatewayTurn(
+                events=(
+                    GatewayTextDelta(delta="safe prefix exact-"),
+                    GatewayTextDelta(delta="secret-value and sk-"),
+                    GatewayTextDelta(delta="abcdefghijk trailing"),
+                    GatewayResponseCompleted(finish_reason=GatewayFinishReason.STOP),
+                )
+            )
+        ],
+        redactor=Redactor((known_value,)),
+        transcript_journal=journal,
+    )
+
+    events = await collect_events(loop)
+
+    serialized = "\n".join(event.model_dump_json() for event in events)
+    assert known_value not in serialized
+    assert "sk-abcdefghijk" not in serialized
+    completed = events[-1]
+    assert isinstance(completed, RunCompletedEvent)
+    assert completed.payload.final_text == "safe prefix [REDACTED] and [REDACTED] trailing"
+    assert (
+        "".join(event.payload.delta for event in events if isinstance(event, ModelTextDeltaEvent))
+        == completed.payload.final_text
+    )
+    assert journal.calls[-1][2][-1].content == completed.payload.final_text
+
+
+async def test_redaction_expansion_and_escaped_delta_payloads_remain_bounded() -> None:
+    expansion_loop, _ = make_loop(
+        [ScriptedGatewayTurn.text("aaaaaaaa")],
+        redactor=Redactor(("aaaa",)),
+        config=AgentLoopConfig(max_model_output_bytes=8),
+    )
+    expansion_events = await collect_events(expansion_loop)
+    expansion_failure = expansion_events[-1]
+    assert isinstance(expansion_failure, RunFailedEvent)
+    assert expansion_failure.payload.error.code == "model_output_limit"
+    assert not any(isinstance(event, ModelTextDeltaEvent) for event in expansion_events)
+
+    escaped_loop, _ = make_loop(
+        [ScriptedGatewayTurn.text("\x01" * 180_000)],
+        config=AgentLoopConfig(max_model_output_bytes=256 * 1024),
+    )
+    escaped_events = await collect_events(escaped_loop)
+    escaped_deltas = [event for event in escaped_events if isinstance(event, ModelTextDeltaEvent)]
+    assert len(escaped_deltas) > 1
+    assert all(
+        len(event.payload.model_dump_json().encode("utf-8")) <= MAX_EVENT_PAYLOAD_BYTES
+        for event in escaped_deltas
+    )
+    escaped_failure = escaped_events[-1]
+    assert isinstance(escaped_failure, RunFailedEvent)
+    assert escaped_failure.payload.error.code == "model_output_limit"
+
+
+@pytest.mark.asyncio
+async def test_require_all_suspends_before_read_only_tool_execution() -> None:
+    handler = ScriptedReadHandler()
+    call = GatewayToolCall(id="approval-call", name="read_file", arguments={"path": "README"})
+    loop, gateway = make_loop([ScriptedGatewayTurn.tool_calls(call)], handler=handler)
+    loop_input = default_input().model_copy(update={"approval_mode": ApprovalMode.REQUIRE_ALL})
+
+    events = [event async for event in loop.run(loop_input)]
+
+    approval = next(event for event in events if isinstance(event, ToolApprovalRequiredEvent))
+    assert approval.payload.tool_call_id == call.id
+    assert handler.calls == []
+    assert len(gateway.requests) == 1
+    assert EventType.TOOL_STARTED not in event_types(events)
+    assert EventType.RUN_FAILED not in event_types(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("approved", "expected_calls"), [(True, 1), (False, 0)])
+async def test_decided_approval_resumes_without_reasking_model(
+    approved: bool,
+    expected_calls: int,
+) -> None:
+    handler = ScriptedReadHandler()
+    arguments: JsonObject = {"path": "README"}
+    pending = DurablePendingToolCall(
+        tool_call_id="approval-call",
+        tool_name="read_file",
+        turn_number=1,
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        approval_id=UUID("70000000-0000-0000-0000-000000000007"),
+        approval_approved=approved,
+    )
+    loop, gateway = make_loop([ScriptedGatewayTurn.text("continued")], handler=handler)
+    loop_input = default_input().model_copy(
+        update={
+            "attempt": 2,
+            "approval_mode": ApprovalMode.REQUIRE_ALL,
+            "pending_tool_calls": (pending,),
+        }
+    )
+
+    events = [event async for event in loop.run(loop_input)]
+
+    assert len(handler.calls) == expected_calls
+    completion = next(event for event in events if isinstance(event, ToolCompletedEvent))
+    assert completion.payload.status is (
+        ToolCallStatus.COMPLETED if approved else ToolCallStatus.FAILED
+    )
+    if not approved:
+        assert completion.payload.error is not None
+        assert completion.payload.error.code == "approval_rejected"
+    assert isinstance(events[-1], RunCompletedEvent)
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].messages[-1].role is MessageRole.TOOL
     assert gateway.requests[0].session_id == default_input().session_id
     assert gateway.requests[0].run_id == default_input().run_id
     assert gateway.requests[0].turn_number == 1
@@ -415,7 +569,7 @@ async def test_invalid_json_tool_call_is_recorded_and_retried_without_raw_argume
     )
     assert failed_tool.payload.error is not None
     assert failed_tool.payload.error.code == "malformed_tool_arguments"
-    assert gateway.requests[1].messages[-1].role is MessageRole.SYSTEM
+    assert gateway.requests[1].messages[-1].role is MessageRole.USER
     assert "malformed_tool_arguments" in gateway.requests[1].messages[-1].content
     assert known_value not in gateway.requests[1].messages[-1].content
     assert events[-1].event_type is EventType.RUN_COMPLETED
@@ -475,7 +629,7 @@ async def test_mixed_valid_and_invalid_tool_calls_are_rejected_atomically() -> N
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL,
-        MessageRole.SYSTEM,
+        MessageRole.USER,
     ]
 
 
@@ -1254,9 +1408,11 @@ async def test_empty_model_response_can_recover_within_semantic_budget() -> None
     empty_turn = ScriptedGatewayTurn(
         events=(GatewayResponseCompleted(finish_reason=GatewayFinishReason.STOP),)
     )
+    journal = RecordingTranscriptJournal()
     loop, gateway = make_loop(
         [empty_turn, ScriptedGatewayTurn.text("Recovered response.")],
         config=AgentLoopConfig(max_semantic_retries=1),
+        transcript_journal=journal,
     )
 
     events = await collect_events(loop)
@@ -1264,9 +1420,31 @@ async def test_empty_model_response_can_recover_within_semantic_budget() -> None
     assert events[-1].event_type is EventType.RUN_COMPLETED
     assert len(gateway.requests) == 2
     assert gateway.requests[1].messages[-1] == GatewayMessage(
-        role=MessageRole.SYSTEM,
+        role=MessageRole.USER,
         content="The previous response contained neither text nor tool calls.",
     )
+    assert journal.calls == [
+        (
+            RUN_ID,
+            1,
+            (
+                GatewayMessage(
+                    role=MessageRole.USER,
+                    content=("The previous response contained neither text nor tool calls."),
+                ),
+            ),
+        ),
+        (
+            RUN_ID,
+            2,
+            (
+                GatewayMessage(
+                    role=MessageRole.ASSISTANT,
+                    content="Recovered response.",
+                ),
+            ),
+        ),
+    ]
 
 
 async def test_exhausted_fake_gateway_returns_its_structured_failure() -> None:

@@ -91,6 +91,7 @@ class Session(DomainModel):
     approval_mode: ApprovalMode
     model_route: IdentifierString
     memory_enabled: bool = True
+    context_generation: int = Field(default=1, ge=1)
     created_at: AwareTimestamp
     updated_at: AwareTimestamp
 
@@ -195,6 +196,7 @@ class ToolCall(DomainModel):
 
     id: IdentifierString
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     turn_number: int = Field(ge=1)
     tool_name: ToolName
     arguments: FrozenJsonObject
@@ -244,12 +246,21 @@ class Checkpoint(DomainModel):
     id: uuid.UUID
     run_id: uuid.UUID
     session_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
+    tool_call_id: IdentifierString
     message_sequence: int = Field(ge=0)
+    messages: tuple[FrozenJsonObject, ...] = Field(default=(), max_length=4096)
     workspace_snapshot_uri: NonEmptyString
     workspace_revision: IdentifierString
     task_plan: FrozenJsonObject
     context_summary: str | None = None
     created_at: AwareTimestamp
+
+    @model_validator(mode="after")
+    def validate_messages(self) -> Self:
+        if self.messages and len(self.messages) != self.message_sequence:
+            raise ValueError("checkpoint messages must match message_sequence")
+        return self
 
 
 class ModelCall(DomainModel):
@@ -257,6 +268,7 @@ class ModelCall(DomainModel):
 
     id: IdentifierString
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     request_id: IdentifierString
     route_name: IdentifierString
     provider: IdentifierString | None = None

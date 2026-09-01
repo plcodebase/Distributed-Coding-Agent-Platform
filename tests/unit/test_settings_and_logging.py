@@ -70,6 +70,54 @@ def test_redactor_handles_known_patterned_nested_and_url_secrets() -> None:
     assert "sk-abcdefghijk" not in redacted["message"]
 
 
+def test_streaming_redactor_matches_whole_text_across_adversarial_boundaries() -> None:
+    redactor = Redactor(("exact-secret-value",))
+    fragments = (
+        "ordinary text exact-",
+        "secret-value Bear",
+        "er abc.def",
+        ".ghi and sk-",
+        "abcdefghijk done",
+    )
+    stream = redactor.stream()
+
+    result = "".join((*[stream.feed(fragment) for fragment in fragments], stream.finish()))
+    original = "".join(fragments)
+
+    assert result == redactor.redact_text(original)
+    assert "exact-secret-value" not in result
+    assert "Bearer abc.def.ghi" not in result
+    assert "sk-abcdefghijk" not in result
+    with pytest.raises(RuntimeError, match="already finished"):
+        stream.feed("late")
+    with pytest.raises(RuntimeError, match="already finished"):
+        stream.finish()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "prefix exact-secret-value suffix",
+        "prefix Bearer abc.def.ghi suffix",
+        "prefix sk-abcdefghijk suffix",
+        "prefix postgresql://user:password@example.invalid/db suffix",
+        "prefix eyJabcdef.ghijkl.mnopqr suffix",
+    ],
+)
+def test_streaming_redactor_is_invariant_to_every_single_fragment_boundary(value: str) -> None:
+    redactor = Redactor(("exact-secret-value",))
+    expected = redactor.redact_text(value)
+
+    for boundary in range(len(value) + 1):
+        stream = redactor.stream()
+        actual = stream.feed(value[:boundary]) + stream.feed(value[boundary:]) + stream.finish()
+        assert actual == expected
+
+    character_stream = redactor.stream()
+    actual = "".join(character_stream.feed(character) for character in value)
+    assert actual + character_stream.finish() == expected
+
+
 def test_structured_logger_emits_redacted_json() -> None:
     output = StringIO()
     logger = configure_logging(

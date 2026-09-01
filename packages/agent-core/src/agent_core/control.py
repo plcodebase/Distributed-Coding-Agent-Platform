@@ -72,6 +72,7 @@ class PersistedApproval(DomainModel):
 
     id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     status: ApprovalStatus
     reason: str
     arguments: FrozenJsonObject = Field(default_factory=lambda: FrozenJsonObject({}))
@@ -107,6 +108,7 @@ class PersistedMessage(DomainModel):
     id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     sequence: int = Field(ge=1)
     role: MessageRole
     content: str
@@ -119,6 +121,7 @@ class PersistedTaskPlan(DomainModel):
 
     id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     version: int = Field(ge=1)
     plan: FrozenJsonObject
     created_at: AwareTimestamp
@@ -137,6 +140,7 @@ class PersistedContextCompaction(DomainModel):
 
     id: uuid.UUID
     session_id: uuid.UUID
+    context_generation: int = Field(default=1, ge=1)
     status: ContextCompactionStatus
     idempotency_key: IdempotencyKey
     source_message_sequence: int = Field(ge=0)
@@ -292,6 +296,7 @@ class PersistedTaskState(DomainModel):
 
     id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     version: int = Field(ge=1)
     tasks: tuple[TrackedTask, ...] = Field(max_length=500)
     created_at: AwareTimestamp
@@ -318,6 +323,7 @@ class PersistedMemory(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     source_run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     kind: MemoryKind
     content: Annotated[
         str,
@@ -359,6 +365,7 @@ class MemoryExtractionJob(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     status: MemoryExtractionStatus
     source_message_sequence: int = Field(ge=0)
     attempt: int = Field(default=1, ge=1, le=100)

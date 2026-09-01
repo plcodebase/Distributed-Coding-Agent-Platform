@@ -135,6 +135,7 @@ class MemoryExtractionProcessor:
                         tenant_id=job.tenant_id,
                         session_id=job.session_id,
                         run_id=job.run_id,
+                        execution_epoch=job.execution_epoch,
                         transcript=source,
                     )
                 )
@@ -145,6 +146,7 @@ class MemoryExtractionProcessor:
                         tenant_id=job.tenant_id,
                         session_id=job.session_id,
                         source_run_id=job.run_id,
+                        execution_epoch=job.execution_epoch,
                         kind=item.kind,
                         content=item.content,
                         content_hash=memory_content_hash(item.content),

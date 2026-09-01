@@ -24,6 +24,7 @@ from agent_core.domain.status import (
 from agent_core.domain.transitions import (
     RUN_STATUS_TRANSITIONS,
     allowed_run_transitions,
+    rewind_run,
     transition_run,
 )
 
@@ -48,5 +49,6 @@ __all__ = [
     "ToolCallStatus",
     "allowed_run_transitions",
     "canonical_argument_hash",
+    "rewind_run",
     "transition_run",
 ]

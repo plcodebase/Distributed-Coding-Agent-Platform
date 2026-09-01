@@ -278,6 +278,7 @@ class SessionRecord(Base):
             name="approval_mode",
         ),
         CheckConstraint("updated_at >= created_at", name="timestamp_order"),
+        CheckConstraint("context_generation >= 1", name="context_generation"),
         Index("ix_sessions_tenant_created", "tenant_id", "created_at"),
     )
 
@@ -291,6 +292,11 @@ class SessionRecord(Base):
         Boolean,
         nullable=False,
         server_default=text("true"),
+    )
+    context_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
@@ -464,6 +470,7 @@ class MessageRecord(Base):
         ),
         UniqueConstraint("tenant_id", "session_id", "sequence"),
         CheckConstraint("sequence >= 1", name="sequence"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint(
             "role IN ('system', 'user', 'assistant', 'tool')",
             name="role",
@@ -475,6 +482,11 @@ class MessageRecord(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -503,6 +515,7 @@ class ContextCompactionRecord(Base):
         ),
         UniqueConstraint("tenant_id", "session_id", "idempotency_key"),
         CheckConstraint("source_message_sequence >= 0", name="source_message_sequence"),
+        CheckConstraint("context_generation >= 1", name="context_generation"),
         CheckConstraint(
             "status IN ('pending', 'completed', 'failed')",
             name="status",
@@ -541,6 +554,11 @@ class ContextCompactionRecord(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    context_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
     source_message_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -567,14 +585,20 @@ class TaskPlanRecord(Base):
             ("runs.tenant_id", "runs.id"),
             ondelete="CASCADE",
         ),
-        UniqueConstraint("tenant_id", "run_id", "version"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "version"),
         CheckConstraint("version >= 1", name="version"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint("jsonb_typeof(plan) = 'object'", name="plan_object"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
@@ -608,10 +632,12 @@ class MemoryRecord(Base):
             name="content_bytes",
         ),
         CheckConstraint("content_hash ~ '^[0-9a-f]{64}$'", name="content_hash"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint("jsonb_typeof(metadata) = 'object'", name="metadata_object"),
         UniqueConstraint(
             "tenant_id",
             "session_id",
+            "execution_epoch",
             "kind",
             "content_hash",
             name="uq_memories_memory_identity",
@@ -633,6 +659,11 @@ class MemoryRecord(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     source_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -659,7 +690,7 @@ class MemoryExtractionJobRecord(Base):
             ("runs.tenant_id", "runs.id", "runs.session_id"),
             ondelete="CASCADE",
         ),
-        UniqueConstraint("tenant_id", "run_id"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch"),
         CheckConstraint(
             "status IN ('pending', 'running', 'completed', 'failed')",
             name="status",
@@ -667,6 +698,7 @@ class MemoryExtractionJobRecord(Base):
         CheckConstraint("attempt >= 1 AND attempt <= 100", name="attempt"),
         CheckConstraint("lease_generation >= 0", name="lease_generation"),
         CheckConstraint("source_message_sequence >= 0", name="source_message_sequence"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint(
             "error IS NULL OR jsonb_typeof(error) = 'object'",
             name="error_object",
@@ -700,6 +732,11 @@ class MemoryExtractionJobRecord(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     source_message_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
@@ -731,8 +768,9 @@ class ToolCallRecord(Base):
             ("runs.tenant_id", "runs.id"),
             ondelete="CASCADE",
         ),
-        UniqueConstraint("tenant_id", "run_id", "tool_call_id"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
         CheckConstraint("turn_number >= 1", name="turn_number"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint(
             "status IN "
             "('received', 'waiting_approval', 'running', 'completed', 'failed', 'cancelled')",
@@ -768,12 +806,23 @@ class ToolCallRecord(Base):
             "AND result IS NULL AND error IS NULL)",
             name="terminal_outcome",
         ),
-        Index("ix_tool_calls_run_status", "tenant_id", "run_id", "status"),
+        Index(
+            "ix_tool_calls_run_status",
+            "tenant_id",
+            "run_id",
+            "execution_epoch",
+            "status",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False)
     turn_number: Mapped[int] = mapped_column(Integer, nullable=False)
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -798,12 +847,14 @@ class ApprovalRecord(Base):
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
-            ("tenant_id", "run_id", "tool_call_id"),
+            ("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
             (
                 "tool_calls.tenant_id",
                 "tool_calls.run_id",
+                "tool_calls.execution_epoch",
                 "tool_calls.tool_call_id",
             ),
+            name="fk_approvals_branch_tool_call",
         ),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected')",
@@ -821,13 +872,25 @@ class ApprovalRecord(Base):
             "response IS NULL OR octet_length(response) BETWEEN 1 AND 65536",
             name="response_bytes",
         ),
-        UniqueConstraint("tenant_id", "run_id", "tool_call_id"),
-        Index("ix_approvals_run_status", "tenant_id", "run_id", "status"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
+        Index(
+            "ix_approvals_run_status",
+            "tenant_id",
+            "run_id",
+            "execution_epoch",
+            "status",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     tool_call_id: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
@@ -861,19 +924,38 @@ class CheckpointRecord(Base):
             ("sessions.tenant_id", "sessions.id"),
             ondelete="CASCADE",
         ),
-        UniqueConstraint("tenant_id", "run_id", "message_sequence"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
         UniqueConstraint("tenant_id", "run_id", "id"),
         CheckConstraint("message_sequence >= 0", name="message_sequence"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint("jsonb_typeof(task_plan) = 'object'", name="task_plan_object"),
+        CheckConstraint("jsonb_typeof(checkpoint_messages) = 'array'", name="messages_array"),
+        CheckConstraint(
+            "(completed_snapshot_uri IS NULL) = (completed_revision IS NULL)",
+            name="completed_snapshot_pair",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False)
     message_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    checkpoint_messages: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=_EMPTY_ARRAY,
+    )
     workspace_snapshot_uri: Mapped[str] = mapped_column(Text, nullable=False)
     workspace_revision: Mapped[str] = mapped_column(String(255), nullable=False)
+    completed_snapshot_uri: Mapped[str | None] = mapped_column(Text)
+    completed_revision: Mapped[str | None] = mapped_column(String(255))
     task_plan: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
@@ -881,6 +963,31 @@ class CheckpointRecord(Base):
     )
     context_summary: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+
+
+class AuditRecord(Base):
+    """Append-only authenticated administrative action intent."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        CheckConstraint("method IN ('POST', 'PUT', 'PATCH', 'DELETE')", name="method"),
+        CheckConstraint("jsonb_typeof(details) = 'object'", name="details_object"),
+        Index("ix_audit_log_tenant_occurred", "tenant_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    method: Mapped[str] = mapped_column(String(8), nullable=False)
+    resource: Mapped[str] = mapped_column(String(4096), nullable=False)
+    action: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=_UTC_NOW,
@@ -898,8 +1005,9 @@ class AgentEventRecord(Base):
             ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", "sequence"),
-        UniqueConstraint("run_id", "delivery_key"),
+        UniqueConstraint("run_id", "execution_epoch", "delivery_key"),
         CheckConstraint("sequence >= 1", name="sequence"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint(
             "event_type IN "
             "('run.started', 'context.build_started', 'model.request_started', "
@@ -915,6 +1023,11 @@ class AgentEventRecord(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     delivery_key: Mapped[str | None] = mapped_column(String(255))
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -1053,8 +1166,9 @@ class ModelCallRecord(Base):
             ("runs.tenant_id", "runs.id"),
             ondelete="CASCADE",
         ),
-        UniqueConstraint("tenant_id", "run_id", "model_call_id"),
-        UniqueConstraint("tenant_id", "request_id"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "model_call_id"),
+        UniqueConstraint("tenant_id", "run_id", "execution_epoch", "request_id"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
         CheckConstraint(
             "status IN ('started', 'streaming', 'completed', 'failed')",
             name="status",
@@ -1103,6 +1217,11 @@ class ModelCallRecord(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     model_call_id: Mapped[str] = mapped_column(String(255), nullable=False)
     request_id: Mapped[str] = mapped_column(String(255), nullable=False)
     route_name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -1386,6 +1505,7 @@ class GatewayCircuitRecord(Base):
 __all__ = [
     "AgentEventRecord",
     "ApprovalRecord",
+    "AuditRecord",
     "CheckpointRecord",
     "ContextCompactionRecord",
     "GatewayCapacityLeaseRecord",

@@ -177,6 +177,47 @@ def test_unchanged_workspace_has_an_empty_final_patch(tmp_path: Path) -> None:
         asyncio.run(workspace.destroy())
 
 
+def test_context_patch_is_nonmutating_bounded_and_omits_protected_content(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    create_repository(source)
+    (source / ".env").write_text("TOKEN=baseline-secret\n", encoding="utf-8")
+    git(source, "add", ".env")
+    git(source, "commit", "-q", "-m", "add protected fixture")
+    workspace = GitWorktreeManager(worktree_parent=tmp_path).create(
+        source,
+        run_id="context-patch",
+    )
+    try:
+        original_revision = workspace.current_revision
+        workspace.write_file_atomic("tracked.txt", b"visible change\n")
+        (workspace.root / ".env").write_text("TOKEN=current-secret\n", encoding="utf-8")
+        (workspace.root / "new.txt").write_text("untracked content\n", encoding="utf-8")
+        (workspace.root / ".env.local").write_text(
+            "UNTRACKED_SECRET=secret\n",
+            encoding="utf-8",
+        )
+
+        patch = workspace.context_patch(max_bytes=64 * 1024)
+
+        assert b"visible change" in patch
+        assert b"new.txt" in patch
+        assert b"untracked content" not in patch
+        assert b"current-secret" not in patch
+        assert b"UNTRACKED_SECRET" not in patch
+        assert b".env" not in patch
+        assert workspace.current_revision == original_revision
+        assert "tracked.txt" in git(workspace.root, "status", "--porcelain")
+
+        with pytest.raises(DomainOperationError) as limited:
+            workspace.context_patch(max_bytes=16)
+        assert limited.value.code == "context_git_diff_limit"
+        assert workspace.current_revision == original_revision
+    finally:
+        asyncio.run(workspace.destroy())
+
+
 def test_git_boundary_disables_repository_code_execution(tmp_path: Path) -> None:
     source = tmp_path / "source"
     create_repository(source)

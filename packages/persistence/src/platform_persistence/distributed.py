@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
@@ -13,8 +14,10 @@ from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.capacity import QueueDepth, QueueSnapshot, TenantQuota
+from agent_core.control import ApprovalStatus
 from agent_core.distributed import (
     MAX_RECOVERY_STATE_BYTES,
+    DurablePendingToolCall,
     DurableToolOutcome,
     RunExecutionResult,
     RunLease,
@@ -27,13 +30,14 @@ from agent_core.distributed import (
 from agent_core.domain.base import FrozenJsonObject, normalize_timestamp
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import Checkpoint, Run
-from agent_core.domain.status import RunStatus, ToolCallStatus
+from agent_core.domain.status import ApprovalMode, RunStatus, ToolCallStatus
 from agent_core.domain.transitions import transition_run
 from agent_core.gateway import GatewayMessage
 from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
 from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
+    ApprovalRecord,
     CheckpointRecord,
     MemoryExtractionJobRecord,
     MessageRecord,
@@ -49,8 +53,7 @@ from platform_persistence.models import (
 from platform_persistence.repositories import _apply_run, _run_domain
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from datetime import timedelta
+    from collections.abc import Awaitable, Callable
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -112,6 +115,7 @@ def _run_lease_domain(
         lease_token=record.lease_token,
         generation=record.generation,
         attempt=run.attempt,
+        execution_epoch=run.execution_epoch,
         priority=run.priority,
         priority_class=RunPriorityClass(run.priority_class),
         queued_at=run.created_at,
@@ -152,6 +156,7 @@ class PostgresRunQueue:
         token_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         default_quota: TenantQuota | None = None,
         admission_policy: QueueAdmissionPolicy | None = None,
+        wakeup: Callable[[uuid.UUID], Awaitable[None]] | None = None,
     ) -> None:
         if not callable(token_factory):
             raise TypeError("token_factory must be callable")
@@ -159,6 +164,7 @@ class PostgresRunQueue:
         self._token_factory = token_factory
         self._default_quota = default_quota or TenantQuota()
         self._admission_policy = admission_policy or QueueAdmissionPolicy()
+        self._wakeup = wakeup
 
     async def register_worker(self, registration: WorkerRegistration) -> WorkerRegistration:
         async with self._sessions() as database, database.begin():
@@ -472,6 +478,65 @@ class PostgresRunQueue:
             captured_at=timestamp,
         )
 
+    async def authorize_sandbox_lease(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        session_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        worker_id: str,
+        lease_token: uuid.UUID,
+        generation: int,
+        occurred_at: datetime,
+        execution_epoch: int = 1,
+    ) -> None:
+        """Fail closed unless both run and workspace writer leases are current."""
+
+        timestamp = _operation_time(occurred_at, code="sandbox_lease_invalid")
+        async with self._sessions() as database:
+            row = (
+                await database.execute(
+                    select(RunLeaseRecord, RunRecord, WorkspaceLeaseRecord)
+                    .join(
+                        RunRecord,
+                        (RunRecord.tenant_id == RunLeaseRecord.tenant_id)
+                        & (RunRecord.id == RunLeaseRecord.run_id),
+                    )
+                    .join(
+                        WorkspaceLeaseRecord,
+                        (WorkspaceLeaseRecord.tenant_id == RunRecord.tenant_id)
+                        & (WorkspaceLeaseRecord.workspace_id == RunRecord.workspace_id),
+                    )
+                    .where(
+                        RunLeaseRecord.tenant_id == tenant_id,
+                        RunLeaseRecord.run_id == run_id,
+                        RunLeaseRecord.worker_id == worker_id,
+                        RunLeaseRecord.lease_token == lease_token,
+                        RunLeaseRecord.generation == generation,
+                        RunLeaseRecord.expires_at > timestamp,
+                        RunRecord.session_id == session_id,
+                        RunRecord.workspace_id == workspace_id,
+                        RunRecord.execution_epoch == execution_epoch,
+                        RunRecord.status == RunStatus.RUNNING.value,
+                        RunRecord.assigned_worker_id == worker_id,
+                        RunRecord.cancellation_requested.is_(False),
+                        WorkspaceLeaseRecord.run_id == run_id,
+                        WorkspaceLeaseRecord.worker_id == worker_id,
+                        WorkspaceLeaseRecord.run_lease_token == lease_token,
+                        WorkspaceLeaseRecord.lease_token.is_not(None),
+                        WorkspaceLeaseRecord.expires_at > timestamp,
+                    )
+                )
+            ).first()
+        if row is None:
+            raise DomainOperationError(
+                code="sandbox_lease_unauthorized",
+                message="the sandbox request does not own current run and workspace leases",
+                retryable=True,
+                details={"run_id": str(run_id)},
+            )
+
     async def start(self, lease: RunLease, *, occurred_at: datetime) -> RunLease:
         timestamp = _operation_time(occurred_at, code="run_start_invalid")
         async with self._sessions() as database, database.begin():
@@ -546,6 +611,12 @@ class PostgresRunQueue:
                     update={"last_checkpoint_id": result.last_checkpoint_id}
                 )
             _apply_run(run_row, transitioned)
+            run_row.retry_ready_at = (
+                timestamp + timedelta(seconds=result.retry_delay_seconds)
+                if desired_status is RunStatus.RETRY_PENDING
+                and result.retry_delay_seconds is not None
+                else None
+            )
             if desired_status is RunStatus.COMPLETED:
                 await self._enqueue_memory_extraction(database, run_row, timestamp)
             await self._release_workspace_for_run(database, lease_row)
@@ -564,9 +635,15 @@ class PostgresRunQueue:
 
         source_sequence = (
             select(func.coalesce(func.max(MessageRecord.sequence), 0))
+            .join(
+                RunRecord,
+                (RunRecord.tenant_id == MessageRecord.tenant_id)
+                & (RunRecord.id == MessageRecord.run_id),
+            )
             .where(
                 MessageRecord.tenant_id == run.tenant_id,
                 MessageRecord.session_id == run.session_id,
+                MessageRecord.execution_epoch == RunRecord.execution_epoch,
             )
             .scalar_subquery()
         )
@@ -575,12 +652,13 @@ class PostgresRunQueue:
                 literal(
                     uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        f"agent-platform:memory:{run.tenant_id}:{run.id}",
+                        f"agent-platform:memory:{run.tenant_id}:{run.id}:{run.execution_epoch}",
                     )
                 ),
                 literal(run.tenant_id),
                 literal(run.session_id),
                 literal(run.id),
+                literal(run.execution_epoch),
                 literal("pending"),
                 source_sequence,
                 literal(1),
@@ -606,6 +684,7 @@ class PostgresRunQueue:
                     MemoryExtractionJobRecord.tenant_id,
                     MemoryExtractionJobRecord.session_id,
                     MemoryExtractionJobRecord.run_id,
+                    MemoryExtractionJobRecord.execution_epoch,
                     MemoryExtractionJobRecord.status,
                     MemoryExtractionJobRecord.source_message_sequence,
                     MemoryExtractionJobRecord.attempt,
@@ -617,6 +696,7 @@ class PostgresRunQueue:
                 index_elements=(
                     MemoryExtractionJobRecord.tenant_id,
                     MemoryExtractionJobRecord.run_id,
+                    MemoryExtractionJobRecord.execution_epoch,
                 )
             )
         )
@@ -632,13 +712,36 @@ class PostgresRunQueue:
             raise ValueError(f"limit must be in [1, {MAX_RECOVERY_RUNS}]")
         recovered: list[Run] = []
         async with self._sessions() as database, database.begin():
+            retry_rows = tuple(
+                (
+                    await database.scalars(
+                        select(RunRecord)
+                        .where(
+                            RunRecord.status == RunStatus.RETRY_PENDING.value,
+                            RunRecord.retry_ready_at <= timestamp,
+                        )
+                        .order_by(RunRecord.retry_ready_at, RunRecord.id)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).all()
+            )
+            for retry_row in retry_rows:
+                queued = transition_run(
+                    _run_domain(retry_row),
+                    RunStatus.QUEUED,
+                    occurred_at=timestamp,
+                )
+                _apply_run(retry_row, queued)
+                retry_row.retry_ready_at = None
+                recovered.append(queued)
             lease_rows = tuple(
                 (
                     await database.scalars(
                         select(RunLeaseRecord)
                         .where(RunLeaseRecord.expires_at <= timestamp)
                         .order_by(RunLeaseRecord.expires_at, RunLeaseRecord.run_id)
-                        .limit(limit)
+                        .limit(max(0, limit - len(recovered)))
                         .with_for_update(skip_locked=True)
                     )
                 ).all()
@@ -681,6 +784,9 @@ class PostgresRunQueue:
                 await database.delete(lease_row)
                 await self._return_worker_slot(database, lease_row.worker_id)
             await database.flush()
+        for run in recovered:
+            if run.status is RunStatus.QUEUED and self._wakeup is not None:
+                await self._wakeup(run.id)
         return tuple(recovered)
 
     async def _locked_lease_state(
@@ -708,6 +814,7 @@ class PostgresRunQueue:
                 RunRecord.id == lease.run_id,
                 RunRecord.lease_generation == lease.generation,
                 RunRecord.assigned_worker_id == lease.worker_id,
+                RunRecord.execution_epoch == lease.execution_epoch,
             )
             .with_for_update(of=RunRecord)
         )
@@ -999,15 +1106,48 @@ class PostgresRecoveryStore:
                         "checkpoint_id": str(lease.checkpoint_id),
                     },
                 )
-            message_limit = checkpoint_row.message_sequence if checkpoint_row is not None else None
-            messages = await self._messages(database, lease, message_limit=message_limit)
+            checkpoint_messages = (
+                getattr(checkpoint_row, "checkpoint_messages", [])
+                if checkpoint_row is not None
+                else []
+            )
+            checkpoint_is_active_branch = (
+                checkpoint_row is None or checkpoint_row.execution_epoch == lease.execution_epoch
+            )
+            messages = (
+                await self._messages(database, lease, message_limit=None)
+                if not checkpoint_is_active_branch
+                else await self._checkpoint_messages_with_suffix(
+                    database,
+                    lease,
+                    checkpoint_messages,
+                    checkpoint_sequence=(
+                        checkpoint_row.message_sequence if checkpoint_row is not None else 0
+                    ),
+                )
+                if checkpoint_messages
+                else await self._messages(
+                    database,
+                    lease,
+                    message_limit=(
+                        checkpoint_row.message_sequence if checkpoint_row is not None else None
+                    ),
+                )
+            )
             if not messages:
                 raise DomainOperationError(
                     code="recovery_context_missing",
                     message="the run has no durable messages to execute",
                     details={"run_id": str(lease.run_id)},
                 )
-            checkpoint = _checkpoint_domain(checkpoint_row) if checkpoint_row is not None else None
+            checkpoint = (
+                _checkpoint_domain(
+                    checkpoint_row,
+                    prefer_completed=checkpoint_is_active_branch,
+                )
+                if checkpoint_row is not None
+                else None
+            )
             if checkpoint is not None:
                 task_plan = checkpoint.task_plan
                 context_summary = checkpoint.context_summary
@@ -1017,21 +1157,55 @@ class PostgresRecoveryStore:
                     .where(
                         TaskPlanRecord.tenant_id == lease.tenant_id,
                         TaskPlanRecord.run_id == lease.run_id,
+                        TaskPlanRecord.execution_epoch == lease.execution_epoch,
                     )
                     .order_by(TaskPlanRecord.version.desc())
                     .limit(1)
                 )
                 task_plan = FrozenJsonObject(plan_row.plan if plan_row is not None else {})
                 context_summary = None
-            outcomes = await self._tool_outcomes(
-                database,
-                lease,
-                completed_at_or_after=(checkpoint.created_at if checkpoint is not None else None),
+            checkpoint_has_completed_state = (
+                checkpoint_row is not None
+                and getattr(
+                    checkpoint_row,
+                    "completed_snapshot_uri",
+                    None,
+                )
+                is not None
             )
+            outcomes = (
+                await self._tool_outcomes(
+                    database,
+                    lease,
+                    completed_at_or_after=(
+                        checkpoint.created_at if checkpoint is not None else None
+                    ),
+                )
+                if not checkpoint_is_active_branch
+                or checkpoint is None
+                or checkpoint_has_completed_state
+                else ()
+            )
+            pending_tool_calls = (
+                await self._pending_tool_calls(database, lease)
+                if not checkpoint_is_active_branch
+                or checkpoint is None
+                or checkpoint_has_completed_state
+                else ()
+            )
+            approval_mode_value = await database.scalar(
+                select(SessionRecord.approval_mode).where(
+                    SessionRecord.tenant_id == lease.tenant_id,
+                    SessionRecord.id == lease.session_id,
+                )
+            )
+            if not isinstance(approval_mode_value, str):
+                raise DomainOperationError(
+                    code="recovery_session_missing",
+                    message="the durable recovery session is unavailable",
+                )
             workspace_restore_revision = (
-                _latest_workspace_revision(outcomes) or checkpoint.workspace_revision
-                if checkpoint is not None
-                else None
+                checkpoint.workspace_revision if checkpoint is not None else None
             )
             return RunRecoveryState(
                 checkpoint=checkpoint,
@@ -1040,6 +1214,8 @@ class PostgresRecoveryStore:
                 task_plan=task_plan,
                 context_summary=context_summary,
                 prior_tool_outcomes=outcomes,
+                approval_mode=ApprovalMode(approval_mode_value),
+                pending_tool_calls=pending_tool_calls,
             )
 
     @staticmethod
@@ -1065,11 +1241,175 @@ class PostgresRecoveryStore:
                 .where(
                     CheckpointRecord.tenant_id == lease.tenant_id,
                     CheckpointRecord.run_id == lease.run_id,
+                    CheckpointRecord.execution_epoch == lease.execution_epoch,
                 )
                 .order_by(CheckpointRecord.created_at.desc(), CheckpointRecord.id.desc())
                 .limit(1)
             ),
         )
+
+    @staticmethod
+    def _checkpoint_messages(
+        lease: RunLease,
+        values: object,
+    ) -> tuple[GatewayMessage, ...]:
+        if not isinstance(values, list) or len(values) > MAX_RECOVERY_MESSAGES:
+            raise DomainOperationError(
+                code="recovery_context_limit",
+                message="durable checkpoint messages exceed the message limit",
+                details={"run_id": str(lease.run_id)},
+            )
+        try:
+            encoded = json.dumps(
+                values,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="durable checkpoint messages are invalid",
+                details={"run_id": str(lease.run_id)},
+            ) from None
+        if len(encoded) > MAX_RECOVERY_CONTEXT_BYTES:
+            raise DomainOperationError(
+                code="recovery_context_limit",
+                message="durable checkpoint messages exceed the byte limit",
+                details={"run_id": str(lease.run_id)},
+            )
+        try:
+            return tuple(GatewayMessage.model_validate(value) for value in values)
+        except ValidationError as error:
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="a durable checkpoint message is invalid",
+                details={"run_id": str(lease.run_id)},
+            ) from error
+
+    @classmethod
+    async def _checkpoint_messages_with_suffix(
+        cls,
+        database: AsyncSession,
+        lease: RunLease,
+        values: object,
+        *,
+        checkpoint_sequence: int,
+    ) -> tuple[GatewayMessage, ...]:
+        """Merge the immutable checkpoint context with its journaled run suffix."""
+
+        base = cls._checkpoint_messages(lease, values)
+        if checkpoint_sequence != len(base):
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="durable checkpoint message metadata is inconsistent",
+                details={"run_id": str(lease.run_id)},
+            )
+        result = await database.stream_scalars(
+            select(MessageRecord)
+            .where(
+                MessageRecord.tenant_id == lease.tenant_id,
+                MessageRecord.session_id == lease.session_id,
+                MessageRecord.run_id == lease.run_id,
+                MessageRecord.execution_epoch == lease.execution_epoch,
+            )
+            .order_by(MessageRecord.sequence)
+            .limit(MAX_RECOVERY_MESSAGES + 1)
+            .execution_options(yield_per=1)
+        )
+        suffix: dict[int, GatewayMessage] = {}
+        row_count = 0
+        try:
+            async for row in result:
+                row_count += 1
+                if row_count > MAX_RECOVERY_MESSAGES:
+                    raise DomainOperationError(
+                        code="recovery_context_limit",
+                        message="durable recovery context exceeds the message limit",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                metadata = row.metadata_json
+                if not isinstance(metadata, dict):
+                    raise DomainOperationError(
+                        code="recovery_message_invalid",
+                        message="durable message metadata is invalid",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                transcript_index = metadata.get("transcript_index")
+                if transcript_index is None:
+                    continue
+                if type(transcript_index) is not int or transcript_index < 1:
+                    raise DomainOperationError(
+                        code="recovery_message_invalid",
+                        message="durable transcript position is invalid",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                if transcript_index <= checkpoint_sequence:
+                    continue
+                if transcript_index in suffix:
+                    raise DomainOperationError(
+                        code="recovery_message_invalid",
+                        message="durable transcript positions are not unique",
+                        details={"run_id": str(lease.run_id)},
+                    )
+                suffix[transcript_index] = cls._gateway_message(lease, row)
+        finally:
+            await result.close()
+
+        positions = sorted(suffix)
+        if positions and positions != list(
+            range(checkpoint_sequence + 1, checkpoint_sequence + len(positions) + 1)
+        ):
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="durable transcript positions are not contiguous",
+                details={"run_id": str(lease.run_id)},
+            )
+        merged = (*base, *(suffix[position] for position in positions))
+        if len(merged) > MAX_RECOVERY_MESSAGES:
+            raise DomainOperationError(
+                code="recovery_context_limit",
+                message="durable recovery context exceeds the message limit",
+                details={"run_id": str(lease.run_id)},
+            )
+        encoded_bytes = sum(len(message.model_dump_json().encode("utf-8")) for message in merged)
+        if encoded_bytes > MAX_RECOVERY_CONTEXT_BYTES:
+            raise DomainOperationError(
+                code="recovery_context_limit",
+                message="durable recovery context exceeds the byte limit",
+                details={
+                    "run_id": str(lease.run_id),
+                    "limit_bytes": MAX_RECOVERY_CONTEXT_BYTES,
+                },
+            )
+        return merged
+
+    @staticmethod
+    def _gateway_message(lease: RunLease, row: MessageRecord) -> GatewayMessage:
+        metadata = row.metadata_json
+        if "role" in metadata or "content" in metadata:
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="durable message metadata contains a reserved field",
+                details={"run_id": str(lease.run_id), "sequence": row.sequence},
+            )
+        values: dict[str, object] = {
+            **{
+                key: value
+                for key, value in metadata.items()
+                if key in {"tool_call_id", "tool_calls"}
+            },
+            "role": row.role,
+            "content": row.content,
+        }
+        try:
+            return GatewayMessage.model_validate(values)
+        except ValidationError as error:
+            raise DomainOperationError(
+                code="recovery_message_invalid",
+                message="a durable recovery message is invalid",
+                details={"run_id": str(lease.run_id), "sequence": row.sequence},
+            ) from error
 
     @staticmethod
     async def _messages(
@@ -1085,15 +1425,26 @@ class PostgresRecoveryStore:
                 .where(
                     MessageRecord.tenant_id == lease.tenant_id,
                     MessageRecord.run_id == lease.run_id,
+                    MessageRecord.execution_epoch == lease.execution_epoch,
                 )
                 .scalar_subquery()
             )
         else:
             cutoff = message_limit
+        active_branch = (
+            select(RunRecord.id)
+            .where(
+                RunRecord.tenant_id == MessageRecord.tenant_id,
+                RunRecord.id == MessageRecord.run_id,
+                RunRecord.execution_epoch == MessageRecord.execution_epoch,
+            )
+            .exists()
+        )
         filters = (
             MessageRecord.tenant_id == lease.tenant_id,
             MessageRecord.session_id == lease.session_id,
             MessageRecord.sequence <= cutoff,
+            active_branch,
         )
         serialized_bytes = await database.scalar(
             select(
@@ -1131,25 +1482,13 @@ class PostgresRecoveryStore:
                         message="durable recovery context exceeds the message limit",
                         details={"run_id": str(lease.run_id)},
                     )
-                if "role" in row.metadata_json or "content" in row.metadata_json:
+                if not isinstance(row.metadata_json, dict):
                     raise DomainOperationError(
                         code="recovery_message_invalid",
-                        message="durable message metadata contains a reserved field",
+                        message="durable message metadata is invalid",
                         details={"run_id": str(lease.run_id), "sequence": row.sequence},
                     )
-                values: dict[str, object] = {
-                    **row.metadata_json,
-                    "role": row.role,
-                    "content": row.content,
-                }
-                try:
-                    converted.append(GatewayMessage.model_validate(values))
-                except ValidationError as error:
-                    raise DomainOperationError(
-                        code="recovery_message_invalid",
-                        message="a durable recovery message is invalid",
-                        details={"run_id": str(lease.run_id), "sequence": row.sequence},
-                    ) from error
+                converted.append(PostgresRecoveryStore._gateway_message(lease, row))
         finally:
             await result.close()
         return tuple(converted)
@@ -1164,6 +1503,7 @@ class PostgresRecoveryStore:
         filters = (
             ToolCallRecord.tenant_id == lease.tenant_id,
             ToolCallRecord.run_id == lease.run_id,
+            ToolCallRecord.execution_epoch == lease.execution_epoch,
             ToolCallRecord.status.in_(
                 (
                     ToolCallStatus.COMPLETED.value,
@@ -1241,14 +1581,74 @@ class PostgresRecoveryStore:
             await result.close()
         return tuple(outcomes)
 
-
-def _latest_workspace_revision(
-    outcomes: tuple[DurableToolOutcome, ...],
-) -> str | None:
-    for outcome in reversed(outcomes):
-        if outcome.workspace_version is not None:
-            return outcome.workspace_version
-    return None
+    @staticmethod
+    async def _pending_tool_calls(
+        database: AsyncSession,
+        lease: RunLease,
+    ) -> tuple[DurablePendingToolCall, ...]:
+        rows = (
+            await database.execute(
+                select(ToolCallRecord, ApprovalRecord)
+                .outerjoin(
+                    ApprovalRecord,
+                    (ApprovalRecord.tenant_id == ToolCallRecord.tenant_id)
+                    & (ApprovalRecord.run_id == ToolCallRecord.run_id)
+                    & (ApprovalRecord.execution_epoch == ToolCallRecord.execution_epoch)
+                    & (ApprovalRecord.tool_call_id == ToolCallRecord.tool_call_id),
+                )
+                .where(
+                    ToolCallRecord.tenant_id == lease.tenant_id,
+                    ToolCallRecord.run_id == lease.run_id,
+                    ToolCallRecord.execution_epoch == lease.execution_epoch,
+                    ToolCallRecord.status.in_(
+                        (
+                            ToolCallStatus.RECEIVED.value,
+                            ToolCallStatus.WAITING_APPROVAL.value,
+                        )
+                    ),
+                )
+                .order_by(ToolCallRecord.turn_number, ToolCallRecord.tool_call_id)
+                .limit(MAX_RECOVERY_TOOL_OUTCOMES + 1)
+            )
+        ).all()
+        if len(rows) > MAX_RECOVERY_TOOL_OUTCOMES:
+            raise DomainOperationError(
+                code="recovery_tool_limit",
+                message="durable recovery contains too many pending tool calls",
+            )
+        pending: list[DurablePendingToolCall] = []
+        for tool, approval in rows:
+            approval_id: uuid.UUID | None = None
+            approved: bool | None = None
+            if tool.status == ToolCallStatus.WAITING_APPROVAL.value:
+                if approval is None or approval.status == ApprovalStatus.PENDING.value:
+                    raise DomainOperationError(
+                        code="recovery_approval_incomplete",
+                        message="a resumed run contains an undecided approval",
+                        retryable=True,
+                    )
+                approval_id = approval.id
+                approved = approval.status == ApprovalStatus.APPROVED.value
+            elif approval is not None:
+                raise DomainOperationError(
+                    code="recovery_approval_invalid",
+                    message="a durable approval is attached to a non-waiting tool call",
+                )
+            pending.append(
+                DurablePendingToolCall(
+                    tool_call_id=tool.tool_call_id,
+                    tool_name=tool.tool_name,
+                    turn_number=tool.turn_number,
+                    arguments=tool.arguments,
+                    argument_hash=tool.argument_hash,
+                    approval_id=approval_id,
+                    approval_approved=approved,
+                    approval_response=(
+                        getattr(approval, "response", None) if approval is not None else None
+                    ),
+                )
+            )
+        return tuple(pending)
 
 
 def _workspace_lease_domain(record: WorkspaceLeaseRecord) -> WorkspaceWriterLease:
@@ -1295,14 +1695,40 @@ def _clear_workspace_owner(record: WorkspaceLeaseRecord) -> None:
     record.expires_at = None
 
 
-def _checkpoint_domain(record: CheckpointRecord) -> Checkpoint:
+def _checkpoint_domain(
+    record: CheckpointRecord,
+    *,
+    prefer_completed: bool = True,
+) -> Checkpoint:
+    """Select post-tool state for recovery and pre-tool state for a rewind fork."""
+
+    completed_uri = getattr(record, "completed_snapshot_uri", None)
+    completed_revision = getattr(record, "completed_revision", None)
+    if (completed_uri is None) != (completed_revision is None):
+        raise DomainOperationError(
+            code="recovery_checkpoint_invalid",
+            message="the durable checkpoint completion state is incomplete",
+        )
     return Checkpoint(
         id=record.id,
         run_id=record.run_id,
         session_id=record.session_id,
+        execution_epoch=record.execution_epoch,
+        tool_call_id=record.tool_call_id,
         message_sequence=record.message_sequence,
-        workspace_snapshot_uri=record.workspace_snapshot_uri,
-        workspace_revision=record.workspace_revision,
+        messages=tuple(
+            FrozenJsonObject(message) for message in getattr(record, "checkpoint_messages", [])
+        ),
+        workspace_snapshot_uri=(
+            completed_uri
+            if prefer_completed and completed_uri is not None
+            else record.workspace_snapshot_uri
+        ),
+        workspace_revision=(
+            completed_revision
+            if prefer_completed and completed_revision is not None
+            else record.workspace_revision
+        ),
         task_plan=record.task_plan,
         context_summary=record.context_summary,
         created_at=record.created_at,

@@ -7,7 +7,7 @@ import uuid  # noqa: TC003 - Pydantic resolves UUID fields at runtime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Never, Protocol, Self
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from agent_core.domain.base import DomainModel, FrozenJsonObject, JsonObject
 from agent_core.domain.errors import DomainOperationError
@@ -23,6 +23,7 @@ from agent_core.gateway import (
     MessageRole,
     ModelGateway,
 )
+from agent_core.workspace_access import WorkspaceFileReference
 from platform_telemetry import Redactor
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ MAX_CONTEXT_ITEM_BYTES = 1024 * 1024
 MAX_COMPRESSION_INPUT_BYTES = 4 * 1024 * 1024
 MAX_CONTEXT_SUMMARY_BYTES = 256 * 1024
 MAX_RECENT_CONTEXT_MESSAGES = 512
+MAX_WORKSPACE_CONTEXT_BYTES = 6 * 1024 * 1024
 CONTEXT_COMPACTION_ROUTE = "summarization"
 _TASK_PLAN_CHUNK_BYTES = MAX_CONTEXT_ITEM_BYTES // 16
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "cancelled"})
@@ -64,6 +66,16 @@ class ReferencedContextFile(DomainModel):
     content: str
     active: bool = False
 
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        try:
+            return WorkspaceFileReference(path=value).path
+        except ValueError as error:
+            raise ValueError(
+                "referenced context paths must be canonical workspace files"
+            ) from error
+
     @model_validator(mode="after")
     def validate_bytes(self) -> Self:
         _require_utf8_limit("referenced file", self.content, MAX_CONTEXT_ITEM_BYTES)
@@ -81,6 +93,25 @@ class ContextToolResult(DomainModel):
     @model_validator(mode="after")
     def validate_bytes(self) -> Self:
         _require_utf8_limit("tool result", self.content, MAX_CONTEXT_ITEM_BYTES)
+        return self
+
+
+class WorkspaceContextSnapshot(DomainModel):
+    """One lease-bound, read-only view of context obtained from the active workspace."""
+
+    project_instructions: str = ""
+    referenced_files: tuple[ReferencedContextFile, ...] = Field(default=(), max_length=32)
+    current_git_diff: str = ""
+
+    @model_validator(mode="after")
+    def validate_size(self) -> Self:
+        for name, value in (
+            ("project instructions", self.project_instructions),
+            ("current Git diff", self.current_git_diff),
+        ):
+            _require_utf8_limit(name, value, MAX_CONTEXT_ITEM_BYTES)
+        if len(self.model_dump_json().encode("utf-8")) > MAX_WORKSPACE_CONTEXT_BYTES:
+            raise ValueError("serialized workspace context exceeds its byte limit")
         return self
 
 
@@ -102,6 +133,7 @@ class ContextBuildRequest(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     route_name: IdentifierString
     system_instructions: str = ""
     project_instructions: str = ""
@@ -232,6 +264,7 @@ class ContextCompressionRequest(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     source_text: str
     max_summary_bytes: int = Field(ge=1, le=MAX_CONTEXT_SUMMARY_BYTES)
 
@@ -532,6 +565,7 @@ class ContextPipeline:
                     tenant_id=request.tenant_id,
                     session_id=request.session_id,
                     run_id=request.run_id,
+                    execution_epoch=request.execution_epoch,
                     source_text=source_text,
                     max_summary_bytes=self._max_summary_bytes,
                 )
@@ -637,6 +671,7 @@ class GatewayContextCompressor:
             tenant_id=request.tenant_id,
             session_id=request.session_id,
             run_id=request.run_id,
+            execution_epoch=request.execution_epoch,
             turn_number=1,
             model_call_id=self._ids.new_id("context-model-call"),
             request_id=self._ids.new_id("context-request"),
@@ -1021,4 +1056,5 @@ __all__ = [
     "SystemInstructionsContributor",
     "TokenEstimator",
     "Utf8TokenEstimator",
+    "WorkspaceContextSnapshot",
 ]

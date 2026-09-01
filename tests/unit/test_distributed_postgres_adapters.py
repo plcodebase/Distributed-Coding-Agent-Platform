@@ -65,6 +65,11 @@ class _ExecuteResult:
     def first(self) -> object:
         return self._row
 
+    def all(self) -> list[object]:
+        if self._row is None:
+            return []
+        return self._row if isinstance(self._row, list) else [self._row]
+
 
 class _Database:
     def __init__(
@@ -177,7 +182,18 @@ def _run_row(
     tenant_id: uuid.UUID = TENANT_ID,
 ) -> SimpleNamespace:
     assigned = "worker-1" if status in {RunStatus.LEASED, RunStatus.RUNNING} else None
-    started_at = NOW if status is RunStatus.RUNNING else None
+    started_at = (
+        NOW
+        if status
+        in {
+            RunStatus.RUNNING,
+            RunStatus.WAITING_APPROVAL,
+            RunStatus.RETRY_PENDING,
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+        }
+        else None
+    )
     return SimpleNamespace(
         id=run_id,
         tenant_id=tenant_id,
@@ -187,9 +203,11 @@ def _run_row(
         priority_class=RunPriorityClass.INTERACTIVE.value,
         priority=7,
         attempt=1,
+        execution_epoch=1,
         lease_generation=0 if status is RunStatus.QUEUED else 1,
         assigned_worker_id=assigned,
         lease_expires_at=NOW + timedelta(seconds=30) if assigned else None,
+        retry_ready_at=NOW if status is RunStatus.RETRY_PENDING else None,
         last_checkpoint_id=None,
         cancellation_requested=cancellation_requested,
         traceparent=None,
@@ -242,6 +260,7 @@ def _lease(*, expires_at: datetime | None = None) -> RunLease:
         lease_token=RUN_TOKEN,
         generation=1,
         attempt=1,
+        execution_epoch=1,
         priority=7,
         acquired_at=NOW,
         expires_at=expires_at or NOW + timedelta(seconds=30),
@@ -547,7 +566,7 @@ async def test_postgres_queue_recovers_expired_and_cancelled_attempts() -> None:
             cancelled_workspace,
             worker,
         ],
-        scalar_sets=[[lost_lease, cancelled_lease]],
+        scalar_sets=[[], [lost_lease, cancelled_lease]],
     )
     queue = PostgresRunQueue(_sessions(database))
 
@@ -562,6 +581,28 @@ async def test_postgres_queue_recovers_expired_and_cancelled_attempts() -> None:
     assert database.deleted == [lost_lease, cancelled_lease]
     with pytest.raises(ValueError, match="limit"):
         await queue.recover_expired(occurred_at=NOW, limit=0)
+
+
+@pytest.mark.asyncio
+async def test_postgres_queue_requeues_due_retry_without_a_worker_lease() -> None:
+    retry = _run_row(status=RunStatus.RETRY_PENDING)
+    database = _Database(scalar_sets=[[retry], []])
+    wakeups: list[uuid.UUID] = []
+
+    async def wakeup(run_id: uuid.UUID) -> None:
+        wakeups.append(run_id)
+
+    queue = PostgresRunQueue(_sessions(database), wakeup=wakeup)
+
+    recovered = await queue.recover_expired(
+        occurred_at=NOW + timedelta(seconds=1),
+        limit=1,
+    )
+
+    assert recovered[0].status is RunStatus.QUEUED
+    assert recovered[0].attempt == 2
+    assert retry.retry_ready_at is None
+    assert wakeups == [RUN_ID]
 
 
 @pytest.mark.asyncio
@@ -698,12 +739,14 @@ async def test_postgres_workspace_lease_replay_renews_and_release_is_fenced() ->
 @pytest.mark.asyncio
 async def test_postgres_recovery_loads_messages_plan_and_terminal_tool_outcomes() -> None:
     message = SimpleNamespace(
+        execution_epoch=1,
         sequence=1,
         role="user",
         content="continue",
         metadata_json={},
     )
     tool = SimpleNamespace(
+        execution_epoch=1,
         tool_call_id="call-1",
         tool_name="read_file",
         turn_number=1,
@@ -721,6 +764,7 @@ async def test_postgres_recovery_loads_messages_plan_and_terminal_tool_outcomes(
             8,
             SimpleNamespace(plan={"steps": []}),
             64,
+            "require_sensitive",
         ],
         scalar_sets=[[message], [tool]],
     )
@@ -744,10 +788,18 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
         id=checkpoint_id,
         tenant_id=TENANT_ID,
         run_id=RUN_ID,
+        execution_epoch=1,
         session_id=SESSION_ID,
-        message_sequence=1,
+        tool_call_id="mutating-call",
+        message_sequence=2,
+        checkpoint_messages=[
+            {"role": "user", "content": "resume"},
+            {"role": "assistant", "content": "working"},
+        ],
         workspace_snapshot_uri="s3://agent-platform/checkpoint",
         workspace_revision="revision-1",
+        completed_snapshot_uri="artifact:///checkpoint?sha256=" + "a" * 64 + "&size_bytes=1",
+        completed_revision="revision-after-edit",
         task_plan={"steps": [{"done": False}]},
         context_summary="summary",
         created_at=NOW,
@@ -758,17 +810,37 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
             _run_lease_row(),
             _run_row(status=RunStatus.RUNNING),
             checkpoint,
-            8,
             64,
+            "require_sensitive",
         ],
         scalar_sets=[
             [
                 SimpleNamespace(
-                    sequence=1,
-                    role="user",
-                    content="resume",
-                    metadata_json={},
-                )
+                    sequence=3,
+                    role="tool",
+                    content='{"result":{"workspace_revision":"revision-after-edit"}}',
+                    metadata_json={
+                        "tool_call_id": "mutating-call",
+                        "tool_calls": [],
+                        "transcript_index": 3,
+                    },
+                ),
+                SimpleNamespace(
+                    sequence=4,
+                    role="assistant",
+                    content="",
+                    metadata_json={
+                        "tool_call_id": None,
+                        "tool_calls": [
+                            {
+                                "id": "next-call",
+                                "name": "run_command",
+                                "arguments": {"argv": ["python", "-m", "unittest"]},
+                            }
+                        ],
+                        "transcript_index": 4,
+                    },
+                ),
             ],
             [
                 SimpleNamespace(
@@ -787,6 +859,13 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     state = await PostgresRecoveryStore(_sessions(database)).load(lease)
     assert state.checkpoint is not None
     assert state.context_summary == "summary"
+    assert [message.role.value for message in state.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert state.messages[-1].tool_calls[0].id == "next-call"
     assert state.workspace_restore_revision == "revision-after-edit"
 
     missing_checkpoint = PostgresRecoveryStore(
@@ -846,6 +925,64 @@ async def test_postgres_recovery_uses_checkpoint_and_fails_closed_on_bad_context
     with pytest.raises(DomainOperationError) as error:
         await invalid_message.load(_lease())
     assert error.value.code == "recovery_message_invalid"
+
+
+@pytest.mark.asyncio
+async def test_postgres_rewind_recovery_uses_pre_tool_snapshot_from_prior_epoch() -> None:
+    checkpoint_id = uuid.UUID("90000000-0000-0000-0000-000000000010")
+    checkpoint = SimpleNamespace(
+        id=checkpoint_id,
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        execution_epoch=1,
+        session_id=SESSION_ID,
+        tool_call_id="repeated-edit",
+        message_sequence=1,
+        checkpoint_messages=[{"role": "user", "content": "old branch"}],
+        workspace_snapshot_uri="s3://agent-platform/pre-tool",
+        workspace_revision="revision-before-edit",
+        completed_snapshot_uri="s3://agent-platform/post-tool",
+        completed_revision="revision-after-abandoned-edit",
+        task_plan={"steps": []},
+        context_summary="checkpoint summary",
+        created_at=NOW,
+    )
+    active_run = _run_row(status=RunStatus.RUNNING)
+    active_run.attempt = 2
+    active_run.execution_epoch = 2
+    active_message = SimpleNamespace(
+        execution_epoch=2,
+        sequence=9,
+        role="user",
+        content="replacement branch",
+        metadata_json={"source": "rewind"},
+    )
+    lease = _lease().model_copy(
+        update={
+            "attempt": 2,
+            "execution_epoch": 2,
+            "checkpoint_id": checkpoint_id,
+        }
+    )
+    database = _Database(
+        scalar_values=[
+            _run_lease_row(),
+            active_run,
+            checkpoint,
+            64,
+            0,
+            "require_sensitive",
+        ],
+        scalar_sets=[[active_message], []],
+    )
+
+    state = await PostgresRecoveryStore(_sessions(database)).load(lease)
+
+    assert state.checkpoint is not None
+    assert state.checkpoint.workspace_snapshot_uri == "s3://agent-platform/pre-tool"
+    assert state.workspace_restore_revision == "revision-before-edit"
+    assert [message.content for message in state.messages] == ["replacement branch"]
+    assert state.prior_tool_outcomes == ()
 
 
 @pytest.mark.asyncio

@@ -118,6 +118,7 @@ class RecordingCheckpointCoordinator:
             id=CHECKPOINT_ID,
             run_id=run_id,
             session_id=SESSION_ID,
+            tool_call_id=tool_call_id,
             message_sequence=len(messages),
             workspace_snapshot_uri="memory://checkpoint/pre-tool",
             workspace_revision="revision-before",

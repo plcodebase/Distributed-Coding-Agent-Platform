@@ -1,5 +1,6 @@
 """PostgreSQL system-of-record adapters for the agent platform."""
 
+from platform_persistence.audit import PostgresAuditSink
 from platform_persistence.base import Base
 from platform_persistence.capacity import (
     PostgresGatewayCapacityStore,
@@ -52,6 +53,7 @@ __all__ = [
     "PersistedTaskPlan",
     "PostgreSQLUrl",
     "PostgresApprovalRepository",
+    "PostgresAuditSink",
     "PostgresContextRepository",
     "PostgresExecutionRepository",
     "PostgresGatewayCapacityStore",

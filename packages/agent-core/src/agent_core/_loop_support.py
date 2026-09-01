@@ -75,7 +75,7 @@ def tool_message(
 def invalid_call_feedback(
     invalid_calls: tuple[tuple[str, str, ErrorDetail], ...],
 ) -> GatewayMessage:
-    """Return safe system feedback for calls that had no valid JSON argument object."""
+    """Return safe correction feedback for calls that had no valid JSON argument object."""
 
     failures: list[JsonObject] = [
         {
@@ -92,7 +92,7 @@ def invalid_call_feedback(
         separators=(",", ":"),
         sort_keys=True,
     )
-    return GatewayMessage(role=MessageRole.SYSTEM, content=content)
+    return GatewayMessage(role=MessageRole.USER, content=content)
 
 
 __all__ = ["invalid_call_feedback", "json_size", "loop_error", "tool_message"]

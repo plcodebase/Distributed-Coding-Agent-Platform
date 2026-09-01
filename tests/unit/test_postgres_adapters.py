@@ -5,9 +5,12 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import MethodType, SimpleNamespace
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from agent_core.capacity import TenantQuota
 from agent_core.control import (
@@ -16,6 +19,8 @@ from agent_core.control import (
     PersistedApproval,
     PersistedMessage,
     PersistedTaskPlan,
+    RunSubmission,
+    TrackedTask,
     run_creation_hash,
 )
 from agent_core.domain.base import FrozenJsonObject
@@ -39,6 +44,7 @@ from agent_core.event_store import MIN_EVENT_PAGE_BYTES, EventDraft, EventPage, 
 from agent_core.gateway import GatewayFinishReason, GatewayResponseCompleted, GatewayTextDelta
 from agent_core.gateway_reliability import GatewayRequestClaimStatus
 from agent_core.scheduling import QueueAdmissionPolicy
+from agent_core.workspace_access import WorkspaceFileReference
 from event_store import PostgresEventStore
 from platform_persistence import (
     PostgresApprovalRepository,
@@ -64,6 +70,9 @@ class _ScalarRows:
 
     def all(self) -> list[object]:
         return self._rows
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(self._rows)
 
     def __aiter__(self) -> _ScalarRows:
         self._iterator = iter(self._rows)
@@ -112,8 +121,19 @@ class _FakeDatabase:
             raise AssertionError("unexpected scalars query")
         return _ScalarRows(self.row_pages.popleft())
 
-    async def execute(self, _statement: object) -> None:
+    async def scalars(self, _statement: object) -> _ScalarRows:
+        if not self.row_pages:
+            raise AssertionError("unexpected scalars query")
+        return _ScalarRows(self.row_pages.popleft())
+
+    async def execute(self, statement: object) -> object:
         self.executed += 1
+        if getattr(statement, "_returning", ()):
+            if not self.scalar_values:
+                raise AssertionError("unexpected returning query")
+            value = self.scalar_values.popleft()
+            return SimpleNamespace(first=lambda: (value, 1))
+        return None
 
     def add(self, value: object) -> None:
         self.added.append(value)
@@ -206,6 +226,7 @@ def _run_row(run: Run, *, creation_hash: str | None = None) -> SimpleNamespace:
         priority_class=run.priority_class.value,
         priority=run.priority,
         attempt=run.attempt,
+        execution_epoch=run.execution_epoch,
         assigned_worker_id=run.assigned_worker_id,
         lease_expires_at=run.lease_expires_at,
         last_checkpoint_id=run.last_checkpoint_id,
@@ -237,11 +258,76 @@ def _stored_event(run_id: uuid.UUID, sequence: int) -> StoredEvent:
 def _event_row(run_id: uuid.UUID, sequence: int) -> SimpleNamespace:
     return SimpleNamespace(
         run_id=run_id,
+        execution_epoch=1,
         sequence=sequence,
         event_type="context.build_started",
         payload={"message_count": sequence, "checkpoint_id": None},
         created_at=NOW,
     )
+
+
+def _rewind_fixture(
+    rewind_row: SimpleNamespace,
+    checkpoint_id: uuid.UUID,
+) -> tuple[SimpleNamespace, SimpleNamespace, _FakeDatabase]:
+    checkpoint = SimpleNamespace(
+        id=checkpoint_id,
+        tenant_id=TENANT_ID,
+        run_id=rewind_row.id,
+        execution_epoch=1,
+        session_id=rewind_row.session_id,
+        tool_call_id="edit-1",
+        message_sequence=1,
+        task_plan={"tasks": [{"id": "inspect", "title": "Inspect the failure"}]},
+        created_at=NOW,
+    )
+    message = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=TENANT_ID,
+        session_id=rewind_row.session_id,
+        run_id=rewind_row.id,
+        execution_epoch=1,
+        sequence=7,
+        role="user",
+        content="Inspect the failing persistence test.",
+        metadata_json={"transcript_index": 1, "source": "run_submission"},
+        created_at=NOW,
+    )
+    session = SimpleNamespace(
+        id=rewind_row.session_id,
+        tenant_id=TENANT_ID,
+        context_generation=1,
+    )
+    return (
+        checkpoint,
+        session,
+        _FakeDatabase(
+            scalars=[rewind_row, checkpoint, session, 7],
+            row_pages=[[message]],
+        ),
+    )
+
+
+def _assert_rewind_branch_seed(
+    database: _FakeDatabase,
+    session: SimpleNamespace,
+    task_plan: dict[str, object],
+) -> None:
+    assert session.context_generation == 2
+    seeded_message = cast(
+        "Any",
+        next(row for row in database.added if type(row).__name__ == "MessageRecord"),
+    )
+    assert seeded_message.execution_epoch == 2
+    assert seeded_message.sequence == 8
+    assert seeded_message.content == "Inspect the failing persistence test."
+    seeded_plan = cast(
+        "Any",
+        next(row for row in database.added if type(row).__name__ == "TaskPlanRecord"),
+    )
+    assert seeded_plan.execution_epoch == 2
+    assert seeded_plan.version == 1
+    assert seeded_plan.plan == task_plan
 
 
 @pytest.mark.parametrize(
@@ -730,6 +816,7 @@ async def test_postgres_event_store_limits_page_bytes_before_materializing_all_r
     rows: list[object] = [
         SimpleNamespace(
             run_id=run_id,
+            execution_epoch=1,
             sequence=sequence,
             event_type="model.text_delta",
             payload={"model_call_id": "call", "delta": large_text},
@@ -892,8 +979,12 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
     cancel_row = _run_row(_run(run_id=uuid.uuid4()))
     active_row = _run_row(_run(status=RunStatus.LEASED, run_id=uuid.uuid4()))
     completed_row = _run_row(_run(status=RunStatus.COMPLETED, run_id=uuid.uuid4()))
-    rewind_row = _run_row(_run(run_id=uuid.uuid4()))
+    rewind_row = _run_row(_run(status=RunStatus.CANCELLED, run_id=uuid.uuid4()))
     checkpoint_id = uuid.uuid4()
+    checkpoint_row, rewind_session, rewind_database = _rewind_fixture(
+        rewind_row,
+        checkpoint_id,
+    )
     quota_row = SimpleNamespace(
         tenant_id=TENANT_ID,
         max_active_runs=4,
@@ -921,7 +1012,7 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
             _FakeDatabase(scalars=[cancel_row]),
             _FakeDatabase(scalars=[active_row]),
             _FakeDatabase(scalars=[completed_row]),
-            _FakeDatabase(scalars=[checkpoint_id, rewind_row]),
+            rewind_database,
             _FakeDatabase(scalars=[None]),
             _FakeDatabase(scalars=[checkpoint_id, None]),
         )
@@ -1001,8 +1092,99 @@ async def test_postgres_run_repository_creation_transitions_cancel_and_rewind() 
 
     rewound = await repository.rewind(TENANT_ID, rewind_row.id, checkpoint_id)
     assert rewound is not None and rewound.last_checkpoint_id == checkpoint_id
+    assert rewound.status is RunStatus.QUEUED and rewound.attempt == 2
+    assert rewound.execution_epoch == 2
+    _assert_rewind_branch_seed(rewind_database, rewind_session, checkpoint_row.task_plan)
     assert await repository.rewind(TENANT_ID, rewind_row.id, checkpoint_id) is None
     assert await repository.rewind(TENANT_ID, rewind_row.id, checkpoint_id) is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_run_submission_persists_initial_state_in_creation_transaction() -> None:
+    run = _run()
+    task = "Fix the failing persistence test."
+    initial_tasks = (TrackedTask(id="inspect", title="Inspect the failing test"),)
+    referenced_files = (WorkspaceFileReference(path="README.md"),)
+    submission = RunSubmission(
+        run=run,
+        task=task,
+        initial_tasks=initial_tasks,
+        referenced_files=referenced_files,
+    )
+    creation_hash = run_creation_hash(
+        priority=run.priority,
+        priority_class=run.priority_class,
+        task=task,
+        initial_tasks=initial_tasks,
+        referenced_files=referenced_files,
+    )
+    quota_row = SimpleNamespace(
+        tenant_id=TENANT_ID,
+        max_active_runs=4,
+        max_queued_runs=100,
+        max_gateway_requests=4,
+        memory_enabled=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    admission_row = SimpleNamespace(
+        id=1,
+        global_queue_limit=10_000,
+        retry_after_seconds=Decimal("1.0"),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    create_database = _FakeDatabase(
+        scalars=[
+            None,
+            SimpleNamespace(id=run.session_id, workspace_id=run.workspace_id),
+            quota_row,
+            None,
+            admission_row,
+            0,
+            0,
+            run.id,
+            4,
+        ]
+    )
+    replay_row = _run_row(run, creation_hash=creation_hash)
+    identifiers = iter(
+        (
+            uuid.UUID("70000000-0000-0000-0000-000000000001"),
+            uuid.UUID("70000000-0000-0000-0000-000000000002"),
+        )
+    )
+    repository = PostgresRunRepository(
+        _sessions(create_database, _FakeDatabase(scalars=[replay_row])),
+        id_factory=lambda: next(identifiers),
+    )
+
+    result = await repository.create_submission(
+        TENANT_ID,
+        submission,
+        idempotency_key="atomic-submission",
+        creation_hash=creation_hash,
+    )
+    replay = await repository.create_submission(
+        TENANT_ID,
+        submission,
+        idempotency_key="atomic-submission",
+        creation_hash=creation_hash,
+    )
+
+    assert result.created is True
+    assert replay.created is False
+    assert len(create_database.added) == 2
+    message, plan = cast("tuple[Any, Any]", tuple(create_database.added))
+    assert message.sequence == 5
+    assert message.content == task
+    assert message.role == "user"
+    assert message.metadata_json == {
+        "source": "run_submission",
+        "referenced_files": [{"path": "README.md"}],
+    }
+    assert plan.version == 1
+    assert plan.plan == {"tasks": [initial_tasks[0].model_dump(mode="json")]}
 
 
 @pytest.mark.asyncio
@@ -1149,6 +1331,7 @@ async def test_postgres_approval_repository_is_idempotent_and_resumes_run() -> N
     pending = SimpleNamespace(
         id=approval_id,
         run_id=run_id,
+        execution_epoch=1,
         status=ApprovalStatus.PENDING.value,
         reason="sensitive",
         arguments={},
@@ -1176,7 +1359,7 @@ async def test_postgres_approval_repository_is_idempotent_and_resumes_run() -> N
     repository = PostgresApprovalRepository(
         _sessions(
             _FakeDatabase(scalars=[None]),
-            _FakeDatabase(scalars=[pending, waiting]),
+            _FakeDatabase(scalars=[pending, waiting, 0]),
             _FakeDatabase(scalars=[already_approved]),
             _FakeDatabase(scalars=[already_rejected]),
             _FakeDatabase(scalars=[SimpleNamespace(**pending.__dict__), None]),
@@ -1232,6 +1415,7 @@ async def test_postgres_execution_repository_serializes_entities_and_detects_con
         id=uuid.uuid4(),
         run_id=run.id,
         session_id=run.session_id,
+        tool_call_id="tool-1",
         message_sequence=1,
         workspace_snapshot_uri="object://snapshot",
         workspace_revision="revision-1",
@@ -1251,6 +1435,7 @@ async def test_postgres_execution_repository_serializes_entities_and_detects_con
     existing_tool = SimpleNamespace(
         tool_call_id=tool_call.id,
         run_id=tool_call.run_id,
+        execution_epoch=1,
         argument_hash=tool_call.argument_hash,
         tool_name=tool_call.tool_name,
         turn_number=tool_call.turn_number,
@@ -1361,6 +1546,7 @@ async def test_tool_call_replay_returns_later_durable_state_and_rejects_divergen
     durable_row = SimpleNamespace(
         tool_call_id=completed.id,
         run_id=completed.run_id,
+        execution_epoch=1,
         turn_number=completed.turn_number,
         tool_name=completed.tool_name,
         arguments=completed.arguments.to_json_object(),

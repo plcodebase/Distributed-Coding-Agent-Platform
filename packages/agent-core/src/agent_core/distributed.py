@@ -8,18 +8,20 @@ from typing import TYPE_CHECKING, Protocol, Self
 
 from pydantic import Field, model_validator
 
+from agent_core.control import MAX_APPROVAL_RESPONSE_BYTES
 from agent_core.domain.base import AwareTimestamp, DomainModel, FrozenJsonObject
 from agent_core.domain.errors import (  # noqa: TC001 - Pydantic resolves fields at runtime
     ErrorDetail,
 )
-from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves fields at runtime
+from agent_core.domain.models import (
     Checkpoint,
     IdentifierString,
     Run,
     Sha256Hex,
     ToolName,
+    canonical_argument_hash,
 )
-from agent_core.domain.status import RunStatus, ToolCallStatus
+from agent_core.domain.status import ApprovalMode, RunStatus, ToolCallStatus
 from agent_core.gateway import (  # noqa: TC001 - Pydantic resolves fields at runtime
     GatewayMessage,
 )
@@ -160,6 +162,34 @@ class DurableToolOutcome(DomainModel):
         return self
 
 
+class DurablePendingToolCall(DomainModel):
+    """One validated nonterminal tool call recovered after an approval wait."""
+
+    tool_call_id: IdentifierString
+    tool_name: ToolName
+    turn_number: int = Field(ge=1)
+    arguments: FrozenJsonObject
+    argument_hash: Sha256Hex
+    approval_id: uuid.UUID | None = None
+    approval_approved: bool | None = None
+    approval_response: str | None = Field(default=None, min_length=1, max_length=65_536)
+
+    @model_validator(mode="after")
+    def validate_approval(self) -> Self:
+        if self.argument_hash != canonical_argument_hash(self.arguments):
+            raise ValueError("pending tool argument hash does not match its arguments")
+        if (self.approval_id is None) != (self.approval_approved is None):
+            raise ValueError("approval identity and decision must be present together")
+        if self.approval_response is not None and self.approval_id is None:
+            raise ValueError("approval response requires an approval decision")
+        if (
+            self.approval_response is not None
+            and len(self.approval_response.encode("utf-8")) > MAX_APPROVAL_RESPONSE_BYTES
+        ):
+            raise ValueError("approval response exceeds its UTF-8 byte limit")
+        return self
+
+
 class RunRecoveryState(DomainModel):
     """Latest durable state needed to resume a reassigned run."""
 
@@ -172,6 +202,8 @@ class RunRecoveryState(DomainModel):
         default=(),
         max_length=100,
     )
+    approval_mode: ApprovalMode = ApprovalMode.AUTO_APPROVE
+    pending_tool_calls: tuple[DurablePendingToolCall, ...] = Field(default=(), max_length=100)
 
     @model_validator(mode="after")
     def validate_outcomes(self) -> Self:
@@ -182,6 +214,16 @@ class RunRecoveryState(DomainModel):
         identifiers = [outcome.tool_call_id for outcome in self.prior_tool_outcomes]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("prior durable tool-call IDs must be unique")
+        pending_identifiers = [call.tool_call_id for call in self.pending_tool_calls]
+        if len(pending_identifiers) != len(set(pending_identifiers)):
+            raise ValueError("pending durable tool-call IDs must be unique")
+        if (
+            self.pending_tool_calls
+            and len({call.turn_number for call in self.pending_tool_calls}) != 1
+        ):
+            raise ValueError("pending durable tool calls must belong to one atomic model turn")
+        if set(identifiers).intersection(pending_identifiers):
+            raise ValueError("terminal and pending tool-call IDs must be disjoint")
         if len(self.model_dump_json().encode("utf-8")) > MAX_RECOVERY_STATE_BYTES:
             raise ValueError(
                 f"serialized recovery state exceeds {MAX_RECOVERY_STATE_BYTES}-byte limit"
@@ -195,6 +237,7 @@ class RunExecutionResult(DomainModel):
     status: RunStatus
     last_checkpoint_id: uuid.UUID | None = None
     error: ErrorDetail | None = None
+    retry_delay_seconds: float | None = Field(default=None, ge=0, le=3600)
 
     @model_validator(mode="after")
     def validate_status(self) -> Self:
@@ -210,6 +253,8 @@ class RunExecutionResult(DomainModel):
             raise ValueError("failed worker execution requires an error")
         if self.status is not RunStatus.FAILED and self.error is not None:
             raise ValueError("only failed worker execution may include an error")
+        if (self.status is RunStatus.RETRY_PENDING) != (self.retry_delay_seconds is not None):
+            raise ValueError("retry-pending execution requires only a retry delay")
         return self
 
 
@@ -339,6 +384,7 @@ class RunExecutor(Protocol):
 
 __all__ = [
     "MAX_RECOVERY_STATE_BYTES",
+    "DurablePendingToolCall",
     "DurableToolOutcome",
     "RecoveryStore",
     "RunExecutionResult",

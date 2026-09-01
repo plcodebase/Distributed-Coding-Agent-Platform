@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
+from collections.abc import Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -13,7 +15,7 @@ from agent_core._loop_support import invalid_call_feedback, json_size, loop_erro
 from agent_core.domain.base import FrozenJsonObject
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import Checkpoint, canonical_argument_hash
-from agent_core.domain.status import ToolCallStatus
+from agent_core.domain.status import ApprovalMode, ToolCallStatus
 from agent_core.tools import (
     PreparedToolExecution,
     ToolEffect,
@@ -28,7 +30,7 @@ _WORKSPACE_RESULT_METADATA_RESERVE_BYTES = 2048
 _MAX_WORKSPACE_REVISION_CHARACTERS = 255
 
 if TYPE_CHECKING:
-    import uuid
+    from collections.abc import Callable
 
     from agent_core._loop_events import LoopEventFactory
     from agent_core._loop_types import AgentLoopConfig
@@ -58,6 +60,7 @@ class ToolTurnReport:
     semantic_failures: int = 0
     terminal: bool = False
     last_checkpoint_id: uuid.UUID | None = None
+    updated_task_plan: FrozenJsonObject | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +89,7 @@ def _checkpoint_matches_request(
     checkpoint: Checkpoint,
     *,
     run_id: uuid.UUID,
+    tool_call_id: str,
     message_sequence: int,
     task_plan: FrozenJsonObject,
     context_summary: str | None,
@@ -93,6 +97,7 @@ def _checkpoint_matches_request(
     return (
         isinstance(checkpoint, Checkpoint)
         and checkpoint.run_id == run_id
+        and checkpoint.tool_call_id == tool_call_id
         and checkpoint.message_sequence == message_sequence
         and checkpoint.task_plan == task_plan
         and checkpoint.context_summary == context_summary
@@ -186,12 +191,16 @@ class ToolTurnExecutor:
         tools: ToolRegistry,
         config: AgentLoopConfig,
         redactor: Redactor,
+        approval_id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         checkpoints: CheckpointCoordinator | None = None,
         telemetry: PlatformTelemetry | None = None,
     ) -> None:
         self._tools = tools
         self._config = config
         self._redactor = redactor
+        if not callable(approval_id_factory):
+            raise TypeError("approval_id_factory must be callable")
+        self._approval_id_factory = approval_id_factory
         self._checkpoints = checkpoints
         self._telemetry = telemetry
 
@@ -210,6 +219,9 @@ class ToolTurnExecutor:
         turn_number: int,
         task_plan: FrozenJsonObject,
         context_summary: str | None,
+        approval_mode: ApprovalMode = ApprovalMode.AUTO_APPROVE,
+        approval_decisions: Mapping[str, bool] | None = None,
+        approval_responses: Mapping[str, str] | None = None,
     ) -> ToolTurnReport:
         conflict = self._find_id_conflict(tool_calls, invalid_tool_calls, outcomes)
         if conflict is not None:
@@ -232,8 +244,41 @@ class ToolTurnExecutor:
                 semantic_retry_count=semantic_retry_count,
             )
 
+        decisions = dict(approval_decisions or {})
+        responses = dict(approval_responses or {})
+        awaiting = tuple(
+            item
+            for item in prepared_calls
+            if item.tool_call.id not in outcomes
+            and item.prepared is not None
+            and _requires_approval(approval_mode, item.prepared.effect)
+            and item.tool_call.id not in decisions
+        )
+        if awaiting:
+            approval_events: list[AnyAgentEvent] = []
+            for item in awaiting:
+                prepared = item.prepared
+                if prepared is None:
+                    raise AssertionError("approval requires a prepared tool call")
+                approval_id = self._approval_id_factory()
+                if not isinstance(approval_id, uuid.UUID):
+                    raise DomainOperationError(
+                        code="approval_id_invalid",
+                        message="the approval identifier factory returned an invalid value",
+                    )
+                approval_events.append(
+                    events.approval_required(
+                        approval_id=approval_id,
+                        tool_call=item.tool_call,
+                        argument_hash=item.argument_hash,
+                        reason=_approval_reason(item.tool_call.name, prepared.effect),
+                    )
+                )
+            return ToolTurnReport(events=tuple(approval_events), terminal=True)
+
         emitted: list[AnyAgentEvent] = []
         last_checkpoint_id: uuid.UUID | None = None
+        updated_task_plan: FrozenJsonObject | None = None
         for item in prepared_calls:
             telemetry_context = TelemetryContext(
                 tenant_id=str(tenant_id),
@@ -255,8 +300,58 @@ class ToolTurnExecutor:
                     )
                 )
                 continue
+            if decisions.get(item.tool_call.id) is False:
+                error = loop_error(
+                    "approval_rejected",
+                    "human approval was denied for this tool call",
+                    details={
+                        "tool_call_id": item.tool_call.id,
+                        "tool_name": item.tool_call.name,
+                    },
+                )
+                outcome = ToolOutcome(
+                    tool_name=item.tool_call.name,
+                    argument_hash=item.argument_hash,
+                    status=ToolCallStatus.FAILED,
+                    error=error,
+                )
+                outcomes[item.tool_call.id] = outcome
+                emitted.append(self._completion_from_outcome(events, item.tool_call.id, outcome))
+                transcript.append(tool_message(item.tool_call.id, error=error))
+                continue
             if item.prepared is None:
                 raise AssertionError("new validated call must have a prepared execution")
+            if item.prepared.effect is ToolEffect.INTERACTION:
+                response = responses.get(item.tool_call.id)
+                if response is None:
+                    error = loop_error(
+                        "interaction_response_missing",
+                        "the approved user interaction did not include a response",
+                        details={"tool_call_id": item.tool_call.id},
+                    )
+                    outcome = ToolOutcome(
+                        tool_name=item.tool_call.name,
+                        argument_hash=item.argument_hash,
+                        status=ToolCallStatus.FAILED,
+                        error=error,
+                    )
+                else:
+                    outcome = ToolOutcome(
+                        tool_name=item.tool_call.name,
+                        argument_hash=item.argument_hash,
+                        status=ToolCallStatus.COMPLETED,
+                        result=FrozenJsonObject({"response": response}),
+                    )
+                outcomes[item.tool_call.id] = outcome
+                emitted.append(self._completion_from_outcome(events, item.tool_call.id, outcome))
+                transcript.append(
+                    tool_message(
+                        item.tool_call.id,
+                        result=outcome.result,
+                        error=outcome.error,
+                    )
+                )
+                continue
 
             checkpoint: Checkpoint | None = None
             if item.prepared.effect in {ToolEffect.WORKSPACE_MUTATION, ToolEffect.COMMAND}:
@@ -319,6 +414,7 @@ class ToolTurnExecutor:
                 if not _checkpoint_matches_request(
                     checkpoint,
                     run_id=run_id,
+                    tool_call_id=item.tool_call.id,
                     message_sequence=len(transcript),
                     task_plan=task_plan,
                     context_summary=context_summary,
@@ -344,6 +440,7 @@ class ToolTurnExecutor:
                 emitted.append(
                     events.checkpoint_created(
                         checkpoint_id=checkpoint.id,
+                        tool_call_id=checkpoint.tool_call_id,
                         message_sequence=checkpoint.message_sequence,
                         workspace_revision=checkpoint.workspace_revision,
                     )
@@ -530,6 +627,10 @@ class ToolTurnExecutor:
                 raise AssertionError("tool execution must produce a result or error")
 
             outcomes[item.tool_call.id] = outcome
+            if item.tool_call.name == "update_task_plan" and outcome.result is not None:
+                candidate = outcome.result.get("task_plan")
+                if isinstance(candidate, Mapping):
+                    updated_task_plan = FrozenJsonObject(candidate)
             emitted.append(self._completion_from_outcome(events, item.tool_call.id, outcome))
             transcript.append(
                 tool_message(
@@ -542,6 +643,7 @@ class ToolTurnExecutor:
         return ToolTurnReport(
             events=tuple(emitted),
             last_checkpoint_id=last_checkpoint_id,
+            updated_task_plan=updated_task_plan,
         )
 
     def _find_id_conflict(
@@ -993,6 +1095,25 @@ class ToolTurnExecutor:
             result=outcome.result,
             error=outcome.error,
         )
+
+
+def _requires_approval(mode: ApprovalMode, effect: ToolEffect) -> bool:
+    if effect is ToolEffect.INTERACTION:
+        return True
+    if mode is ApprovalMode.REQUIRE_ALL:
+        return True
+    return mode is ApprovalMode.REQUIRE_SENSITIVE and effect in {
+        ToolEffect.WORKSPACE_MUTATION,
+        ToolEffect.COMMAND,
+    }
+
+
+def _approval_reason(tool_name: str, effect: ToolEffect) -> str:
+    if effect is ToolEffect.READ_ONLY:
+        return f"Session policy requires confirmation before {tool_name}."
+    if effect is ToolEffect.COMMAND:
+        return f"Command execution by {tool_name} requires human confirmation."
+    return f"Workspace mutation by {tool_name} requires human confirmation."
 
 
 __all__ = ["ToolOutcome", "ToolTurnExecutor", "ToolTurnReport"]

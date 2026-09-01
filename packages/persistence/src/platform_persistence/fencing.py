@@ -44,6 +44,7 @@ async def assert_active_run_lease(
             RunRecord.id == lease.run_id,
             RunRecord.session_id == lease.session_id,
             RunRecord.workspace_id == lease.workspace_id,
+            RunRecord.execution_epoch == lease.execution_epoch,
             RunRecord.assigned_worker_id == lease.worker_id,
             RunRecord.lease_generation == lease.generation,
             RunRecord.lease_expires_at > func.clock_timestamp(),

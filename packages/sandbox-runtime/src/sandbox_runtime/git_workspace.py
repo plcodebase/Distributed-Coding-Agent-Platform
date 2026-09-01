@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import json
 import math
 import os
 import re
@@ -35,6 +36,8 @@ _DEFAULT_GIT_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 _MAX_GIT_TIMEOUT_SECONDS = 3600.0
 _MAX_RUN_ID_BYTES = 1024
 _MAX_LABEL_BYTES = 1024
+_MAX_CONTEXT_PATCH_PATHS = 2000
+_MAX_CONTEXT_PATCH_PATH_BYTES = 256 * 1024
 _COPY_CHUNK_BYTES = 64 * 1024
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
@@ -473,6 +476,140 @@ class GitWorktreeWorkspace(RootedWorkspace):
                 "Git returned an empty patch for differing workspace revisions",
             )
         return patch
+
+    def context_patch(self, *, max_bytes: int) -> bytes:
+        """Return a bounded, protected-path-safe patch without changing Git state."""
+
+        limit = min(
+            _positive_integer("max_bytes", max_bytes),
+            self._max_patch_bytes,
+            self._git_output_limit_bytes,
+        )
+        tracked = self._context_patch_paths(
+            (
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                self._baseline_revision,
+                "--",
+            ),
+            limit=limit,
+        )
+        untracked = self._context_patch_paths(
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+            limit=limit,
+        )
+        retained_tracked = tuple(
+            path for path in tracked if not self.access_policy.is_protected(path)
+        )
+        retained_untracked = tuple(
+            path for path in untracked if not self.access_policy.is_protected(path)
+        )
+        patch = b""
+        if retained_tracked:
+            try:
+                patch = _require_bytes(
+                    self._git_runner.run(
+                        self.root,
+                        (
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--binary",
+                            "--full-index",
+                            "--no-renames",
+                            self._baseline_revision,
+                            "--",
+                            *(path.as_posix() for path in retained_tracked),
+                        ),
+                        text=False,
+                        output_limit_bytes=limit,
+                    )
+                )
+            except DomainOperationError as error:
+                if error.code != "git_output_limit":
+                    raise
+                raise _git_error(
+                    "context_git_diff_limit",
+                    "the current Git diff exceeds the context byte limit",
+                    details={"limit_bytes": limit},
+                ) from error
+        if retained_untracked:
+            marker = (
+                "\n# Untracked workspace files (contents omitted from diff context):\n"
+                + "".join(
+                    f"# {json.dumps(path.as_posix(), ensure_ascii=False)}\n"
+                    for path in retained_untracked
+                )
+            ).encode("utf-8")
+            if len(patch) + len(marker) > limit:
+                raise _git_error(
+                    "context_git_diff_limit",
+                    "the current Git diff exceeds the context byte limit",
+                    details={"limit_bytes": limit},
+                )
+            patch += marker
+        return patch
+
+    def _context_patch_paths(
+        self,
+        arguments: Sequence[str],
+        *,
+        limit: int,
+    ) -> tuple[PurePosixPath, ...]:
+        try:
+            output = _require_bytes(
+                self._git_runner.run(
+                    self.root,
+                    arguments,
+                    text=False,
+                    output_limit_bytes=min(
+                        self._git_output_limit_bytes,
+                        _MAX_CONTEXT_PATCH_PATH_BYTES,
+                    ),
+                )
+            )
+        except DomainOperationError as error:
+            if error.code != "git_output_limit":
+                raise
+            raise _git_error(
+                "context_git_diff_path_limit",
+                "the current Git change set exceeds the context path limit",
+                details={"limit_bytes": _MAX_CONTEXT_PATCH_PATH_BYTES},
+            ) from error
+        if output and not output.endswith(b"\0"):
+            raise _git_error(
+                "context_git_diff_protocol",
+                "Git returned an unterminated context path",
+            )
+        paths: list[PurePosixPath] = []
+        for raw in output.split(b"\0"):
+            if not raw:
+                continue
+            if len(paths) >= _MAX_CONTEXT_PATCH_PATHS:
+                raise _git_error(
+                    "context_git_diff_path_limit",
+                    "the current Git change set exceeds the context path limit",
+                    details={"limit": _MAX_CONTEXT_PATCH_PATHS},
+                )
+            try:
+                decoded = raw.decode("utf-8", errors="strict")
+                path = normalize_workspace_path(decoded)
+            except (DomainOperationError, UnicodeDecodeError):
+                raise _git_error(
+                    "context_git_diff_protocol",
+                    "Git returned an invalid context path",
+                ) from None
+            if path == PurePosixPath(".") or path.as_posix() != decoded:
+                raise _git_error(
+                    "context_git_diff_protocol",
+                    "Git returned a noncanonical context path",
+                )
+            paths.append(path)
+        return tuple(paths)
 
     async def destroy(self) -> None:
         cleanup = asyncio.create_task(self._destroy())

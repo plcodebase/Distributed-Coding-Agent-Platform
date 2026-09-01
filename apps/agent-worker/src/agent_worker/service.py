@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from agent_core.loop import Clock
 
 type Sleep = Callable[[float], Awaitable[None]]
+type CloseCallback = Callable[[], Awaitable[None]]
 _PhaseResult = TypeVar("_PhaseResult")
 
 
@@ -53,6 +54,7 @@ class WorkerConfig(DomainModel):
     lease_seconds: float = Field(default=30, gt=1, le=3600)
     heartbeat_seconds: float = Field(default=5, gt=0.1, le=300)
     poll_seconds: float = Field(default=0.25, ge=0.01, le=10)
+    max_attempt_seconds: float = Field(default=1800, gt=1, le=86_400)
 
     @model_validator(mode="after")
     def validate_timing(self) -> Self:
@@ -79,7 +81,9 @@ class WorkerService:
         executor: RunExecutor,
         clock: Clock,
         sleep: Sleep = asyncio.sleep,
+        idle_wait: Sleep | None = None,
         telemetry: PlatformTelemetry | None = None,
+        close: CloseCallback | None = None,
     ) -> None:
         self._config = config
         self._queue = queue
@@ -89,7 +93,10 @@ class WorkerService:
         self._executor = executor
         self._clock = clock
         self._sleep = sleep
+        self._idle_wait = idle_wait or sleep
         self._telemetry = telemetry
+        self._close = close
+        self._closed = False
         self._active: set[asyncio.Task[None]] = set()
         self._sandbox_slots = asyncio.BoundedSemaphore(config.sandbox_slots)
         self._fatal_error: BaseException | None = None
@@ -170,7 +177,7 @@ class WorkerService:
             while not stop.is_set():
                 claimed = await self.run_once()
                 if not claimed:
-                    await self._sleep(self._config.poll_seconds)
+                    await self._idle_wait(self._config.poll_seconds)
         except BaseException:
             with suppress(BaseException):
                 await self.drain()
@@ -205,6 +212,21 @@ class WorkerService:
             draining=False,
             occurred_at=self._clock.now(),
         )
+
+    async def aclose(self) -> None:
+        """Drain work and close composition-owned dependencies exactly once."""
+
+        if self._closed:
+            return
+        await self.drain()
+        if self._close is not None:
+            task: asyncio.Future[None] = asyncio.ensure_future(self._close())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+        self._closed = True
 
     async def _process(self, original_lease: RunLease) -> None:
         if self._telemetry is None:
@@ -285,7 +307,8 @@ class WorkerService:
                 self._executor.execute(lease, workspace_lease, recovery),
                 name=f"agent-execution-{lease.run_id}",
             )
-            result = await self._wait_phase_or_heartbeat(execution, heartbeat)
+            async with asyncio.timeout(self._config.max_attempt_seconds):
+                result = await self._wait_phase_or_heartbeat(execution, heartbeat)
             finished = await self._queue.finish(
                 lease,
                 result,
@@ -295,6 +318,16 @@ class WorkerService:
         except asyncio.CancelledError:
             await self._executor.cancel(lease)
             raise
+        except TimeoutError:
+            await self._executor.cancel(lease)
+            await self._finish_failure_if_owned(
+                lease,
+                ErrorDetail(
+                    code="run_timeout",
+                    message="the run attempt exceeded its wall-clock limit",
+                    retryable=True,
+                ),
+            )
         except DomainOperationError as error:
             if error.code in {"run_lease_lost", "run_lease_expired"}:
                 await self._executor.cancel(lease)
@@ -503,7 +536,7 @@ class WorkerService:
         return timedelta(seconds=self._config.lease_seconds)
 
 
-__all__ = ["WorkerConfig", "WorkerService"]
+__all__ = ["CloseCallback", "WorkerConfig", "WorkerService"]
 
 
 def _trace_carrier(lease: RunLease) -> dict[str, str]:

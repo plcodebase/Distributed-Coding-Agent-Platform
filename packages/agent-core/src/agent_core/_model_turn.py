@@ -29,7 +29,7 @@ from agent_core.gateway import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
     from agent_core._loop_events import LoopEventFactory
     from agent_core._loop_types import AgentLoopConfig
@@ -69,6 +69,39 @@ class ModelTurnFailure:
 type ModelStreamItem = AnyAgentEvent | ModelTurnResult | ModelTurnFailure
 
 
+def _model_text_chunks(value: str, *, model_call_id: str) -> Iterator[str]:
+    """Split sanitized text into the largest event-safe Unicode chunks."""
+
+    cursor = 0
+    while cursor < len(value):
+        remaining = value[cursor:]
+        if _model_text_payload_fits(remaining, model_call_id=model_call_id):
+            yield remaining
+            return
+        lower = 1
+        upper = len(remaining) - 1
+        best = 0
+        while lower <= upper:
+            middle = (lower + upper) // 2
+            if _model_text_payload_fits(
+                remaining[:middle],
+                model_call_id=model_call_id,
+            ):
+                best = middle
+                lower = middle + 1
+            else:
+                upper = middle - 1
+        if best == 0:
+            raise AssertionError("one Unicode character must fit in a model delta event")
+        yield remaining[:best]
+        cursor += best
+
+
+def _model_text_payload_fits(value: str, *, model_call_id: str) -> bool:
+    payload = ModelTextDeltaPayload(model_call_id=model_call_id, delta=value)
+    return len(payload.model_dump_json().encode("utf-8")) <= MAX_EVENT_PAYLOAD_BYTES
+
+
 class ModelTurnRunner:
     """Consume one gateway stream while enforcing model-side safety bounds."""
 
@@ -93,7 +126,9 @@ class ModelTurnRunner:
         prior_tool_call_count: int,
     ) -> AsyncIterator[ModelStreamItem]:
         text_parts: list[str] = []
-        model_output_bytes = 0
+        raw_model_output_bytes = 0
+        safe_model_output_bytes = 0
+        text_redactor = self._redactor.stream()
         tool_calls: list[GatewayToolCall] = []
         invalid_tool_calls: list[InvalidToolCall] = []
         completion: GatewayResponseCompleted | None = None
@@ -124,8 +159,8 @@ class ModelTurnRunner:
                         return
 
                     if isinstance(gateway_event, GatewayTextDelta):
-                        model_output_bytes += len(gateway_event.delta.encode("utf-8"))
-                        if model_output_bytes > self._config.max_model_output_bytes:
+                        raw_model_output_bytes += len(gateway_event.delta.encode("utf-8"))
+                        if raw_model_output_bytes > self._config.max_model_output_bytes:
                             yield ModelTurnFailure(
                                 loop_error(
                                     "model_output_limit",
@@ -137,24 +172,30 @@ class ModelTurnRunner:
                                 )
                             )
                             return
-                        payload = ModelTextDeltaPayload(
-                            model_call_id=model_call_id,
-                            delta=gateway_event.delta,
-                        )
-                        if len(payload.model_dump_json().encode("utf-8")) > MAX_EVENT_PAYLOAD_BYTES:
+                        safe_text = text_redactor.feed(gateway_event.delta)
+                        safe_model_output_bytes += len(safe_text.encode("utf-8"))
+                        if safe_model_output_bytes > self._config.max_model_output_bytes:
                             yield ModelTurnFailure(
                                 loop_error(
                                     "model_output_limit",
-                                    "model delta exceeded the event payload limit",
-                                    details={"turn": turn_number},
+                                    "redacted model output exceeded the configured byte limit",
+                                    details={
+                                        "limit_bytes": self._config.max_model_output_bytes,
+                                        "turn": turn_number,
+                                    },
                                 )
                             )
                             return
-                        text_parts.append(gateway_event.delta)
-                        yield events.model_text(
-                            model_call_id=model_call_id,
-                            delta=gateway_event.delta,
-                        )
+                        if safe_text:
+                            text_parts.append(safe_text)
+                            for chunk in _model_text_chunks(
+                                safe_text,
+                                model_call_id=model_call_id,
+                            ):
+                                yield events.model_text(
+                                    model_call_id=model_call_id,
+                                    delta=chunk,
+                                )
                         continue
 
                     if isinstance(gateway_event, GatewayToolCallEvent):
@@ -270,6 +311,30 @@ class ModelTurnRunner:
                 )
             )
             return
+        final_safe_text = text_redactor.finish()
+        safe_model_output_bytes += len(final_safe_text.encode("utf-8"))
+        if safe_model_output_bytes > self._config.max_model_output_bytes:
+            yield ModelTurnFailure(
+                loop_error(
+                    "model_output_limit",
+                    "redacted model output exceeded the configured byte limit",
+                    details={
+                        "limit_bytes": self._config.max_model_output_bytes,
+                        "turn": turn_number,
+                    },
+                )
+            )
+            return
+        if final_safe_text:
+            text_parts.append(final_safe_text)
+            for chunk in _model_text_chunks(
+                final_safe_text,
+                model_call_id=model_call_id,
+            ):
+                yield events.model_text(
+                    model_call_id=model_call_id,
+                    delta=chunk,
+                )
         yield ModelTurnResult(
             text="".join(text_parts),
             tool_calls=tuple(tool_calls),

@@ -84,6 +84,7 @@ class ModelToolCallReceivedPayload(EventPayload):
 
 
 class ToolApprovalRequiredPayload(EventPayload):
+    approval_id: uuid.UUID
     tool_call_id: IdentifierString
     tool_name: ToolName
     arguments: FrozenJsonObject
@@ -132,13 +133,14 @@ class ToolCompletedPayload(EventPayload):
 
 class CheckpointCreatedPayload(EventPayload):
     checkpoint_id: uuid.UUID
+    tool_call_id: IdentifierString
     message_sequence: int = Field(ge=0)
     workspace_revision: IdentifierString
 
 
 class RunRetryScheduledPayload(EventPayload):
     attempt: int = Field(ge=1)
-    delay_seconds: float = Field(ge=0)
+    delay_seconds: float = Field(ge=0, le=3600)
     error: ErrorDetail
 
 

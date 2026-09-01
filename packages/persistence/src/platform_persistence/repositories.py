@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.capacity import CapacityScope, TenantQuota
@@ -27,18 +27,21 @@ from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import Checkpoint, ModelCall, Run, Session, ToolCall
 from agent_core.domain.status import (
     ApprovalMode,
+    ModelCallStatus,
     RunStatus,
     SessionStatus,
     ToolCallStatus,
 )
-from agent_core.domain.transitions import transition_run
-from agent_core.gateway import MessageRole
+from agent_core.domain.transitions import rewind_run, transition_run
+from agent_core.gateway import GatewayMessage, MessageRole
 from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
 from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
 from platform_persistence.models import (
     ApprovalRecord,
     CheckpointRecord,
+    ContextCompactionRecord,
+    MemoryExtractionJobRecord,
     MessageRecord,
     ModelCallRecord,
     QueueAdmissionRecord,
@@ -49,6 +52,8 @@ from platform_persistence.models import (
 )
 
 _IDEMPOTENCY_KEY_ADAPTER: TypeAdapter[IdempotencyKey] = TypeAdapter(IdempotencyKey)
+_MAX_TRANSCRIPT_SUFFIX_MESSAGES = 4096
+_MAX_TRANSCRIPT_SUFFIX_BYTES = 8 * 1024 * 1024
 _TOOL_CALL_TRANSITIONS: dict[ToolCallStatus, frozenset[ToolCallStatus]] = {
     ToolCallStatus.RECEIVED: frozenset(
         {
@@ -406,6 +411,7 @@ class PostgresRunRepository:
             id=self._id_factory(),
             session_id=run.session_id,
             run_id=run.id,
+            execution_epoch=run.execution_epoch,
             sequence=next_sequence,
             role=MessageRole.USER,
             content=submission.task,
@@ -415,6 +421,7 @@ class PostgresRunRepository:
         plan = PersistedTaskPlan(
             id=self._id_factory(),
             run_id=run.id,
+            execution_epoch=run.execution_epoch,
             version=1,
             plan=FrozenJsonObject(
                 {"tasks": [task.model_dump(mode="json") for task in submission.initial_tasks]}
@@ -427,6 +434,7 @@ class PostgresRunRepository:
                 tenant_id=tenant_id,
                 session_id=message.session_id,
                 run_id=message.run_id,
+                execution_epoch=message.execution_epoch,
                 sequence=message.sequence,
                 role=message.role.value,
                 content=message.content,
@@ -439,6 +447,7 @@ class PostgresRunRepository:
                 id=plan.id,
                 tenant_id=tenant_id,
                 run_id=plan.run_id,
+                execution_epoch=plan.execution_epoch,
                 version=plan.version,
                 plan=plan.plan.to_json_object(),
                 created_at=plan.created_at,
@@ -627,15 +636,6 @@ class PostgresRunRepository:
         checkpoint_id: uuid.UUID,
     ) -> Run | None:
         async with self._sessions() as database, database.begin():
-            checkpoint_exists = await database.scalar(
-                select(CheckpointRecord.id).where(
-                    CheckpointRecord.tenant_id == tenant_id,
-                    CheckpointRecord.run_id == run_id,
-                    CheckpointRecord.id == checkpoint_id,
-                )
-            )
-            if checkpoint_exists is None:
-                return None
             row = await database.scalar(
                 select(RunRecord)
                 .where(
@@ -646,15 +646,217 @@ class PostgresRunRepository:
             )
             if row is None:
                 return None
-            row.last_checkpoint_id = checkpoint_id
-            return _run_domain(row)
+            checkpoint = await database.scalar(
+                select(CheckpointRecord)
+                .where(
+                    CheckpointRecord.tenant_id == tenant_id,
+                    CheckpointRecord.run_id == run_id,
+                    CheckpointRecord.id == checkpoint_id,
+                )
+                .with_for_update()
+            )
+            if checkpoint is None:
+                return None
+            session = await database.scalar(
+                select(SessionRecord)
+                .where(
+                    SessionRecord.tenant_id == tenant_id,
+                    SessionRecord.id == row.session_id,
+                )
+                .with_for_update()
+            )
+            if session is None:
+                raise DomainOperationError(
+                    code="rewind_session_missing",
+                    message="the run's durable session is unavailable",
+                    retryable=True,
+                )
+            rewound = rewind_run(_run_domain(row), checkpoint_id)
+            await self._seed_rewind_branch(
+                database,
+                tenant_id=tenant_id,
+                run=row,
+                checkpoint=checkpoint,
+                execution_epoch=rewound.execution_epoch,
+            )
+            session.context_generation += 1
+            await database.execute(
+                update(ContextCompactionRecord)
+                .where(
+                    ContextCompactionRecord.tenant_id == tenant_id,
+                    ContextCompactionRecord.session_id == row.session_id,
+                    ContextCompactionRecord.status == "pending",
+                )
+                .values(
+                    status="failed",
+                    error={
+                        "code": "context_compaction_superseded",
+                        "message": "the source conversation was rewound",
+                        "retryable": False,
+                        "details": {},
+                    },
+                    completed_at=func.greatest(
+                        func.now(),
+                        ContextCompactionRecord.requested_at,
+                    ),
+                )
+            )
+            await database.execute(
+                update(MemoryExtractionJobRecord)
+                .where(
+                    MemoryExtractionJobRecord.tenant_id == tenant_id,
+                    MemoryExtractionJobRecord.run_id == run_id,
+                    MemoryExtractionJobRecord.execution_epoch == row.execution_epoch,
+                    MemoryExtractionJobRecord.status.in_(("pending", "running")),
+                )
+                .values(
+                    status="failed",
+                    started_at=func.coalesce(
+                        MemoryExtractionJobRecord.started_at,
+                        MemoryExtractionJobRecord.created_at,
+                    ),
+                    completed_at=func.greatest(
+                        func.now(),
+                        MemoryExtractionJobRecord.created_at,
+                        func.coalesce(
+                            MemoryExtractionJobRecord.started_at,
+                            MemoryExtractionJobRecord.created_at,
+                        ),
+                    ),
+                    worker_id=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    error={
+                        "code": "memory_extraction_superseded",
+                        "message": "the source run was rewound",
+                        "retryable": False,
+                        "details": {},
+                    },
+                )
+            )
+            _apply_run(row, rewound)
+            row.retry_ready_at = None
+        await self._publish_wakeup(rewound.id)
+        return rewound
+
+    @staticmethod
+    async def _seed_rewind_branch(
+        database: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        run: RunRecord,
+        checkpoint: CheckpointRecord,
+        execution_epoch: int,
+    ) -> None:
+        """Copy only the selected prefix and plan into the new active branch."""
+
+        if not 0 <= checkpoint.message_sequence <= _MAX_TRANSCRIPT_SUFFIX_MESSAGES:
+            raise DomainOperationError(
+                code="rewind_checkpoint_invalid",
+                message="the checkpoint message sequence exceeds the rewind limit",
+            )
+        rows = tuple(
+            await database.scalars(
+                select(MessageRecord)
+                .where(
+                    MessageRecord.tenant_id == tenant_id,
+                    MessageRecord.run_id == run.id,
+                    MessageRecord.execution_epoch == checkpoint.execution_epoch,
+                    MessageRecord.created_at <= checkpoint.created_at,
+                )
+                .order_by(MessageRecord.sequence)
+                .limit(_MAX_TRANSCRIPT_SUFFIX_MESSAGES + 1)
+            )
+        )
+        if len(rows) > _MAX_TRANSCRIPT_SUFFIX_MESSAGES:
+            raise DomainOperationError(
+                code="rewind_context_limit",
+                message="the rewind branch seed exceeds the message limit",
+            )
+        retained: list[MessageRecord] = []
+        seen_transcript_positions: set[int] = set()
+        for message in rows:
+            metadata = message.metadata_json
+            if not isinstance(metadata, dict):
+                raise DomainOperationError(
+                    code="rewind_message_invalid",
+                    message="a durable rewind message has invalid metadata",
+                )
+            transcript_index = metadata.get("transcript_index")
+            if transcript_index is None:
+                retained.append(message)
+                continue
+            if type(transcript_index) is not int or transcript_index < 1:
+                raise DomainOperationError(
+                    code="rewind_message_invalid",
+                    message="a durable rewind message has an invalid transcript position",
+                )
+            if transcript_index <= checkpoint.message_sequence:
+                if transcript_index in seen_transcript_positions:
+                    raise DomainOperationError(
+                        code="rewind_message_invalid",
+                        message="durable rewind transcript positions are not unique",
+                    )
+                seen_transcript_positions.add(transcript_index)
+                retained.append(message)
+        next_sequence = (
+            int(
+                await database.scalar(
+                    select(func.coalesce(func.max(MessageRecord.sequence), 0)).where(
+                        MessageRecord.tenant_id == tenant_id,
+                        MessageRecord.session_id == run.session_id,
+                    )
+                )
+                or 0
+            )
+            + 1
+        )
+        for message in retained:
+            database.add(
+                MessageRecord(
+                    id=uuid.uuid5(
+                        run.id,
+                        f"rewind-epoch:{execution_epoch}:source-message:{message.id}",
+                    ),
+                    tenant_id=tenant_id,
+                    session_id=run.session_id,
+                    run_id=run.id,
+                    execution_epoch=execution_epoch,
+                    sequence=next_sequence,
+                    role=message.role,
+                    content=message.content,
+                    metadata_json=dict(message.metadata_json),
+                    created_at=func.now(),
+                )
+            )
+            next_sequence += 1
+        database.add(
+            TaskPlanRecord(
+                id=uuid.uuid5(
+                    checkpoint.id,
+                    f"rewind-epoch:{execution_epoch}:task-plan",
+                ),
+                tenant_id=tenant_id,
+                run_id=run.id,
+                execution_epoch=execution_epoch,
+                version=1,
+                plan=dict(checkpoint.task_plan),
+                created_at=func.now(),
+            )
+        )
 
 
 class PostgresApprovalRepository:
     """Durable tenant-scoped approval decisions."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        wakeup: Callable[[uuid.UUID], Awaitable[None]] | None = None,
+    ) -> None:
         self._sessions = sessions
+        self._wakeup = wakeup
 
     async def decide(
         self,
@@ -664,20 +866,46 @@ class PostgresApprovalRepository:
         decision: ApprovalDecision,
     ) -> PersistedApproval | None:
         status = ApprovalStatus.APPROVED if decision.approved else ApprovalStatus.REJECTED
+        did_resume = False
         async with self._sessions() as database, database.begin():
             row = await database.scalar(
                 select(ApprovalRecord)
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == ApprovalRecord.tenant_id)
+                    & (RunRecord.id == ApprovalRecord.run_id),
+                )
                 .where(
                     ApprovalRecord.tenant_id == tenant_id,
                     ApprovalRecord.run_id == run_id,
                     ApprovalRecord.id == approval_id,
+                    ApprovalRecord.execution_epoch == RunRecord.execution_epoch,
                 )
                 .with_for_update()
             )
             if row is None:
                 return None
+            tool_call_id = getattr(row, "tool_call_id", None)
+            if decision.approved and tool_call_id is not None:
+                tool_name = await database.scalar(
+                    select(ToolCallRecord.tool_name).where(
+                        ToolCallRecord.tenant_id == tenant_id,
+                        ToolCallRecord.run_id == run_id,
+                        ToolCallRecord.execution_epoch == row.execution_epoch,
+                        ToolCallRecord.tool_call_id == tool_call_id,
+                    )
+                )
+                if tool_name == "ask_user" and decision.response is None:
+                    raise DomainOperationError(
+                        code="interaction_response_required",
+                        message="ask_user approval requires a non-empty response",
+                    )
             if row.status != ApprovalStatus.PENDING.value:
-                if row.status != status.value:
+                if (
+                    row.status != status.value
+                    or row.decided_by != decision.decided_by
+                    or getattr(row, "response", None) != decision.response
+                ):
                     raise DomainOperationError(
                         code="approval_decision_conflict",
                         message="the approval already has a different durable decision",
@@ -687,6 +915,10 @@ class PostgresApprovalRepository:
             row.status = status.value
             row.decided_by = decision.decided_by
             row.decided_at = decision.decided_at
+            row.response = decision.response
+            # The remaining-approval query must observe this decision in the same
+            # transaction. Do not rely on session autoflush configuration here.
+            await database.flush()
             run_row = await database.scalar(
                 select(RunRecord)
                 .where(
@@ -698,13 +930,31 @@ class PostgresApprovalRepository:
             if run_row is None:
                 raise _persistence_conflict("approval run disappeared")
             if run_row.status == RunStatus.WAITING_APPROVAL.value:
-                resumed = transition_run(
-                    _run_domain(run_row),
-                    RunStatus.QUEUED,
-                    occurred_at=decision.decided_at,
+                remaining = int(
+                    await database.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.tenant_id == tenant_id,
+                            ApprovalRecord.run_id == run_id,
+                            ApprovalRecord.execution_epoch == row.execution_epoch,
+                            ApprovalRecord.status == ApprovalStatus.PENDING.value,
+                        )
+                    )
+                    or 0
                 )
-                _apply_run(run_row, resumed)
-            return _approval_domain(row)
+                if remaining == 0:
+                    resumed = transition_run(
+                        _run_domain(run_row),
+                        RunStatus.QUEUED,
+                        occurred_at=decision.decided_at,
+                    )
+                    _apply_run(run_row, resumed)
+                    did_resume = True
+            result = _approval_domain(row)
+        if did_resume and self._wakeup is not None:
+            await self._wakeup(run_id)
+        return result
 
 
 class PostgresExecutionRepository:
@@ -725,6 +975,7 @@ class PostgresExecutionRepository:
                     tenant_id=tenant_id,
                     session_id=message.session_id,
                     run_id=message.run_id,
+                    execution_epoch=message.execution_epoch,
                     sequence=message.sequence,
                     role=message.role.value,
                     content=message.content,
@@ -733,6 +984,114 @@ class PostgresExecutionRepository:
                 )
             )
         return message
+
+    async def append_transcript_fenced(
+        self,
+        lease: RunLease,
+        *,
+        start_index: int,
+        messages: tuple[GatewayMessage, ...],
+        occurred_at: datetime,
+    ) -> None:
+        """Append a replay-idempotent normalized transcript suffix under a run fence."""
+
+        if type(start_index) is not int or start_index < 0:
+            raise ValueError("transcript start index must be a nonnegative integer")
+        if not messages or len(messages) > _MAX_TRANSCRIPT_SUFFIX_MESSAGES:
+            raise ValueError("transcript suffix must contain between 1 and 4096 messages")
+        transcript_bytes = sum(
+            len(message.model_dump_json().encode("utf-8")) for message in messages
+        )
+        if transcript_bytes > _MAX_TRANSCRIPT_SUFFIX_BYTES:
+            raise DomainOperationError(
+                code="transcript_limit",
+                message="the durable transcript suffix exceeds its byte limit",
+            )
+        namespace = (
+            "transcript-message"
+            if lease.execution_epoch == 1
+            else f"execution-epoch:{lease.execution_epoch}:transcript-message"
+        )
+        identifiers = tuple(
+            uuid.uuid5(lease.run_id, f"{namespace}:{start_index + offset + 1}")
+            for offset in range(len(messages))
+        )
+        async with self._sessions() as database, database.begin():
+            await assert_active_run_lease(database, lease)
+            session = await database.scalar(
+                select(SessionRecord)
+                .where(
+                    SessionRecord.tenant_id == lease.tenant_id,
+                    SessionRecord.id == lease.session_id,
+                )
+                .with_for_update()
+            )
+            if session is None:
+                raise DomainOperationError(
+                    code="transcript_session_missing",
+                    message="the durable transcript session is unavailable",
+                )
+            existing_rows = tuple(
+                (
+                    await database.scalars(
+                        select(MessageRecord).where(
+                            MessageRecord.tenant_id == lease.tenant_id,
+                            MessageRecord.id.in_(identifiers),
+                        )
+                    )
+                ).all()
+            )
+            existing = {row.id: row for row in existing_rows}
+            next_sequence = (
+                int(
+                    await database.scalar(
+                        select(func.coalesce(func.max(MessageRecord.sequence), 0)).where(
+                            MessageRecord.tenant_id == lease.tenant_id,
+                            MessageRecord.session_id == lease.session_id,
+                        )
+                    )
+                    or 0
+                )
+                + 1
+            )
+            for identifier, message, transcript_index in zip(
+                identifiers,
+                messages,
+                range(start_index + 1, start_index + len(messages) + 1),
+                strict=True,
+            ):
+                metadata = message.model_dump(mode="json", exclude={"role", "content"})
+                metadata["transcript_index"] = transcript_index
+                row = existing.get(identifier)
+                if row is not None:
+                    if (
+                        row.session_id != lease.session_id
+                        or row.run_id != lease.run_id
+                        or row.execution_epoch != lease.execution_epoch
+                        or row.role != message.role.value
+                        or row.content != message.content
+                        or row.metadata_json != metadata
+                    ):
+                        raise DomainOperationError(
+                            code="transcript_message_conflict",
+                            message="the transcript position contains different durable content",
+                        )
+                    continue
+                database.add(
+                    MessageRecord(
+                        id=identifier,
+                        tenant_id=lease.tenant_id,
+                        session_id=lease.session_id,
+                        run_id=lease.run_id,
+                        execution_epoch=lease.execution_epoch,
+                        sequence=next_sequence,
+                        role=message.role.value,
+                        content=message.content,
+                        metadata_json=metadata,
+                        created_at=occurred_at,
+                    )
+                )
+                next_sequence += 1
 
     async def save_task_plan(
         self,
@@ -745,6 +1104,7 @@ class PostgresExecutionRepository:
                     id=task_plan.id,
                     tenant_id=tenant_id,
                     run_id=task_plan.run_id,
+                    execution_epoch=task_plan.execution_epoch,
                     version=task_plan.version,
                     plan=task_plan.plan.to_json_object(),
                     created_at=task_plan.created_at,
@@ -763,7 +1123,7 @@ class PostgresExecutionRepository:
     ) -> ToolCall:
         """Persist worker-owned tool state under the exact active run fence."""
 
-        if tool_call.run_id != lease.run_id:
+        if tool_call.run_id != lease.run_id or tool_call.execution_epoch != lease.execution_epoch:
             raise DomainOperationError(
                 code="tool_call_run_mismatch",
                 message="the tool call does not belong to the fenced run",
@@ -784,6 +1144,7 @@ class PostgresExecutionRepository:
             .where(
                 ToolCallRecord.tenant_id == tenant_id,
                 ToolCallRecord.run_id == tool_call.run_id,
+                ToolCallRecord.execution_epoch == tool_call.execution_epoch,
                 ToolCallRecord.tool_call_id == tool_call.id,
             )
             .with_for_update()
@@ -793,6 +1154,7 @@ class PostgresExecutionRepository:
                 id=uuid.uuid4(),
                 tenant_id=tenant_id,
                 run_id=tool_call.run_id,
+                execution_epoch=tool_call.execution_epoch,
                 tool_call_id=tool_call.id,
                 turn_number=tool_call.turn_number,
                 tool_name=tool_call.tool_name,
@@ -859,6 +1221,7 @@ class PostgresExecutionRepository:
                     id=approval.id,
                     tenant_id=tenant_id,
                     run_id=approval.run_id,
+                    execution_epoch=approval.execution_epoch,
                     tool_call_id=tool_call_id,
                     status=approval.status.value,
                     reason=approval.reason,
@@ -866,9 +1229,76 @@ class PostgresExecutionRepository:
                     decided_by=approval.decided_by,
                     requested_at=approval.requested_at,
                     decided_at=approval.decided_at,
+                    response=approval.response,
                 )
             )
         return approval
+
+    async def create_approval_fenced(
+        self,
+        lease: RunLease,
+        approval: PersistedApproval,
+        *,
+        tool_call_id: str,
+    ) -> PersistedApproval:
+        """Idempotently create one approval only under the current execution fence."""
+
+        if approval.run_id != lease.run_id or approval.execution_epoch != lease.execution_epoch:
+            raise DomainOperationError(
+                code="approval_run_mismatch",
+                message="the approval does not belong to the leased run",
+            )
+        async with self._sessions() as database, database.begin():
+            await assert_active_run_lease(database, lease)
+            tool = await database.scalar(
+                select(ToolCallRecord).where(
+                    ToolCallRecord.tenant_id == lease.tenant_id,
+                    ToolCallRecord.run_id == lease.run_id,
+                    ToolCallRecord.execution_epoch == lease.execution_epoch,
+                    ToolCallRecord.tool_call_id == tool_call_id,
+                )
+            )
+            if tool is None or tool.status != ToolCallStatus.WAITING_APPROVAL.value:
+                raise DomainOperationError(
+                    code="approval_tool_state_conflict",
+                    message="approval requires a matching waiting tool call",
+                )
+            row = await database.scalar(
+                select(ApprovalRecord)
+                .where(
+                    ApprovalRecord.tenant_id == lease.tenant_id,
+                    ApprovalRecord.run_id == lease.run_id,
+                    ApprovalRecord.execution_epoch == lease.execution_epoch,
+                    ApprovalRecord.id == approval.id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                database.add(
+                    ApprovalRecord(
+                        id=approval.id,
+                        tenant_id=lease.tenant_id,
+                        run_id=lease.run_id,
+                        execution_epoch=lease.execution_epoch,
+                        tool_call_id=tool_call_id,
+                        status=approval.status.value,
+                        reason=approval.reason,
+                        arguments=approval.arguments.to_json_object(),
+                        decided_by=approval.decided_by,
+                        requested_at=approval.requested_at,
+                        decided_at=approval.decided_at,
+                        response=approval.response,
+                    )
+                )
+                return approval
+            existing = _approval_domain(row)
+            if existing != approval or row.tool_call_id != tool_call_id:
+                raise DomainOperationError(
+                    code="approval_id_conflict",
+                    message="the approval ID belongs to another logical request",
+                    details={"approval_id": str(approval.id)},
+                )
+            return existing
 
     async def create_checkpoint(
         self,
@@ -881,8 +1311,13 @@ class PostgresExecutionRepository:
                     id=checkpoint.id,
                     tenant_id=tenant_id,
                     run_id=checkpoint.run_id,
+                    execution_epoch=checkpoint.execution_epoch,
                     session_id=checkpoint.session_id,
+                    tool_call_id=checkpoint.tool_call_id,
                     message_sequence=checkpoint.message_sequence,
+                    checkpoint_messages=[
+                        message.to_json_object() for message in checkpoint.messages
+                    ],
                     workspace_snapshot_uri=checkpoint.workspace_snapshot_uri,
                     workspace_revision=checkpoint.workspace_revision,
                     task_plan=checkpoint.task_plan.to_json_object(),
@@ -891,6 +1326,116 @@ class PostgresExecutionRepository:
                 )
             )
         return checkpoint
+
+    async def create_checkpoint_fenced(
+        self,
+        lease: RunLease,
+        checkpoint: Checkpoint,
+    ) -> Checkpoint:
+        """Persist one idempotent pre-tool checkpoint under the active run lease."""
+
+        if (
+            checkpoint.run_id != lease.run_id
+            or checkpoint.session_id != lease.session_id
+            or checkpoint.execution_epoch != lease.execution_epoch
+        ):
+            raise DomainOperationError(
+                code="checkpoint_run_mismatch",
+                message="the checkpoint does not belong to the leased run",
+            )
+        async with self._sessions() as database, database.begin():
+            await assert_active_run_lease(database, lease)
+            row = await database.scalar(
+                select(CheckpointRecord)
+                .where(
+                    CheckpointRecord.tenant_id == lease.tenant_id,
+                    CheckpointRecord.run_id == lease.run_id,
+                    CheckpointRecord.execution_epoch == lease.execution_epoch,
+                    CheckpointRecord.id == checkpoint.id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                database.add(
+                    CheckpointRecord(
+                        id=checkpoint.id,
+                        tenant_id=lease.tenant_id,
+                        run_id=checkpoint.run_id,
+                        execution_epoch=checkpoint.execution_epoch,
+                        session_id=checkpoint.session_id,
+                        tool_call_id=checkpoint.tool_call_id,
+                        message_sequence=checkpoint.message_sequence,
+                        checkpoint_messages=[
+                            message.to_json_object() for message in checkpoint.messages
+                        ],
+                        workspace_snapshot_uri=checkpoint.workspace_snapshot_uri,
+                        workspace_revision=checkpoint.workspace_revision,
+                        task_plan=checkpoint.task_plan.to_json_object(),
+                        context_summary=checkpoint.context_summary,
+                        created_at=checkpoint.created_at,
+                    )
+                )
+                return checkpoint
+            existing = Checkpoint(
+                id=row.id,
+                run_id=row.run_id,
+                session_id=row.session_id,
+                execution_epoch=row.execution_epoch,
+                tool_call_id=row.tool_call_id,
+                message_sequence=row.message_sequence,
+                messages=tuple(
+                    FrozenJsonObject(message) for message in getattr(row, "checkpoint_messages", [])
+                ),
+                workspace_snapshot_uri=row.workspace_snapshot_uri,
+                workspace_revision=row.workspace_revision,
+                task_plan=row.task_plan,
+                context_summary=row.context_summary,
+                created_at=row.created_at,
+            )
+            if existing != checkpoint:
+                raise DomainOperationError(
+                    code="checkpoint_id_conflict",
+                    message="the checkpoint ID belongs to different state",
+                    details={"checkpoint_id": str(checkpoint.id)},
+                )
+            return existing
+
+    async def complete_checkpoint_fenced(
+        self,
+        lease: RunLease,
+        checkpoint_id: uuid.UUID,
+        *,
+        workspace_snapshot_uri: str,
+        workspace_revision: str,
+    ) -> None:
+        """Bind a successful tool's durable post-state to its pre-tool checkpoint."""
+
+        async with self._sessions() as database, database.begin():
+            await assert_active_run_lease(database, lease)
+            row = await database.scalar(
+                select(CheckpointRecord)
+                .where(
+                    CheckpointRecord.tenant_id == lease.tenant_id,
+                    CheckpointRecord.run_id == lease.run_id,
+                    CheckpointRecord.execution_epoch == lease.execution_epoch,
+                    CheckpointRecord.id == checkpoint_id,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise DomainOperationError(
+                    code="checkpoint_not_found",
+                    message="the checkpoint does not exist",
+                )
+            existing = (row.completed_snapshot_uri, row.completed_revision)
+            requested = (workspace_snapshot_uri, workspace_revision)
+            if existing not in ((None, None), requested):
+                raise DomainOperationError(
+                    code="checkpoint_state_conflict",
+                    message="the checkpoint already has different completed state",
+                )
+            row.completed_snapshot_uri = workspace_snapshot_uri
+            row.completed_revision = workspace_revision
 
     async def save_model_call(
         self,
@@ -903,23 +1448,23 @@ class PostgresExecutionRepository:
                 .where(
                     ModelCallRecord.tenant_id == tenant_id,
                     ModelCallRecord.run_id == model_call.run_id,
+                    ModelCallRecord.execution_epoch == model_call.execution_epoch,
                     ModelCallRecord.model_call_id == model_call.id,
                 )
                 .with_for_update()
             )
             if row is None:
                 database.add(_model_call_record(tenant_id, model_call))
-            elif (
-                row.request_id != model_call.request_id
-                or row.route_name != model_call.route_name
-                or row.started_at != model_call.started_at
-            ):
+            elif row.request_id != model_call.request_id or row.route_name != model_call.route_name:
                 raise DomainOperationError(
                     code="model_call_id_conflict",
                     message="the model-call ID belongs to another logical request",
                     details={"model_call_id": model_call.id},
                 )
-            else:
+            elif not (
+                row.status == ModelCallStatus.COMPLETED.value
+                and model_call.status is ModelCallStatus.COMPLETED
+            ):
                 _apply_model_call(row, model_call)
         return model_call
 
@@ -933,6 +1478,7 @@ def _session_record(session: Session) -> SessionRecord:
         approval_mode=session.approval_mode.value,
         model_route=session.model_route,
         memory_enabled=session.memory_enabled,
+        context_generation=session.context_generation,
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -947,6 +1493,7 @@ def _session_domain(record: SessionRecord) -> Session:
         approval_mode=ApprovalMode(record.approval_mode),
         model_route=record.model_route,
         memory_enabled=record.memory_enabled,
+        context_generation=record.context_generation,
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
@@ -968,6 +1515,7 @@ def _run_values(
         "priority_class": run.priority_class.value,
         "priority": run.priority,
         "attempt": run.attempt,
+        "execution_epoch": run.execution_epoch,
         "assigned_worker_id": run.assigned_worker_id,
         "lease_expires_at": run.lease_expires_at,
         "last_checkpoint_id": run.last_checkpoint_id,
@@ -991,6 +1539,7 @@ def _run_domain(record: RunRecord) -> Run:
         priority_class=RunPriorityClass(record.priority_class),
         priority=record.priority,
         attempt=record.attempt,
+        execution_epoch=record.execution_epoch,
         assigned_worker_id=record.assigned_worker_id,
         lease_expires_at=record.lease_expires_at,
         last_checkpoint_id=record.last_checkpoint_id,
@@ -1006,6 +1555,7 @@ def _run_domain(record: RunRecord) -> Run:
 def _apply_run(record: RunRecord, run: Run) -> None:
     record.status = run.status.value
     record.attempt = run.attempt
+    record.execution_epoch = run.execution_epoch
     record.assigned_worker_id = run.assigned_worker_id
     record.lease_expires_at = run.lease_expires_at
     record.last_checkpoint_id = run.last_checkpoint_id
@@ -1020,12 +1570,14 @@ def _approval_domain(record: ApprovalRecord) -> PersistedApproval:
     return PersistedApproval(
         id=record.id,
         run_id=record.run_id,
+        execution_epoch=record.execution_epoch,
         status=ApprovalStatus(record.status),
         reason=record.reason,
         arguments=record.arguments,
         decided_by=record.decided_by,
         requested_at=record.requested_at,
         decided_at=record.decided_at,
+        response=getattr(record, "response", None),
     )
 
 
@@ -1034,6 +1586,7 @@ def _model_call_record(tenant_id: uuid.UUID, model_call: ModelCall) -> ModelCall
         id=uuid.uuid4(),
         tenant_id=tenant_id,
         run_id=model_call.run_id,
+        execution_epoch=model_call.execution_epoch,
         model_call_id=model_call.id,
         request_id=model_call.request_id,
         route_name=model_call.route_name,
@@ -1081,6 +1634,7 @@ def _tool_call_domain(record: ToolCallRecord) -> ToolCall:
     return ToolCall(
         id=record.tool_call_id,
         run_id=record.run_id,
+        execution_epoch=record.execution_epoch,
         turn_number=record.turn_number,
         tool_name=record.tool_name,
         arguments=record.arguments,

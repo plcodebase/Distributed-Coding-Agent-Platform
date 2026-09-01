@@ -169,6 +169,7 @@ class InMemoryCheckpointCoordinator:
                 id=checkpoint_id,
                 run_id=run_id,
                 session_id=self._session_id,
+                tool_call_id=validated_tool_call_id,
                 message_sequence=len(stored_messages),
                 workspace_snapshot_uri=snapshot.uri,
                 workspace_revision=snapshot.revision,

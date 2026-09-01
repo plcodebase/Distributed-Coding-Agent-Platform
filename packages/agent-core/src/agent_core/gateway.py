@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid  # noqa: TC003 - Pydantic resolves this field type at runtime
+from decimal import Decimal  # noqa: TC003 - Pydantic resolves this field at runtime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
 
@@ -92,6 +93,7 @@ class GatewayRequest(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     turn_number: int = Field(ge=1, le=100)
     model_call_id: GatewayRequestIdentifier
     request_id: GatewayRequestIdentifier
@@ -162,6 +164,7 @@ class GatewayResponseCompleted(DomainModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cached_tokens: int = Field(default=0, ge=0)
+    estimated_cost_usd: Decimal | None = Field(default=None, ge=0, max_digits=20, decimal_places=10)
     provider: IdentifierString | None = None
     model: IdentifierString | None = None
 

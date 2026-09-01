@@ -84,6 +84,7 @@ EVENT_CASES = [
     (
         EventType.TOOL_APPROVAL_REQUIRED,
         {
+            "approval_id": "00000000-0000-0000-0000-000000000099",
             "tool_call_id": "tool-call-1",
             "tool_name": "read_file",
             "arguments": ARGUMENTS,
@@ -121,6 +122,7 @@ EVENT_CASES = [
         EventType.CHECKPOINT_CREATED,
         {
             "checkpoint_id": str(CHECKPOINT_ID),
+            "tool_call_id": "tool-call-1",
             "message_sequence": 3,
             "workspace_revision": "abc123",
         },
@@ -276,6 +278,7 @@ def test_event_payload_rejects_extra_or_mismatched_fields() -> None:
                 **base,
                 "event_type": EventType.TOOL_APPROVAL_REQUIRED,
                 "payload": {
+                    "approval_id": "00000000-0000-0000-0000-000000000099",
                     "tool_call_id": "tool-call-1",
                     "tool_name": "read_file",
                     "arguments": ARGUMENTS,

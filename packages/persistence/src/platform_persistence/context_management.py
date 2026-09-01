@@ -11,6 +11,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_core.control import (
+    MAX_REFERENCED_WORKSPACE_FILES,
     ContextCompactionStatus,
     IdempotencyKey,
     MemoryExtractionJob,
@@ -18,6 +19,7 @@ from agent_core.control import (
     MemoryKind,
     PersistedContextCompaction,
     PersistedMemory,
+    PersistedMessage,
     PersistedTaskState,
     TaskPlanUpdate,
     TaskStatus,
@@ -25,6 +27,8 @@ from agent_core.control import (
 )
 from agent_core.domain.base import FrozenJsonObject, normalize_timestamp
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
+from agent_core.gateway import MessageRole
+from agent_core.workspace_access import WorkspaceFileReference
 from platform_persistence.models import (
     ContextCompactionRecord,
     MemoryExtractionJobRecord,
@@ -44,6 +48,7 @@ if TYPE_CHECKING:
 
 
 MAX_MEMORY_RESULTS = 500
+MAX_CONTEXT_HISTORY_MESSAGES = 4096
 MAX_MEMORIES_PER_EXTRACTION = 100
 MAX_MEMORY_SOURCE_MESSAGES = 2000
 MEMORY_SOURCE_BATCH_SIZE = 64
@@ -57,6 +62,131 @@ class PostgresContextRepository:
 
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
+
+    async def list_messages(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        after_sequence: int | None = None,
+        through_sequence: int | None = None,
+        limit: int = MAX_CONTEXT_HISTORY_MESSAGES,
+    ) -> tuple[PersistedMessage, ...]:
+        """Load one chronological, bounded conversation slice for context assembly."""
+
+        for name, value in (
+            ("after_sequence", after_sequence),
+            ("through_sequence", through_sequence),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if (
+            after_sequence is not None
+            and through_sequence is not None
+            and through_sequence < after_sequence
+        ):
+            raise ValueError("through_sequence may not precede after_sequence")
+        if type(limit) is not int or not 1 <= limit <= MAX_CONTEXT_HISTORY_MESSAGES:
+            raise ValueError("context history limit must be in [1, 4096]")
+        statement = (
+            select(MessageRecord)
+            .join(
+                RunRecord,
+                (RunRecord.tenant_id == MessageRecord.tenant_id)
+                & (RunRecord.id == MessageRecord.run_id),
+            )
+            .where(
+                MessageRecord.tenant_id == tenant_id,
+                MessageRecord.session_id == session_id,
+                MessageRecord.execution_epoch == RunRecord.execution_epoch,
+            )
+        )
+        if after_sequence is not None:
+            statement = statement.where(MessageRecord.sequence > after_sequence)
+        if through_sequence is not None:
+            statement = statement.where(MessageRecord.sequence <= through_sequence)
+        async with self._sessions() as database:
+            rows = tuple(
+                await database.scalars(statement.order_by(MessageRecord.sequence).limit(limit + 1))
+            )
+        if len(rows) > limit:
+            raise DomainOperationError(
+                code="context_history_limit",
+                message="durable conversation history exceeds the configured message limit",
+                details={"limit": limit},
+            )
+        try:
+            return tuple(
+                PersistedMessage(
+                    id=row.id,
+                    session_id=row.session_id,
+                    run_id=row.run_id,
+                    execution_epoch=row.execution_epoch,
+                    sequence=row.sequence,
+                    role=MessageRole(row.role),
+                    content=row.content,
+                    metadata=FrozenJsonObject(row.metadata_json),
+                    created_at=row.created_at,
+                )
+                for row in rows
+            )
+        except (TypeError, ValueError):
+            raise DomainOperationError(
+                code="context_history_invalid",
+                message="durable conversation history contains invalid data",
+            ) from None
+
+    async def referenced_files_for_run(
+        self,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+    ) -> tuple[WorkspaceFileReference, ...]:
+        """Load the immutable explicit references from a run's original submission."""
+
+        async with self._sessions() as database:
+            metadata = await database.scalar(
+                select(MessageRecord.metadata_json)
+                .where(
+                    MessageRecord.tenant_id == tenant_id,
+                    MessageRecord.run_id == run_id,
+                )
+                .order_by(MessageRecord.execution_epoch, MessageRecord.sequence)
+                .limit(1)
+            )
+        if metadata is None:
+            return ()
+        if not isinstance(metadata, dict):
+            raise DomainOperationError(
+                code="context_references_invalid",
+                message="the durable run submission metadata is invalid",
+            )
+        if metadata.get("source") != "run_submission":
+            # Runs created before explicit references were introduced have no
+            # submission marker. They remain valid and simply contribute no files.
+            return ()
+        raw_references = metadata.get("referenced_files", [])
+        if not isinstance(raw_references, list):
+            raise DomainOperationError(
+                code="context_references_invalid",
+                message="the durable run file references are invalid",
+            )
+        try:
+            references = tuple(
+                WorkspaceFileReference.model_validate(item) for item in raw_references
+            )
+        except (TypeError, ValueError):
+            raise DomainOperationError(
+                code="context_references_invalid",
+                message="the durable run file references are invalid",
+            ) from None
+        if len(references) > MAX_REFERENCED_WORKSPACE_FILES or len(
+            {item.path for item in references}
+        ) != len(references):
+            raise DomainOperationError(
+                code="context_references_invalid",
+                message="the durable run file references are invalid",
+            )
+        return references
 
     async def request_compaction(
         self,
@@ -92,6 +222,7 @@ class PostgresContextRepository:
                 .where(
                     ContextCompactionRecord.tenant_id == tenant_id,
                     ContextCompactionRecord.session_id == session_id,
+                    ContextCompactionRecord.context_generation == session.context_generation,
                     ContextCompactionRecord.status == ContextCompactionStatus.PENDING.value,
                 )
                 .order_by(ContextCompactionRecord.requested_at, ContextCompactionRecord.id)
@@ -106,9 +237,16 @@ class PostgresContextRepository:
                 )
             source_sequence = int(
                 await database.scalar(
-                    select(func.coalesce(func.max(MessageRecord.sequence), 0)).where(
+                    select(func.coalesce(func.max(MessageRecord.sequence), 0))
+                    .join(
+                        RunRecord,
+                        (RunRecord.tenant_id == MessageRecord.tenant_id)
+                        & (RunRecord.id == MessageRecord.run_id),
+                    )
+                    .where(
                         MessageRecord.tenant_id == tenant_id,
                         MessageRecord.session_id == session_id,
+                        MessageRecord.execution_epoch == RunRecord.execution_epoch,
                     )
                 )
                 or 0
@@ -119,6 +257,7 @@ class PostgresContextRepository:
                     id=compaction_id,
                     tenant_id=tenant_id,
                     session_id=session_id,
+                    context_generation=session.context_generation,
                     status=ContextCompactionStatus.PENDING.value,
                     idempotency_key=idempotency_key,
                     source_message_sequence=source_sequence,
@@ -143,6 +282,130 @@ class PostgresContextRepository:
                 raise _state_conflict("compaction request disappeared after insertion")
             return _validate_compaction_replay(row, route_name=route_name)
 
+    async def request_compaction_if_needed(
+        self,
+        tenant_id: uuid.UUID,
+        session_id: uuid.UUID,
+        *,
+        after_message_sequence: int | None,
+        threshold_messages: int,
+        route_name: str,
+        requested_at: datetime,
+    ) -> PersistedContextCompaction | None:
+        """Atomically schedule compaction before the bounded history query is exhausted."""
+
+        if after_message_sequence is not None and (
+            type(after_message_sequence) is not int or after_message_sequence < 0
+        ):
+            raise ValueError("after_message_sequence must be a nonnegative integer")
+        if type(threshold_messages) is not int or not (
+            1 <= threshold_messages < MAX_CONTEXT_HISTORY_MESSAGES
+        ):
+            raise ValueError("threshold_messages must be in [1, 4095]")
+        requested = normalize_timestamp(requested_at)
+        async with self._sessions() as database, database.begin():
+            session = await database.scalar(
+                select(SessionRecord)
+                .where(
+                    SessionRecord.tenant_id == tenant_id,
+                    SessionRecord.id == session_id,
+                )
+                .with_for_update()
+            )
+            if session is None:
+                return None
+            pending = await database.scalar(
+                select(ContextCompactionRecord)
+                .where(
+                    ContextCompactionRecord.tenant_id == tenant_id,
+                    ContextCompactionRecord.session_id == session_id,
+                    ContextCompactionRecord.context_generation == session.context_generation,
+                    ContextCompactionRecord.status == ContextCompactionStatus.PENDING.value,
+                )
+                .order_by(ContextCompactionRecord.requested_at, ContextCompactionRecord.id)
+                .limit(1)
+            )
+            if pending is not None:
+                return _compaction_domain(pending)
+            count_statement = (
+                select(func.count(MessageRecord.id))
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == MessageRecord.tenant_id)
+                    & (RunRecord.id == MessageRecord.run_id),
+                )
+                .where(
+                    MessageRecord.tenant_id == tenant_id,
+                    MessageRecord.session_id == session_id,
+                    MessageRecord.execution_epoch == RunRecord.execution_epoch,
+                )
+            )
+            source_statement = (
+                select(func.coalesce(func.max(MessageRecord.sequence), 0))
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == MessageRecord.tenant_id)
+                    & (RunRecord.id == MessageRecord.run_id),
+                )
+                .where(
+                    MessageRecord.tenant_id == tenant_id,
+                    MessageRecord.session_id == session_id,
+                    MessageRecord.execution_epoch == RunRecord.execution_epoch,
+                )
+            )
+            if after_message_sequence is not None:
+                count_statement = count_statement.where(
+                    MessageRecord.sequence > after_message_sequence
+                )
+                source_statement = source_statement.where(
+                    MessageRecord.sequence > after_message_sequence
+                )
+            uncompacted_count = int(await database.scalar(count_statement) or 0)
+            if uncompacted_count < threshold_messages:
+                return None
+            source_sequence = int(await database.scalar(source_statement) or 0)
+            idempotency_key = f"auto-context-{session.context_generation}-{source_sequence}"
+            existing = await self._by_idempotency_key(
+                database,
+                tenant_id,
+                session_id,
+                idempotency_key,
+            )
+            if existing is not None:
+                current = _validate_compaction_replay(existing, route_name=route_name)
+                return current if current.status is ContextCompactionStatus.PENDING else None
+            compaction_id = uuid.uuid5(session_id, idempotency_key)
+            await database.execute(
+                insert(ContextCompactionRecord)
+                .values(
+                    id=compaction_id,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    context_generation=session.context_generation,
+                    status=ContextCompactionStatus.PENDING.value,
+                    idempotency_key=idempotency_key,
+                    source_message_sequence=source_sequence,
+                    route_name=route_name,
+                    requested_at=requested,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=(
+                        ContextCompactionRecord.tenant_id,
+                        ContextCompactionRecord.session_id,
+                        ContextCompactionRecord.idempotency_key,
+                    )
+                )
+            )
+            row = await self._by_idempotency_key(
+                database,
+                tenant_id,
+                session_id,
+                idempotency_key,
+            )
+            if row is None:
+                raise _state_conflict("proactive compaction disappeared after insertion")
+            return _validate_compaction_replay(row, route_name=route_name)
+
     async def pending_for_session(
         self,
         tenant_id: uuid.UUID,
@@ -151,9 +414,15 @@ class PostgresContextRepository:
         async with self._sessions() as database:
             row = await database.scalar(
                 select(ContextCompactionRecord)
+                .join(
+                    SessionRecord,
+                    (SessionRecord.tenant_id == ContextCompactionRecord.tenant_id)
+                    & (SessionRecord.id == ContextCompactionRecord.session_id),
+                )
                 .where(
                     ContextCompactionRecord.tenant_id == tenant_id,
                     ContextCompactionRecord.session_id == session_id,
+                    ContextCompactionRecord.context_generation == SessionRecord.context_generation,
                     ContextCompactionRecord.status == ContextCompactionStatus.PENDING.value,
                 )
                 .order_by(ContextCompactionRecord.requested_at, ContextCompactionRecord.id)
@@ -187,9 +456,15 @@ class PostgresContextRepository:
         async with self._sessions() as database:
             row = await database.scalar(
                 select(ContextCompactionRecord)
+                .join(
+                    SessionRecord,
+                    (SessionRecord.tenant_id == ContextCompactionRecord.tenant_id)
+                    & (SessionRecord.id == ContextCompactionRecord.session_id),
+                )
                 .where(
                     ContextCompactionRecord.tenant_id == tenant_id,
                     ContextCompactionRecord.session_id == session_id,
+                    ContextCompactionRecord.context_generation == SessionRecord.context_generation,
                     ContextCompactionRecord.status == ContextCompactionStatus.COMPLETED.value,
                 )
                 .order_by(ContextCompactionRecord.completed_at.desc())
@@ -319,9 +594,15 @@ class PostgresTaskRepository:
         async with self._sessions() as database:
             row = await database.scalar(
                 select(TaskPlanRecord)
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == TaskPlanRecord.tenant_id)
+                    & (RunRecord.id == TaskPlanRecord.run_id),
+                )
                 .where(
                     TaskPlanRecord.tenant_id == tenant_id,
                     TaskPlanRecord.run_id == run_id,
+                    TaskPlanRecord.execution_epoch == RunRecord.execution_epoch,
                 )
                 .order_by(TaskPlanRecord.version.desc())
                 .limit(1)
@@ -338,18 +619,19 @@ class PostgresTaskRepository:
         created_at: datetime,
     ) -> PersistedTaskState | None:
         async with self._sessions() as database, database.begin():
-            run_exists = await database.scalar(
-                select(RunRecord.id)
+            run_record = await database.scalar(
+                select(RunRecord)
                 .where(RunRecord.tenant_id == tenant_id, RunRecord.id == run_id)
                 .with_for_update()
             )
-            if run_exists is None:
+            if run_record is None:
                 return None
             row = await database.scalar(
                 select(TaskPlanRecord)
                 .where(
                     TaskPlanRecord.tenant_id == tenant_id,
                     TaskPlanRecord.run_id == run_id,
+                    TaskPlanRecord.execution_epoch == run_record.execution_epoch,
                 )
                 .order_by(TaskPlanRecord.version.desc())
                 .limit(1)
@@ -367,6 +649,7 @@ class PostgresTaskRepository:
             state = PersistedTaskState(
                 id=plan_id,
                 run_id=run_id,
+                execution_epoch=run_record.execution_epoch,
                 version=current_version + 1,
                 tasks=update.tasks,
                 created_at=created_at,
@@ -376,6 +659,7 @@ class PostgresTaskRepository:
                     id=state.id,
                     tenant_id=tenant_id,
                     run_id=run_id,
+                    execution_epoch=state.execution_epoch,
                     version=state.version,
                     plan={"tasks": [task.model_dump(mode="json") for task in state.tasks]},
                     created_at=state.created_at,
@@ -436,10 +720,16 @@ class PostgresMemoryRepository:
                 return ()
             rows = await database.scalars(
                 select(MemoryRecord)
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == MemoryRecord.tenant_id)
+                    & (RunRecord.id == MemoryRecord.source_run_id),
+                )
                 .where(
                     MemoryRecord.tenant_id == tenant_id,
                     MemoryRecord.session_id == session_id,
                     MemoryRecord.archived_at.is_(None),
+                    MemoryRecord.execution_epoch == RunRecord.execution_epoch,
                 )
                 .order_by(MemoryRecord.extracted_at.desc(), MemoryRecord.id)
                 .limit(limit)
@@ -493,7 +783,13 @@ class PostgresMemoryRepository:
         async with self._sessions() as database, database.begin():
             row = await database.scalar(
                 select(MemoryExtractionJobRecord)
+                .join(
+                    RunRecord,
+                    (RunRecord.tenant_id == MemoryExtractionJobRecord.tenant_id)
+                    & (RunRecord.id == MemoryExtractionJobRecord.run_id),
+                )
                 .where(
+                    MemoryExtractionJobRecord.execution_epoch == RunRecord.execution_epoch,
                     or_(
                         MemoryExtractionJobRecord.status == MemoryExtractionStatus.PENDING.value,
                         (
@@ -503,7 +799,7 @@ class PostgresMemoryRepository:
                             )
                             & (MemoryExtractionJobRecord.lease_expires_at <= occurred_at)
                         ),
-                    )
+                    ),
                 )
                 .order_by(
                     func.coalesce(
@@ -572,6 +868,7 @@ class PostgresMemoryRepository:
                     MessageRecord.tenant_id == job.tenant_id,
                     MessageRecord.session_id == job.session_id,
                     MessageRecord.run_id == job.run_id,
+                    MessageRecord.execution_epoch == job.execution_epoch,
                     MessageRecord.sequence <= job.source_message_sequence,
                 )
                 .order_by(MessageRecord.sequence.desc())
@@ -621,6 +918,7 @@ class PostgresMemoryRepository:
                         memory.tenant_id != job.tenant_id
                         or memory.session_id != job.session_id
                         or memory.source_run_id != job.run_id
+                        or memory.execution_epoch != job.execution_epoch
                     ):
                         raise ValueError("memory provenance does not match its extraction job")
                     await database.execute(
@@ -630,6 +928,7 @@ class PostgresMemoryRepository:
                             tenant_id=row.tenant_id,
                             session_id=memory.session_id,
                             source_run_id=memory.source_run_id,
+                            execution_epoch=memory.execution_epoch,
                             kind=memory.kind.value,
                             content=memory.content,
                             content_hash=memory.content_hash,
@@ -641,6 +940,7 @@ class PostgresMemoryRepository:
                             index_elements=(
                                 MemoryRecord.tenant_id,
                                 MemoryRecord.session_id,
+                                MemoryRecord.execution_epoch,
                                 MemoryRecord.kind,
                                 MemoryRecord.content_hash,
                             )
@@ -684,6 +984,7 @@ class PostgresMemoryRepository:
                 MemoryExtractionJobRecord.tenant_id == job.tenant_id,
                 MemoryExtractionJobRecord.session_id == job.session_id,
                 MemoryExtractionJobRecord.run_id == job.run_id,
+                MemoryExtractionJobRecord.execution_epoch == job.execution_epoch,
                 MemoryExtractionJobRecord.source_message_sequence == job.source_message_sequence,
             )
             .with_for_update()
@@ -729,6 +1030,7 @@ def _compaction_domain(record: ContextCompactionRecord) -> PersistedContextCompa
     return PersistedContextCompaction(
         id=record.id,
         session_id=record.session_id,
+        context_generation=record.context_generation,
         status=ContextCompactionStatus(record.status),
         idempotency_key=record.idempotency_key,
         source_message_sequence=record.source_message_sequence,
@@ -756,6 +1058,7 @@ def _task_state_domain(record: TaskPlanRecord) -> PersistedTaskState:
     return PersistedTaskState(
         id=record.id,
         run_id=record.run_id,
+        execution_epoch=record.execution_epoch,
         version=record.version,
         tasks=tasks,
         created_at=record.created_at,
@@ -768,6 +1071,7 @@ def _memory_domain(record: MemoryRecord) -> PersistedMemory:
         tenant_id=record.tenant_id,
         session_id=record.session_id,
         source_run_id=record.source_run_id,
+        execution_epoch=record.execution_epoch,
         kind=MemoryKind(record.kind),
         content=record.content,
         content_hash=record.content_hash,
@@ -783,6 +1087,7 @@ def _memory_job_domain(record: MemoryExtractionJobRecord) -> MemoryExtractionJob
         tenant_id=record.tenant_id,
         session_id=record.session_id,
         run_id=record.run_id,
+        execution_epoch=record.execution_epoch,
         status=MemoryExtractionStatus(record.status),
         source_message_sequence=record.source_message_sequence,
         attempt=record.attempt,

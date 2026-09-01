@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import hashlib
+import uuid
+from typing import TYPE_CHECKING, Protocol
 
 from agent_core._loop_events import LoopEventFactory
 from agent_core._loop_safety import redact_json
@@ -14,9 +16,12 @@ from agent_core._loop_types import (
     AgentLoopInput,
     Clock,
     IdGenerator,
+    UtcClock,
+    UuidIdGenerator,
 )
 from agent_core._model_turn import ModelTurnFailure, ModelTurnResult, ModelTurnRunner
 from agent_core._tool_turn import ToolOutcome, ToolTurnExecutor
+from agent_core.domain.models import canonical_argument_hash
 from agent_core.events import (
     MAX_EVENT_PAYLOAD_BYTES,
     AnyAgentEvent,
@@ -33,11 +38,25 @@ from agent_core.gateway import (
 )
 from platform_telemetry import PlatformTelemetry, Redactor
 
+_MAX_EXECUTION_IDENTIFIER_LENGTH = 255
+
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from agent_core.checkpoints import CheckpointCoordinator
     from agent_core.tools import ToolRegistry
+
+
+class TranscriptJournal(Protocol):
+    """Append newly produced normalized messages before a run can report success."""
+
+    async def append(
+        self,
+        run_id: uuid.UUID,
+        *,
+        start_index: int,
+        messages: tuple[GatewayMessage, ...],
+    ) -> None: ...
 
 
 def _redact_message(message: GatewayMessage, redactor: Redactor) -> GatewayMessage:
@@ -77,12 +96,15 @@ class AgentLoop:
         redactor: Redactor | None = None,
         checkpoints: CheckpointCoordinator | None = None,
         telemetry: PlatformTelemetry | None = None,
+        transcript_journal: TranscriptJournal | None = None,
+        approval_id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
     ) -> None:
         self._tools = tools
         self._clock = clock
         self._id_generator = id_generator
         self._config = config or AgentLoopConfig()
         self._redactor = redactor or Redactor()
+        self._transcript_journal = transcript_journal
         self._model_turns = ModelTurnRunner(
             gateway=gateway,
             config=self._config,
@@ -94,6 +116,7 @@ class AgentLoop:
             redactor=self._redactor,
             checkpoints=checkpoints,
             telemetry=telemetry,
+            approval_id_factory=approval_id_factory,
         )
 
     async def run(  # noqa: PLR0911, PLR0912, PLR0915 - explicit terminal policy paths
@@ -104,6 +127,7 @@ class AgentLoop:
 
         events = LoopEventFactory(run_id=loop_input.run_id, clock=self._clock)
         transcript = [_redact_message(message, self._redactor) for message in loop_input.messages]
+        journaled_message_count = len(transcript)
         tool_call_count = 0
         semantic_retry_count = 0
         outcomes = {
@@ -117,6 +141,7 @@ class AgentLoop:
             for outcome in loop_input.prior_tool_outcomes
         }
         last_checkpoint_id = loop_input.checkpoint_id
+        task_plan = loop_input.task_plan
 
         yield events.run_started(
             attempt=loop_input.attempt,
@@ -126,6 +151,74 @@ class AgentLoop:
             message_count=len(transcript),
             checkpoint_id=loop_input.checkpoint_id,
         )
+
+        if loop_input.pending_tool_calls:
+            pending_calls = tuple(
+                GatewayToolCall(
+                    id=item.tool_call_id,
+                    name=item.tool_name,
+                    arguments=item.arguments,
+                )
+                for item in loop_input.pending_tool_calls
+            )
+            if not _ends_with_tool_calls(transcript, pending_calls):
+                transcript.append(
+                    GatewayMessage(
+                        role=MessageRole.ASSISTANT,
+                        content="",
+                        tool_calls=pending_calls,
+                    )
+                )
+            journaled_message_count = await self._journal_new(
+                loop_input.run_id,
+                transcript,
+                journaled_message_count,
+            )
+            for call in pending_calls:
+                yield events.tool_received(
+                    model_call_id="approval-resume",
+                    tool_call=call,
+                    argument_hash=canonical_argument_hash(call.arguments),
+                )
+            tool_call_count += len(pending_calls)
+            pending_report = await self._tool_turns.execute(
+                pending_calls,
+                (),
+                events=events,
+                transcript=transcript,
+                outcomes=outcomes,
+                semantic_retry_count=semantic_retry_count,
+                tenant_id=loop_input.tenant_id,
+                session_id=loop_input.session_id,
+                run_id=loop_input.run_id,
+                turn_number=loop_input.pending_tool_calls[0].turn_number,
+                task_plan=task_plan,
+                context_summary=loop_input.context_summary,
+                approval_mode=loop_input.approval_mode,
+                approval_decisions={
+                    item.tool_call_id: item.approval_approved
+                    for item in loop_input.pending_tool_calls
+                    if item.approval_approved is not None
+                },
+                approval_responses={
+                    item.tool_call_id: item.approval_response
+                    for item in loop_input.pending_tool_calls
+                    if item.approval_response is not None
+                },
+            )
+            if pending_report.last_checkpoint_id is not None:
+                last_checkpoint_id = pending_report.last_checkpoint_id
+            if pending_report.updated_task_plan is not None:
+                task_plan = pending_report.updated_task_plan
+            journaled_message_count = await self._journal_new(
+                loop_input.run_id,
+                transcript,
+                journaled_message_count,
+            )
+            for event in pending_report.events:
+                yield event
+            if pending_report.terminal:
+                return
 
         for turn_number in range(1, self._config.max_turns + 1):
             if len(transcript) > self._config.max_context_messages:
@@ -141,12 +234,19 @@ class AgentLoop:
                 )
                 return
 
-            model_call_id = self._id_generator.new_id("model-call")
-            request_id = self._id_generator.new_id("request")
+            model_call_id = _execution_identifier(
+                self._id_generator.new_id("model-call"),
+                loop_input.execution_epoch,
+            )
+            request_id = _execution_identifier(
+                self._id_generator.new_id("request"),
+                loop_input.execution_epoch,
+            )
             request = GatewayRequest(
                 tenant_id=loop_input.tenant_id,
                 session_id=loop_input.session_id,
                 run_id=loop_input.run_id,
+                execution_epoch=loop_input.execution_epoch,
                 turn_number=turn_number,
                 model_call_id=model_call_id,
                 request_id=request_id,
@@ -220,6 +320,11 @@ class AgentLoop:
                             tool_calls=turn_result.tool_calls,
                         )
                     )
+                journaled_message_count = await self._journal_new(
+                    loop_input.run_id,
+                    transcript,
+                    journaled_message_count,
+                )
                 report = await self._tool_turns.execute(
                     turn_result.tool_calls,
                     turn_result.invalid_tool_calls,
@@ -231,11 +336,19 @@ class AgentLoop:
                     session_id=loop_input.session_id,
                     run_id=loop_input.run_id,
                     turn_number=turn_number,
-                    task_plan=loop_input.task_plan,
+                    task_plan=task_plan,
                     context_summary=loop_input.context_summary,
+                    approval_mode=loop_input.approval_mode,
                 )
                 if report.last_checkpoint_id is not None:
                     last_checkpoint_id = report.last_checkpoint_id
+                if report.updated_task_plan is not None:
+                    task_plan = report.updated_task_plan
+                journaled_message_count = await self._journal_new(
+                    loop_input.run_id,
+                    transcript,
+                    journaled_message_count,
+                )
                 semantic_retry_count += report.semantic_failures
                 for event in report.events:
                     yield event
@@ -262,6 +375,14 @@ class AgentLoop:
                 )
                 return
             if turn_result.text:
+                transcript.append(
+                    GatewayMessage(role=MessageRole.ASSISTANT, content=turn_result.text)
+                )
+                journaled_message_count = await self._journal_new(
+                    loop_input.run_id,
+                    transcript,
+                    journaled_message_count,
+                )
                 completion_payload = RunCompletedPayload(
                     final_text=turn_result.text,
                     checkpoint_id=last_checkpoint_id,
@@ -299,9 +420,14 @@ class AgentLoop:
                 return
             transcript.append(
                 GatewayMessage(
-                    role=MessageRole.SYSTEM,
+                    role=MessageRole.USER,
                     content="The previous response contained neither text nor tool calls.",
                 )
+            )
+            journaled_message_count = await self._journal_new(
+                loop_input.run_id,
+                transcript,
+                journaled_message_count,
             )
 
         yield events.run_failed(
@@ -312,6 +438,45 @@ class AgentLoop:
             )
         )
 
+    async def _journal_new(
+        self,
+        run_id: uuid.UUID,
+        transcript: list[GatewayMessage],
+        start_index: int,
+    ) -> int:
+        if start_index >= len(transcript):
+            return start_index
+        if self._transcript_journal is not None:
+            await self._transcript_journal.append(
+                run_id,
+                start_index=start_index,
+                messages=tuple(transcript[start_index:]),
+            )
+        return len(transcript)
+
+
+def _ends_with_tool_calls(
+    transcript: list[GatewayMessage],
+    calls: tuple[GatewayToolCall, ...],
+) -> bool:
+    return bool(
+        transcript
+        and transcript[-1].role is MessageRole.ASSISTANT
+        and transcript[-1].tool_calls == calls
+    )
+
+
+def _execution_identifier(value: str, execution_epoch: int) -> str:
+    """Namespace post-rewind request identity without changing the initial branch."""
+
+    if execution_epoch == 1:
+        return value
+    scoped = f"e{execution_epoch}-{value}"
+    if len(scoped) <= _MAX_EXECUTION_IDENTIFIER_LENGTH:
+        return scoped
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"e{execution_epoch}-{digest}"
+
 
 __all__ = [
     "MAX_GATEWAY_REQUEST_BYTES",
@@ -321,4 +486,7 @@ __all__ = [
     "AgentLoopInput",
     "Clock",
     "IdGenerator",
+    "TranscriptJournal",
+    "UtcClock",
+    "UuidIdGenerator",
 ]

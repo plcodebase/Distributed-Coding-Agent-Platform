@@ -21,6 +21,8 @@ from agent_core.events import (
     RunFailedPayload,
     RunStartedEvent,
     RunStartedPayload,
+    ToolApprovalRequiredEvent,
+    ToolApprovalRequiredPayload,
     ToolCompletedEvent,
     ToolCompletedPayload,
     ToolOutputPayload,
@@ -161,6 +163,29 @@ class LoopEventFactory:
             created_at=created_at,
         )
 
+    def approval_required(
+        self,
+        *,
+        approval_id: uuid.UUID,
+        tool_call: GatewayToolCall,
+        argument_hash: str,
+        reason: str,
+    ) -> ToolApprovalRequiredEvent:
+        sequence, created_at = self._metadata()
+        return ToolApprovalRequiredEvent(
+            run_id=self._run_id,
+            sequence=sequence,
+            payload=ToolApprovalRequiredPayload(
+                approval_id=approval_id,
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                argument_hash=argument_hash,
+                reason=reason,
+            ),
+            created_at=created_at,
+        )
+
     def tool_output(
         self,
         *,
@@ -208,6 +233,7 @@ class LoopEventFactory:
         self,
         *,
         checkpoint_id: uuid.UUID,
+        tool_call_id: str,
         message_sequence: int,
         workspace_revision: str,
     ) -> CheckpointCreatedEvent:
@@ -217,6 +243,7 @@ class LoopEventFactory:
             sequence=sequence,
             payload=CheckpointCreatedPayload(
                 checkpoint_id=checkpoint_id,
+                tool_call_id=tool_call_id,
                 message_sequence=message_sequence,
                 workspace_revision=workspace_revision,
             ),

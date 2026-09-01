@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field
 
@@ -19,6 +19,13 @@ if TYPE_CHECKING:
     from platform_telemetry import PlatformTelemetry
 
 type Sleep = Callable[[float], Awaitable[None]]
+type CloseCallback = Callable[[], Awaitable[None]]
+
+
+class BackgroundProcessor(Protocol):
+    """One bounded, durable background-job processor."""
+
+    async def run_once(self) -> bool: ...
 
 
 class SchedulerConfig(DomainModel):
@@ -39,17 +46,22 @@ class SchedulerService:
         config: SchedulerConfig | None = None,
         sleep: Sleep = asyncio.sleep,
         memory_processor: MemoryExtractionProcessor | None = None,
+        background_processors: tuple[BackgroundProcessor, ...] = (),
         queue_monitor: QueueMonitor | None = None,
         telemetry: PlatformTelemetry | None = None,
+        close: CloseCallback | None = None,
     ) -> None:
         self._queue = queue
         self._clock = clock
         self._config = config or SchedulerConfig()
         self._sleep = sleep
         self._memory_processor = memory_processor
+        self._background_processors = background_processors
         self._queue_monitor = queue_monitor
         self._telemetry = telemetry
         self._started = False
+        self._close = close
+        self._closed = False
 
     @property
     def ready(self) -> bool:
@@ -87,10 +99,27 @@ class SchedulerService:
                     if self._memory_processor is not None
                     else False
                 )
-                if recovered == 0 and not memory_processed:
+                background_processed = False
+                for processor in self._background_processors:
+                    background_processed = await processor.run_once() or background_processed
+                if recovered == 0 and not memory_processed and not background_processed:
                     await self._sleep(self._config.poll_seconds)
         finally:
             self._started = False
 
+    async def aclose(self) -> None:
+        """Close composition-owned dependencies exactly once."""
 
-__all__ = ["SchedulerConfig", "SchedulerService"]
+        if self._closed:
+            return
+        if self._close is not None:
+            task: asyncio.Future[None] = asyncio.ensure_future(self._close())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+        self._closed = True
+
+
+__all__ = ["BackgroundProcessor", "CloseCallback", "SchedulerConfig", "SchedulerService"]

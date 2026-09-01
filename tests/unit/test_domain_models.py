@@ -26,6 +26,7 @@ from agent_core.domain import (
     ToolCallStatus,
     allowed_run_transitions,
     canonical_argument_hash,
+    rewind_run,
     transition_run,
 )
 
@@ -35,6 +36,28 @@ SESSION_ID = UUID("20000000-0000-0000-0000-000000000002")
 TENANT_ID = UUID("30000000-0000-0000-0000-000000000003")
 WORKSPACE_ID = UUID("40000000-0000-0000-0000-000000000004")
 CHECKPOINT_ID = UUID("50000000-0000-0000-0000-000000000005")
+
+
+def test_rewind_creates_a_new_execution_epoch_and_attempt() -> None:
+    cancelled = Run(
+        id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace_id=WORKSPACE_ID,
+        status=RunStatus.CANCELLED,
+        priority=0,
+        attempt=2,
+        cancellation_requested=True,
+        created_at=NOW,
+        completed_at=NOW + timedelta(seconds=1),
+    )
+
+    rewound = rewind_run(cancelled, CHECKPOINT_ID)
+
+    assert rewound.status is RunStatus.QUEUED
+    assert rewound.attempt == 3
+    assert rewound.execution_epoch == 2
+    assert rewound.last_checkpoint_id == CHECKPOINT_ID
+    assert rewound.completed_at is None
 
 
 def assign_attribute(target: object, name: str, value: object) -> None:
@@ -630,6 +653,7 @@ def test_checkpoint_preserves_recovery_identifiers_and_json_plan() -> None:
         id=CHECKPOINT_ID,
         run_id=RUN_ID,
         session_id=SESSION_ID,
+        tool_call_id="edit-call-1",
         message_sequence=3,
         workspace_snapshot_uri="s3://agent-platform/checkpoints/5",
         workspace_revision="abc123",
@@ -766,6 +790,7 @@ def test_non_finite_numbers_are_rejected_recursively(number: float) -> None:
             id=CHECKPOINT_ID,
             run_id=RUN_ID,
             session_id=SESSION_ID,
+            tool_call_id="finite-call",
             message_sequence=0,
             workspace_snapshot_uri="s3://agent-platform/checkpoints/finite",
             workspace_revision="finite",

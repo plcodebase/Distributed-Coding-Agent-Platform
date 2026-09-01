@@ -20,7 +20,11 @@ from agent_core.context import (
     ContextPipeline,
     ContextRouteBudget,
 )
-from agent_core.control import ContextCompactionStatus, PersistedContextCompaction
+from agent_core.control import (
+    ContextCompactionStatus,
+    PersistedApproval,
+    PersistedContextCompaction,
+)
 from agent_core.distributed import (
     DurableToolOutcome,
     RunExecutionResult,
@@ -351,6 +355,23 @@ class MemoryToolStore:
         return tool_call
 
 
+class MemoryApprovalStore:
+    def __init__(self) -> None:
+        self.approvals: list[PersistedApproval] = []
+
+    async def create_approval_fenced(
+        self,
+        lease: RunLease,
+        approval: PersistedApproval,
+        *,
+        tool_call_id: str,
+    ) -> PersistedApproval:
+        assert approval.run_id == lease.run_id
+        assert tool_call_id
+        self.approvals.append(approval)
+        return approval
+
+
 class PreloadedToolStore(MemoryToolStore):
     def __init__(self, durable: ToolCall) -> None:
         super().__init__()
@@ -392,7 +413,8 @@ class ContextBuilderFake:
 
 class WorkerContextSourceFake:
     def __init__(self) -> None:
-        self.watermark: int | None = None
+        self.after_sequence: int | None = None
+        self.through_sequence: int | None = None
         self.previous_summary: str | None = None
 
     async def load(
@@ -401,12 +423,14 @@ class WorkerContextSourceFake:
         workspace_lease: WorkspaceWriterLease,
         recovery: RunRecoveryState,
         *,
-        source_message_sequence: int | None,
+        after_message_sequence: int | None,
+        through_message_sequence: int | None,
         previous_summary: str | None,
         force_compaction: bool,
     ) -> ContextBuildRequest:
         assert workspace_lease.run_id == lease.run_id
-        self.watermark = source_message_sequence
+        self.after_sequence = after_message_sequence
+        self.through_sequence = through_message_sequence
         self.previous_summary = previous_summary
         return ContextBuildRequest(
             tenant_id=lease.tenant_id,
@@ -498,6 +522,7 @@ class WorkerCompactionStoreFake:
 async def test_agent_loop_executor_idempotently_persists_attempt_events() -> None:
     event_store = MemoryEventStore()
     tool_store = MemoryToolStore()
+    finalized: list[RunStatus] = []
 
     def loop_factory(
         lease: RunLease,
@@ -512,10 +537,18 @@ async def test_agent_loop_executor_idempotently_persists_attempt_events() -> Non
             id_generator=SequentialIdGenerator(),
         )
 
+    async def finalize(
+        _lease: RunLease,
+        _loop: AgentLoop,
+        result: RunExecutionResult,
+    ) -> None:
+        finalized.append(result.status)
+
     executor = AgentLoopRunExecutor(
         loop_factory=loop_factory,
         events=event_store,
         tool_calls=tool_store,
+        attempt_finalizer=finalize,
     )
     first = await executor.execute(run_lease(), writer_lease(), recovery_state())
     event_count = len(event_store.events)
@@ -525,6 +558,7 @@ async def test_agent_loop_executor_idempotently_persists_attempt_events() -> Non
     assert second == first
     assert len(event_store.events) == event_count
     assert set(event_store.events).issuperset({"a1.g1.e1", "a1.g1.e2"})
+    assert finalized == [RunStatus.COMPLETED, RunStatus.COMPLETED]
 
 
 @pytest.mark.asyncio
@@ -551,6 +585,30 @@ async def test_executor_uses_bounded_context_without_precommit_side_effects() ->
 
 
 @pytest.mark.asyncio
+async def test_executor_records_context_build_telemetry() -> None:
+    telemetry = PlatformTelemetry(TelemetrySettings(service_name="agent-worker-context"))
+    executor = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: AgentLoop(
+            gateway=ScriptedModelGateway((ScriptedGatewayTurn.text("complete"),)),
+            tools=ToolRegistry(()),
+            clock=SteppingClock(NOW),
+            id_generator=SequentialIdGenerator(),
+        ),
+        events=MemoryEventStore(),
+        tool_calls=MemoryToolStore(),
+        context_builder=ContextBuilderFake(),
+        telemetry=telemetry,
+    )
+
+    result = await executor.execute(run_lease(), writer_lease(), recovery_state())
+
+    assert result.status is RunStatus.COMPLETED
+    metrics = telemetry.metrics.render().decode("utf-8")
+    assert "agent_platform_context_build_duration_seconds_count 1.0" in metrics
+    telemetry.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_durable_context_builder_honors_watermark_and_completes_request() -> None:
     source = WorkerContextSourceFake()
     compactions = WorkerCompactionStoreFake()
@@ -573,9 +631,217 @@ async def test_durable_context_builder_honors_watermark_and_completes_request() 
     )
     result = await builder.build(run_lease(), writer_lease(), recovery_state())
 
-    assert source.watermark == 7
+    assert source.after_sequence is None
+    assert source.through_sequence == 7
     assert result.summary == "new durable summary"
     assert compactions.completed == ("new durable summary", 8, 3)
+
+
+@pytest.mark.asyncio
+async def test_durable_context_builder_proactively_compacts_before_history_limit() -> None:
+    class ProactiveCompactions(WorkerCompactionStoreFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[int | None, int, str]] = []
+
+        async def pending_for_session(
+            self,
+            tenant_id: uuid.UUID,
+            session_id: uuid.UUID,
+        ) -> PersistedContextCompaction | None:
+            assert tenant_id == TENANT_ID and session_id == SESSION_ID
+            return None
+
+        async def request_compaction_if_needed(
+            self,
+            tenant_id: uuid.UUID,
+            session_id: uuid.UUID,
+            *,
+            after_message_sequence: int | None,
+            threshold_messages: int,
+            route_name: str,
+            requested_at: datetime,
+        ) -> PersistedContextCompaction | None:
+            assert tenant_id == TENANT_ID and session_id == SESSION_ID
+            assert requested_at >= NOW
+            self.calls.append((after_message_sequence, threshold_messages, route_name))
+            return self.pending
+
+    source = WorkerContextSourceFake()
+    compactions = ProactiveCompactions()
+    builder = DurableRunContextBuilder(
+        pipeline=ContextPipeline(
+            budgets=ContextBudgetRegistry(
+                (
+                    ContextRouteBudget(
+                        route_name="coding-default",
+                        max_context_tokens=10_000,
+                        reserved_output_tokens=1_000,
+                    ),
+                )
+            ),
+            compressor=WorkerContextCompressorFake(),
+        ),
+        source=source,
+        compactions=compactions,
+        proactive_compactions=compactions,
+        proactive_threshold_messages=3_072,
+        clock=SteppingClock(NOW + timedelta(seconds=1)),
+    )
+
+    result = await builder.build(run_lease(), writer_lease(), recovery_state())
+
+    assert compactions.calls == [(None, 3_072, "coding-default")]
+    assert source.through_sequence == 7
+    assert result.summary == "new durable summary"
+    assert compactions.completed == ("new durable summary", 8, 3)
+
+    for threshold in (0, 4_096, True):
+        with pytest.raises(ValueError, match="proactive compaction threshold"):
+            DurableRunContextBuilder(
+                pipeline=cast("Any", None),
+                source=cast("Any", None),
+                compactions=cast("Any", None),
+                proactive_threshold_messages=threshold,
+                clock=SteppingClock(NOW),
+            )
+
+
+@pytest.mark.asyncio
+async def test_durable_context_builder_records_compaction_failure_modes() -> None:
+    class Compactions(WorkerCompactionStoreFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failures: list[str] = []
+            self.complete_missing = False
+
+        async def complete(
+            self,
+            tenant_id: uuid.UUID,
+            compaction_id: uuid.UUID,
+            *,
+            summary: str,
+            input_tokens: int,
+            output_tokens: int,
+            completed_at: datetime,
+        ) -> PersistedContextCompaction | None:
+            if self.complete_missing:
+                return None
+            return await super().complete(
+                tenant_id,
+                compaction_id,
+                summary=summary,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                completed_at=completed_at,
+            )
+
+        async def fail(
+            self,
+            tenant_id: uuid.UUID,
+            compaction_id: uuid.UUID,
+            *,
+            error: ErrorDetail,
+            completed_at: datetime,
+        ) -> PersistedContextCompaction | None:
+            assert tenant_id == TENANT_ID and compaction_id == self.pending.id
+            assert completed_at >= NOW
+            self.failures.append(error.code)
+            return self.pending
+
+    class Pipeline:
+        def __init__(self, result: ContextBuildResult | BaseException) -> None:
+            self.result = result
+
+        async def build(self, _request: ContextBuildRequest) -> ContextBuildResult:
+            if isinstance(self.result, BaseException):
+                raise self.result
+            return self.result
+
+    def builder(
+        pipeline: Pipeline,
+        compactions: Compactions,
+        *,
+        source: WorkerContextSourceFake | None = None,
+    ) -> DurableRunContextBuilder:
+        return DurableRunContextBuilder(
+            pipeline=cast("Any", pipeline),
+            source=source or WorkerContextSourceFake(),
+            compactions=compactions,
+            clock=SteppingClock(NOW + timedelta(seconds=1)),
+        )
+
+    compactions = Compactions()
+    empty_result = ContextBuildResult(
+        messages=(GatewayMessage(role=MessageRole.USER, content="bounded"),),
+        estimated_tokens=2,
+        budget_tokens=100,
+    )
+    result = await builder(Pipeline(empty_result), compactions).build(
+        run_lease(), writer_lease(), recovery_state()
+    )
+    assert result == empty_result
+    assert compactions.failures == ["context_compaction_empty"]
+
+    compactions = Compactions()
+    with pytest.raises(RuntimeError, match="compression failed"):
+        await builder(Pipeline(RuntimeError("compression failed")), compactions).build(
+            run_lease(), writer_lease(), recovery_state()
+        )
+    assert compactions.failures == ["context_compaction_failed"]
+
+    compactions = Compactions()
+    compactions.complete_missing = True
+    completed_result = ContextBuildResult(
+        messages=(GatewayMessage(role=MessageRole.USER, content="bounded"),),
+        estimated_tokens=2,
+        budget_tokens=100,
+        compressed=True,
+        summary="summary",
+        compression_input_tokens=3,
+        compression_output_tokens=1,
+    )
+    with pytest.raises(DomainOperationError) as missing:
+        await builder(Pipeline(completed_result), compactions).build(
+            run_lease(), writer_lease(), recovery_state()
+        )
+    assert missing.value.code == "context_compaction_missing"
+
+
+@pytest.mark.asyncio
+async def test_durable_context_builder_rejects_mismatched_source_identity() -> None:
+    class MismatchedSource(WorkerContextSourceFake):
+        async def load(
+            self,
+            lease: RunLease,
+            workspace_lease: WorkspaceWriterLease,
+            recovery: RunRecoveryState,
+            *,
+            after_message_sequence: int | None,
+            through_message_sequence: int | None,
+            previous_summary: str | None,
+            force_compaction: bool,
+        ) -> ContextBuildRequest:
+            request = await super().load(
+                lease,
+                workspace_lease,
+                recovery,
+                after_message_sequence=after_message_sequence,
+                through_message_sequence=through_message_sequence,
+                previous_summary=previous_summary,
+                force_compaction=force_compaction,
+            )
+            return request.model_copy(update={"route_name": "different-route"})
+
+    builder = DurableRunContextBuilder(
+        pipeline=cast("Any", None),
+        source=MismatchedSource(),
+        compactions=WorkerCompactionStoreFake(),
+        clock=SteppingClock(NOW),
+    )
+    with pytest.raises(DomainOperationError) as captured:
+        await builder.build(run_lease(), writer_lease(), recovery_state())
+    assert captured.value.code == "context_source_mismatch"
 
 
 @pytest.mark.asyncio
@@ -667,10 +933,12 @@ async def test_agent_loop_executor_persists_waiting_approval_state() -> None:
     arguments: JsonObject = {"path": "README.md"}
     argument_hash = canonical_argument_hash(arguments)
     store = MemoryToolStore()
+    approvals = MemoryApprovalStore()
     executor = AgentLoopRunExecutor(
         loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
         events=MemoryEventStore(),
         tool_calls=store,
+        approvals=approvals,
     )
     common = {
         "run_id": RUN_ID,
@@ -696,6 +964,7 @@ async def test_agent_loop_executor_persists_waiting_approval_state() -> None:
             "sequence": 2,
             "event_type": EventType.TOOL_APPROVAL_REQUIRED,
             "payload": {
+                "approval_id": "70000000-0000-0000-0000-000000000007",
                 "tool_call_id": "call-approval",
                 "tool_name": "read_file",
                 "arguments": arguments,
@@ -718,6 +987,266 @@ async def test_agent_loop_executor_persists_waiting_approval_state() -> None:
         ToolCallStatus.RECEIVED,
         ToolCallStatus.WAITING_APPROVAL,
     ]
+    assert len(approvals.approvals) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executor_maps_deferred_failure_and_incomplete_outcomes() -> None:
+    class EventLoop:
+        def __init__(self, events: tuple[Any, ...]) -> None:
+            self.events = events
+
+        async def run(self, _loop_input: AgentLoopInput) -> AsyncGenerator[Any, None]:
+            for event in self.events:
+                yield event
+
+    base = {"run_id": RUN_ID, "created_at": NOW}
+    retry = parse_agent_event(
+        {
+            **base,
+            "sequence": 1,
+            "event_type": EventType.RUN_RETRY_SCHEDULED,
+            "payload": {
+                "attempt": 2,
+                "delay_seconds": 0.75,
+                "error": {
+                    "code": "gateway_timeout",
+                    "message": "gateway timed out",
+                    "retryable": True,
+                },
+            },
+        }
+    )
+    approval = parse_agent_event(
+        {
+            **base,
+            "sequence": 1,
+            "event_type": EventType.TOOL_APPROVAL_REQUIRED,
+            "payload": {
+                "approval_id": uuid.uuid4(),
+                "tool_call_id": "unobserved-call",
+                "tool_name": "edit_file",
+                "arguments": {"path": "README.md"},
+                "argument_hash": canonical_argument_hash({"path": "README.md"}),
+                "reason": "approval is required",
+            },
+        }
+    )
+    failure = parse_agent_event(
+        {
+            **base,
+            "sequence": 1,
+            "event_type": EventType.RUN_FAILED,
+            "payload": {"error": {"code": "turn_limit", "message": "turn limit reached"}},
+        }
+    )
+    assert isinstance(failure, RunFailedEvent)
+
+    def new_executor() -> AgentLoopRunExecutor:
+        return AgentLoopRunExecutor(
+            loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
+            events=MemoryEventStore(),
+            tool_calls=MemoryToolStore(),
+        )
+
+    retry_result = await new_executor()._run_loop(
+        cast("AgentLoop", EventLoop((retry,))),
+        run_lease(),
+        recovery_state(),
+        context=None,
+    )
+    approval_result = await new_executor()._run_loop(
+        cast("AgentLoop", EventLoop((approval,))),
+        run_lease(),
+        recovery_state(),
+        context=None,
+    )
+    failure_result = await new_executor()._run_loop(
+        cast("AgentLoop", EventLoop((failure,))),
+        run_lease(),
+        recovery_state(),
+        context=None,
+    )
+    incomplete_result = await new_executor()._run_loop(
+        cast("AgentLoop", EventLoop(())),
+        run_lease(),
+        recovery_state(),
+        context=None,
+    )
+
+    assert retry_result.status is RunStatus.RETRY_PENDING
+    assert retry_result.retry_delay_seconds == 0.75
+    assert approval_result.status is RunStatus.WAITING_APPROVAL
+    assert failure_result.status is RunStatus.FAILED
+    assert failure_result.error == failure.payload.error
+    assert incomplete_result.error is not None
+    assert incomplete_result.error.code == "agent_loop_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executor_tool_state_failures_are_fail_closed() -> None:
+    arguments: JsonObject = {"path": "README.md"}
+    argument_hash = canonical_argument_hash(arguments)
+    store = MemoryToolStore()
+    executor = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
+        events=MemoryEventStore(),
+        tool_calls=store,
+    )
+    rejected = parse_agent_event(
+        {
+            "run_id": RUN_ID,
+            "sequence": 1,
+            "event_type": EventType.MODEL_TOOL_CALL_RECEIVED,
+            "payload": {
+                "model_call_id": "model-1",
+                "tool_call_id": "rejected-call",
+                "tool_name": "edit_file",
+                "error": {"code": "malformed_tool_arguments", "message": "invalid arguments"},
+            },
+            "created_at": NOW,
+        }
+    )
+    received = parse_agent_event(
+        {
+            "run_id": RUN_ID,
+            "sequence": 2,
+            "event_type": EventType.MODEL_TOOL_CALL_RECEIVED,
+            "payload": {
+                "model_call_id": "model-1",
+                "tool_call_id": "call-1",
+                "tool_name": "edit_file",
+                "arguments": arguments,
+                "argument_hash": argument_hash,
+            },
+            "created_at": NOW,
+        }
+    )
+    approval = parse_agent_event(
+        {
+            "run_id": RUN_ID,
+            "sequence": 3,
+            "event_type": EventType.TOOL_APPROVAL_REQUIRED,
+            "payload": {
+                "approval_id": uuid.uuid4(),
+                "tool_call_id": "call-1",
+                "tool_name": "edit_file",
+                "arguments": arguments,
+                "argument_hash": argument_hash,
+                "reason": "approval is required",
+            },
+            "created_at": NOW,
+        }
+    )
+    observed: dict[str, Any] = {}
+    await executor._persist_tool_state(run_lease(), rejected, observed=observed, turn_number=0)
+    assert store.calls == []
+
+    await executor._persist_tool_state(run_lease(), received, observed=observed, turn_number=0)
+    with pytest.raises(DomainOperationError) as captured:
+        await executor._persist_tool_state(run_lease(), approval, observed=observed, turn_number=1)
+    assert captured.value.code == "approval_store_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executor_persists_running_and_completed_tool_state() -> None:
+    arguments: JsonObject = {"path": "README.md"}
+    argument_hash = canonical_argument_hash(arguments)
+    store = MemoryToolStore()
+    executor = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
+        events=MemoryEventStore(),
+        tool_calls=store,
+    )
+    base = {"run_id": RUN_ID, "created_at": NOW}
+    received = parse_agent_event(
+        {
+            **base,
+            "sequence": 1,
+            "event_type": EventType.MODEL_TOOL_CALL_RECEIVED,
+            "payload": {
+                "model_call_id": "model-1",
+                "tool_call_id": "call-1",
+                "tool_name": "edit_file",
+                "arguments": arguments,
+                "argument_hash": argument_hash,
+            },
+        }
+    )
+    started = parse_agent_event(
+        {
+            **base,
+            "sequence": 2,
+            "event_type": EventType.TOOL_STARTED,
+            "payload": {"tool_call_id": "call-1", "tool_name": "edit_file"},
+        }
+    )
+    completed = parse_agent_event(
+        {
+            **base,
+            "sequence": 3,
+            "event_type": EventType.TOOL_COMPLETED,
+            "payload": {
+                "tool_call_id": "call-1",
+                "status": ToolCallStatus.COMPLETED,
+                "result": {"workspace_revision": "revision-2", "changed": True},
+            },
+        }
+    )
+    observed: dict[str, Any] = {}
+    for event in (received, started, completed):
+        await executor._persist_tool_state(run_lease(), event, observed=observed, turn_number=1)
+
+    assert [call.status for call in store.calls] == [
+        ToolCallStatus.RECEIVED,
+        ToolCallStatus.RUNNING,
+        ToolCallStatus.COMPLETED,
+    ]
+    assert store.calls[-1].workspace_version == "revision-2"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_executor_lifecycle_validates_factory_and_cleanup() -> None:
+    with pytest.raises(TypeError, match="callable"):
+        AgentLoopRunExecutor(
+            loop_factory=cast("Any", None),
+            events=MemoryEventStore(),
+            tool_calls=MemoryToolStore(),
+        )
+
+    invalid = AgentLoopRunExecutor(
+        loop_factory=lambda _lease, _writer, _recovery: cast("Any", None),
+        events=MemoryEventStore(),
+        tool_calls=MemoryToolStore(),
+    )
+    with pytest.raises(TypeError, match="must return AgentLoop"):
+        await invalid.execute(run_lease(), writer_lease(), recovery_state())
+    await invalid.cancel(run_lease())
+
+    async def loop_factory(
+        _lease: RunLease,
+        _writer: WorkspaceWriterLease,
+        _recovery: RunRecoveryState,
+    ) -> AgentLoop:
+        return AgentLoop(
+            gateway=ScriptedModelGateway((ScriptedGatewayTurn.text("complete"),)),
+            tools=ToolRegistry(()),
+            clock=SteppingClock(NOW),
+            id_generator=SequentialIdGenerator(),
+        )
+
+    async def cleanup(_lease: RunLease, _loop: AgentLoop) -> None:
+        raise RuntimeError("cleanup detail must remain internal")
+
+    failing_cleanup = AgentLoopRunExecutor(
+        loop_factory=loop_factory,
+        events=MemoryEventStore(),
+        tool_calls=MemoryToolStore(),
+        loop_cleanup=cleanup,
+    )
+    with pytest.raises(DomainOperationError) as captured:
+        await failing_cleanup.execute(run_lease(), writer_lease(), recovery_state())
+    assert captured.value.code == "worker_attempt_cleanup_failed"
 
 
 class MutableClock:
@@ -1201,6 +1730,7 @@ async def test_worker_restores_checkpoint_before_execution() -> None:
         id=uuid.uuid4(),
         run_id=RUN_ID,
         session_id=SESSION_ID,
+        tool_call_id="restore-call-1",
         message_sequence=1,
         workspace_snapshot_uri="s3://agent-platform/checkpoint",
         workspace_revision="revision-1",
@@ -1365,6 +1895,7 @@ async def test_worker_cancellation_interrupts_restore_before_execution() -> None
         id=uuid.uuid4(),
         run_id=RUN_ID,
         session_id=SESSION_ID,
+        tool_call_id="restore-call-2",
         message_sequence=1,
         workspace_snapshot_uri="s3://agent-platform/checkpoint",
         workspace_revision="revision-1",
@@ -1500,6 +2031,98 @@ async def test_scheduler_exports_bounded_queue_pressure_metrics() -> None:
     assert "agent_platform_oldest_queued_seconds 12.5" in payload
     assert "agent_platform_run_recoveries_total 1.0" in payload
     telemetry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_service_runs_background_work_and_closes_once() -> None:
+    stop = asyncio.Event()
+    sleep_delays: list[float] = []
+    close_calls = 0
+
+    async def sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+        assert scheduler.ready is True
+        stop.set()
+
+    async def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    scheduler = SchedulerService(
+        queue=FakeQueue(None),
+        clock=MutableClock(),
+        config=SchedulerConfig(poll_seconds=0.25),
+        sleep=sleep,
+        close=close,
+    )
+    assert scheduler.ready is False
+    assert scheduler.render_metrics() == b""
+
+    await scheduler.serve(stop)
+    assert sleep_delays == [0.25]
+    assert scheduler.ready is False
+    await scheduler.aclose()
+    await scheduler.aclose()
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_service_processes_all_background_sources_without_sleeping() -> None:
+    stop = asyncio.Event()
+    calls: list[str] = []
+
+    class MemoryProcessor:
+        async def process_once(self) -> bool:
+            calls.append("memory")
+            return True
+
+    class BackgroundProcessor:
+        def __init__(self, name: str, *, should_stop: bool = False) -> None:
+            self.name = name
+            self.should_stop = should_stop
+
+        async def run_once(self) -> bool:
+            calls.append(self.name)
+            if self.should_stop:
+                stop.set()
+            return self.name == "background-1"
+
+    async def unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("productive scheduler iterations must not sleep")
+
+    scheduler = SchedulerService(
+        queue=FakeQueue(None),
+        clock=MutableClock(),
+        memory_processor=cast("Any", MemoryProcessor()),
+        background_processors=(
+            BackgroundProcessor("background-1"),
+            BackgroundProcessor("background-2", should_stop=True),
+        ),
+        sleep=unexpected_sleep,
+    )
+    await scheduler.serve(stop)
+
+    assert calls == ["memory", "background-1", "background-2"]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_close_finishes_cleanup_before_propagating_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close() -> None:
+        started.set()
+        await release.wait()
+
+    scheduler = SchedulerService(queue=FakeQueue(None), clock=MutableClock(), close=close)
+    closing = asyncio.create_task(scheduler.aclose())
+    await started.wait()
+    closing.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await closing
 
 
 def test_worker_and_scheduler_configuration_reject_unsafe_values() -> None:

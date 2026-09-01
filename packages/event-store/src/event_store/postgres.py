@@ -89,26 +89,30 @@ class PostgresEventStore:
         """Allocate and commit the next sequence in the event row transaction."""
 
         async with self._sessions() as database, database.begin():
-            next_value = await database.scalar(
-                update(RunRecord)
-                .where(
-                    RunRecord.tenant_id == tenant_id,
-                    RunRecord.id == run_id,
+            allocation = (
+                await database.execute(
+                    update(RunRecord)
+                    .where(
+                        RunRecord.tenant_id == tenant_id,
+                        RunRecord.id == run_id,
+                    )
+                    .values(next_event_sequence=RunRecord.next_event_sequence + 1)
+                    .returning(RunRecord.next_event_sequence, RunRecord.execution_epoch)
                 )
-                .values(next_event_sequence=RunRecord.next_event_sequence + 1)
-                .returning(RunRecord.next_event_sequence)
-            )
-            if next_value is None:
+            ).first()
+            if allocation is None or allocation[0] is None:
                 raise DomainOperationError(
                     code="run_not_found",
                     message="the run does not exist for this tenant",
                     details={"run_id": str(run_id)},
                 )
+            next_value, execution_epoch = allocation
             sequence = int(next_value) - 1
             database.add(
                 AgentEventRecord(
                     tenant_id=tenant_id,
                     run_id=run_id,
+                    execution_epoch=int(execution_epoch),
                     sequence=sequence,
                     event_type=draft.event_type.value,
                     payload=draft.payload.to_json_object(),
@@ -117,6 +121,7 @@ class PostgresEventStore:
             )
         return StoredEvent(
             run_id=run_id,
+            execution_epoch=int(execution_epoch),
             sequence=sequence,
             event_type=draft.event_type,
             payload=draft.payload,
@@ -191,6 +196,7 @@ class PostgresEventStore:
             select(AgentEventRecord).where(
                 AgentEventRecord.tenant_id == tenant_id,
                 AgentEventRecord.run_id == run_id,
+                AgentEventRecord.execution_epoch == run_row.execution_epoch,
                 AgentEventRecord.delivery_key == delivery_key,
             )
         )
@@ -210,6 +216,7 @@ class PostgresEventStore:
         row = AgentEventRecord(
             tenant_id=tenant_id,
             run_id=run_id,
+            execution_epoch=run_row.execution_epoch,
             sequence=sequence,
             delivery_key=delivery_key,
             event_type=draft.event_type.value,
@@ -378,6 +385,7 @@ class PostgresEventStore:
 def _stored_event(record: AgentEventRecord) -> StoredEvent:
     return StoredEvent(
         run_id=record.run_id,
+        execution_epoch=record.execution_epoch,
         sequence=record.sequence,
         event_type=_EVENT_TYPE_ADAPTER.validate_python(record.event_type),
         payload=record.payload,

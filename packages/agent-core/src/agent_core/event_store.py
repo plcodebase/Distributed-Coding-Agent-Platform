@@ -60,6 +60,7 @@ class StoredEvent(DomainModel):
     """Tenant-safe event returned by durable sequence and replay operations."""
 
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     sequence: int = Field(ge=1)
     event_type: EventType
     payload: FrozenJsonObject
@@ -73,7 +74,7 @@ class StoredEvent(DomainModel):
     def to_agent_event(self) -> AnyAgentEvent:
         """Rebuild the concrete core event for worker-side consumers."""
 
-        return parse_agent_event(self.model_dump(mode="python"))
+        return parse_agent_event(self.model_dump(mode="python", exclude={"execution_epoch"}))
 
     @property
     def serialized_size_bytes(self) -> int:

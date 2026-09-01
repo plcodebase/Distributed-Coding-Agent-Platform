@@ -19,6 +19,7 @@ from agent_core.control import (
     memory_content_hash,
 )
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
+from agent_core.gateway import MessageRole
 from platform_persistence import (
     PostgresContextRepository,
     PostgresMemoryRepository,
@@ -128,15 +129,19 @@ def _sessions(*databases: _Database) -> Any:
 def _compaction_row(
     *,
     status: ContextCompactionStatus = ContextCompactionStatus.PENDING,
+    compaction_id: uuid.UUID = COMPACTION_ID,
+    idempotency_key: str = "compact-1",
+    source_message_sequence: int = 12,
 ) -> SimpleNamespace:
     terminal = status is not ContextCompactionStatus.PENDING
     return SimpleNamespace(
-        id=COMPACTION_ID,
+        id=compaction_id,
         tenant_id=TENANT_ID,
         session_id=SESSION_ID,
+        context_generation=1,
         status=status.value,
-        idempotency_key="compact-1",
-        source_message_sequence=12,
+        idempotency_key=idempotency_key,
+        source_message_sequence=source_message_sequence,
         route_name="coding-default",
         summary="summary" if status is ContextCompactionStatus.COMPLETED else None,
         input_tokens=10 if status is ContextCompactionStatus.COMPLETED else None,
@@ -161,6 +166,7 @@ def _memory_job_row(
         tenant_id=TENANT_ID,
         session_id=SESSION_ID,
         run_id=RUN_ID,
+        execution_epoch=1,
         status=status.value,
         source_message_sequence=12,
         attempt=1,
@@ -181,6 +187,7 @@ def _memory_job() -> MemoryExtractionJob:
         tenant_id=TENANT_ID,
         session_id=SESSION_ID,
         run_id=RUN_ID,
+        execution_epoch=1,
         status=MemoryExtractionStatus.RUNNING,
         source_message_sequence=12,
         worker_id="memory-worker",
@@ -192,12 +199,97 @@ def _memory_job() -> MemoryExtractionJob:
     )
 
 
+def _message_row(sequence: int, *, role: MessageRole = MessageRole.USER) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=TENANT_ID,
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        execution_epoch=1,
+        sequence=sequence,
+        role=role.value,
+        content=f"message-{sequence}",
+        metadata_json={},
+        created_at=NOW + timedelta(seconds=sequence),
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_repository_loads_bounded_chronological_messages() -> None:
+    rows: list[object] = [
+        _message_row(3),
+        _message_row(4, role=MessageRole.ASSISTANT),
+    ]
+    repository = PostgresContextRepository(
+        _sessions(_Database(scalar_sets=[rows]), _Database(scalar_sets=[rows]))
+    )
+
+    messages = await repository.list_messages(
+        TENANT_ID,
+        SESSION_ID,
+        after_sequence=2,
+        through_sequence=4,
+        limit=2,
+    )
+
+    assert [message.sequence for message in messages] == [3, 4]
+    assert messages[-1].role is MessageRole.ASSISTANT
+    with pytest.raises(DomainOperationError) as overflow:
+        await repository.list_messages(TENANT_ID, SESSION_ID, limit=1)
+    assert overflow.value.code == "context_history_limit"
+
+
+@pytest.mark.asyncio
+async def test_context_repository_loads_validated_original_file_references() -> None:
+    metadata = {
+        "source": "run_submission",
+        "referenced_files": [{"path": "README.md"}, {"path": "docs/design.md"}],
+    }
+    repository = PostgresContextRepository(
+        _sessions(
+            _Database(scalar_values=[metadata]),
+            _Database(scalar_values=[{}]),
+            _Database(scalar_values=[None]),
+        )
+    )
+
+    references = await repository.referenced_files_for_run(TENANT_ID, RUN_ID)
+    legacy = await repository.referenced_files_for_run(TENANT_ID, RUN_ID)
+    missing = await repository.referenced_files_for_run(TENANT_ID, RUN_ID)
+
+    assert [item.path for item in references] == ["README.md", "docs/design.md"]
+    assert legacy == ()
+    assert missing == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        [],
+        {"source": "run_submission", "referenced_files": "README.md"},
+        {
+            "source": "run_submission",
+            "referenced_files": [{"path": "README.md"}, {"path": "README.md"}],
+        },
+        {"source": "run_submission", "referenced_files": [{"path": ".git/config"}]},
+    ],
+)
+async def test_context_repository_fails_closed_for_invalid_file_references(
+    metadata: object,
+) -> None:
+    repository = PostgresContextRepository(_sessions(_Database(scalar_values=[metadata])))
+
+    with pytest.raises(DomainOperationError) as failure:
+        await repository.referenced_files_for_run(TENANT_ID, RUN_ID)
+    assert failure.value.code == "context_references_invalid"
+
+
 @pytest.mark.asyncio
 async def test_context_repository_requests_replays_and_finishes_compaction() -> None:
     inserted = _compaction_row()
-    create_db = _Database(
-        scalar_values=[SESSION_ID, None, None, 12, inserted],
-    )
+    session = SimpleNamespace(id=SESSION_ID, context_generation=1)
+    create_db = _Database(scalar_values=[session, None, None, 12, inserted])
     repository = PostgresContextRepository(_sessions(create_db))
     created = await repository.request_compaction(
         TENANT_ID,
@@ -217,7 +309,7 @@ async def test_context_repository_requests_replays_and_finishes_compaction() -> 
     assert fetched == created
 
     replay_repository = PostgresContextRepository(
-        _sessions(_Database(scalar_values=[SESSION_ID, inserted]))
+        _sessions(_Database(scalar_values=[session, inserted]))
     )
     replay = await replay_repository.request_compaction(
         TENANT_ID,
@@ -231,7 +323,7 @@ async def test_context_repository_requests_replays_and_finishes_compaction() -> 
 
     with pytest.raises(DomainOperationError) as pending:
         await PostgresContextRepository(
-            _sessions(_Database(scalar_values=[SESSION_ID, None, inserted]))
+            _sessions(_Database(scalar_values=[session, None, inserted]))
         ).request_compaction(
             TENANT_ID,
             SESSION_ID,
@@ -260,7 +352,7 @@ async def test_context_repository_requests_replays_and_finishes_compaction() -> 
 
     with pytest.raises(DomainOperationError) as conflict:
         await PostgresContextRepository(
-            _sessions(_Database(scalar_values=[SESSION_ID, _compaction_row()]))
+            _sessions(_Database(scalar_values=[session, _compaction_row()]))
         ).request_compaction(
             TENANT_ID,
             SESSION_ID,
@@ -270,6 +362,86 @@ async def test_context_repository_requests_replays_and_finishes_compaction() -> 
             requested_at=NOW,
         )
     assert conflict.value.code == "context_compaction_idempotency_conflict"
+
+
+@pytest.mark.asyncio
+async def test_context_repository_proactively_schedules_compaction_idempotently() -> None:
+    session = SimpleNamespace(id=SESSION_ID, context_generation=1)
+    automatic_key = "auto-context-1-12"
+    automatic_id = uuid.uuid5(SESSION_ID, automatic_key)
+    inserted = _compaction_row(
+        compaction_id=automatic_id,
+        idempotency_key=automatic_key,
+    )
+    create_db = _Database(scalar_values=[session, None, 3, 12, None, inserted])
+    repository = PostgresContextRepository(_sessions(create_db))
+
+    created = await repository.request_compaction_if_needed(
+        TENANT_ID,
+        SESSION_ID,
+        after_message_sequence=None,
+        threshold_messages=3,
+        route_name="coding-default",
+        requested_at=NOW,
+    )
+
+    assert created is not None
+    assert created.id == automatic_id
+    assert created.idempotency_key == automatic_key
+    assert create_db.executed == 1
+
+    replay_db = _Database(scalar_values=[session, None, 3, 12, inserted])
+    replay = await PostgresContextRepository(_sessions(replay_db)).request_compaction_if_needed(
+        TENANT_ID,
+        SESSION_ID,
+        after_message_sequence=9,
+        threshold_messages=3,
+        route_name="coding-default",
+        requested_at=NOW + timedelta(seconds=1),
+    )
+    assert replay == created
+    assert replay_db.executed == 0
+
+
+@pytest.mark.asyncio
+async def test_context_repository_proactive_compaction_respects_threshold_and_pending() -> None:
+    session = SimpleNamespace(id=SESSION_ID, context_generation=1)
+    pending = _compaction_row()
+    existing = await PostgresContextRepository(
+        _sessions(_Database(scalar_values=[session, pending]))
+    ).request_compaction_if_needed(
+        TENANT_ID,
+        SESSION_ID,
+        after_message_sequence=None,
+        threshold_messages=3,
+        route_name="coding-default",
+        requested_at=NOW,
+    )
+    assert existing is not None and existing.id == COMPACTION_ID
+
+    below_threshold = await PostgresContextRepository(
+        _sessions(_Database(scalar_values=[session, None, 2]))
+    ).request_compaction_if_needed(
+        TENANT_ID,
+        SESSION_ID,
+        after_message_sequence=10,
+        threshold_messages=3,
+        route_name="coding-default",
+        requested_at=NOW,
+    )
+    assert below_threshold is None
+
+    repository = PostgresContextRepository(cast("Any", None))
+    for after_sequence, threshold in ((-1, 3), (None, 0), (None, 4096), (None, True)):
+        with pytest.raises(ValueError):
+            await repository.request_compaction_if_needed(
+                TENANT_ID,
+                SESSION_ID,
+                after_message_sequence=after_sequence,
+                threshold_messages=threshold,
+                route_name="coding-default",
+                requested_at=NOW,
+            )
 
 
 @pytest.mark.asyncio
@@ -301,7 +473,8 @@ async def test_task_repository_compare_and_set_round_trip() -> None:
             "tasks": [{"id": "task-1", "title": "Persist task state"}],
         }
     )
-    create_db = _Database(scalar_values=[RUN_ID, None])
+    run_record = SimpleNamespace(id=RUN_ID, execution_epoch=1)
+    create_db = _Database(scalar_values=[run_record, None])
     repository = PostgresTaskRepository(_sessions(create_db))
     state = await repository.update(
         TENANT_ID,
@@ -320,7 +493,9 @@ async def test_task_repository_compare_and_set_round_trip() -> None:
 
     existing = SimpleNamespace(version=2)
     with pytest.raises(DomainOperationError) as conflict:
-        await PostgresTaskRepository(_sessions(_Database(scalar_values=[RUN_ID, existing]))).update(
+        await PostgresTaskRepository(
+            _sessions(_Database(scalar_values=[run_record, existing]))
+        ).update(
             TENANT_ID,
             RUN_ID,
             update,
@@ -335,6 +510,7 @@ async def test_task_repository_exposes_legacy_step_plans_without_mutation() -> N
     row = SimpleNamespace(
         id=uuid.uuid4(),
         run_id=RUN_ID,
+        execution_epoch=1,
         version=1,
         plan={
             "steps": [
@@ -373,6 +549,7 @@ async def test_memory_repository_settings_listing_source_completion_and_failure(
         tenant_id=TENANT_ID,
         session_id=SESSION_ID,
         source_run_id=RUN_ID,
+        execution_epoch=1,
         kind=MemoryKind.FACT.value,
         content="Uses PostgreSQL.",
         content_hash=memory_content_hash("Uses PostgreSQL."),

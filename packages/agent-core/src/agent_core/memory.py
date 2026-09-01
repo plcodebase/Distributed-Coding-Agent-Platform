@@ -42,6 +42,7 @@ class MemoryExtractionInput(DomainModel):
     tenant_id: uuid.UUID
     session_id: uuid.UUID
     run_id: uuid.UUID
+    execution_epoch: int = Field(default=1, ge=1)
     transcript: str
 
     @model_validator(mode="after")
@@ -119,6 +120,7 @@ class GatewayMemoryExtractor:
             tenant_id=request.tenant_id,
             session_id=request.session_id,
             run_id=request.run_id,
+            execution_epoch=request.execution_epoch,
             turn_number=1,
             model_call_id=self._ids.new_id("memory-model-call"),
             request_id=self._ids.new_id("memory-request"),
