@@ -31,6 +31,237 @@ _EMPTY_JSON = text("'{}'::jsonb")
 _EMPTY_ARRAY = text("'[]'::jsonb")
 
 
+class WorkspaceRecord(Base):
+    """Tenant-owned logical workspace whose head is an immutable snapshot."""
+
+    __tablename__ = "workspaces"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "id", "current_snapshot_id"),
+            ("source_snapshots.tenant_id", "source_snapshots.workspace_id", "source_snapshots.id"),
+            name="fk_workspaces_current_snapshot",
+            use_alter=True,
+        ),
+        UniqueConstraint("tenant_id", "id"),
+        CheckConstraint("status IN ('pending', 'ready', 'archived')", name="status"),
+        CheckConstraint(
+            "(status = 'pending' AND current_snapshot_id IS NULL AND version = 0) "
+            "OR (status = 'ready' AND current_snapshot_id IS NOT NULL AND version >= 1) "
+            "OR status = 'archived'",
+            name="lifecycle",
+        ),
+        CheckConstraint("octet_length(display_name) BETWEEN 1 AND 1024", name="display_name_bytes"),
+        CheckConstraint("updated_at >= created_at", name="timestamp_order"),
+        Index("ix_workspaces_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    current_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+
+
+class ArtifactRecord(Base):
+    """Immutable tenant artifact stored in an external object store."""
+
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "workspace_id"),
+            ("workspaces.tenant_id", "workspaces.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "run_id", "workspace_id"),
+            ("runs.tenant_id", "runs.id", "runs.workspace_id"),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "workspace_id", "id"),
+        UniqueConstraint("object_key"),
+        CheckConstraint(
+            "kind IN ('source_snapshot', 'workspace_checkpoint', 'final_patch', "
+            "'command_log', 'evaluation_report')",
+            name="kind",
+        ),
+        CheckConstraint("object_key ~ '^[a-z0-9][a-z0-9._/-]*$'", name="object_key"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256"),
+        CheckConstraint("size_bytes >= 0", name="size_bytes"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
+        CheckConstraint("octet_length(content_type) BETWEEN 3 AND 255", name="content_type"),
+        CheckConstraint("etag IS NULL OR octet_length(etag) BETWEEN 1 AND 1024", name="etag"),
+        CheckConstraint("expires_at IS NULL OR expires_at > created_at", name="retention"),
+        Index("ix_artifacts_tenant_workspace_created", "tenant_id", "workspace_id", "created_at"),
+        Index("ix_artifacts_tenant_run_created", "tenant_id", "run_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    etag: Mapped[str | None] = mapped_column(String(1024))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SourceSnapshotRecord(Base):
+    """Fail-closed validation state for an uploaded source archive."""
+
+    __tablename__ = "source_snapshots"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "workspace_id"),
+            ("workspaces.tenant_id", "workspaces.id"),
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("tenant_id", "workspace_id", "artifact_id"),
+            ("artifacts.tenant_id", "artifacts.workspace_id", "artifacts.id"),
+        ),
+        UniqueConstraint("tenant_id", "workspace_id", "id"),
+        UniqueConstraint("object_key"),
+        CheckConstraint(
+            "status IN ('pending', 'validating', 'ready', 'rejected')",
+            name="status",
+        ),
+        CheckConstraint("object_key ~ '^[a-z0-9][a-z0-9._/-]*$'", name="object_key"),
+        CheckConstraint(
+            "expected_sha256 IS NULL OR expected_sha256 ~ '^[0-9a-f]{64}$'",
+            name="expected_sha256",
+        ),
+        CheckConstraint(
+            "manifest_sha256 IS NULL OR manifest_sha256 ~ '^[0-9a-f]{64}$'",
+            name="manifest_sha256",
+        ),
+        CheckConstraint(
+            "compressed_bytes IS NULL OR compressed_bytes >= 0", name="compressed_bytes"
+        ),
+        CheckConstraint("entry_count IS NULL OR entry_count >= 0", name="entry_count"),
+        CheckConstraint("expanded_bytes IS NULL OR expanded_bytes >= 0", name="expanded_bytes"),
+        CheckConstraint("error IS NULL OR jsonb_typeof(error) = 'object'", name="error_object"),
+        CheckConstraint(
+            "(status = 'pending' AND expected_sha256 IS NULL AND compressed_bytes IS NULL "
+            "AND artifact_id IS NULL AND manifest_sha256 IS NULL AND entry_count IS NULL "
+            "AND expanded_bytes IS NULL AND error IS NULL) "
+            "OR (status = 'validating' AND expected_sha256 IS NOT NULL "
+            "AND compressed_bytes IS NOT NULL AND artifact_id IS NULL "
+            "AND manifest_sha256 IS NULL AND entry_count IS NULL AND expanded_bytes IS NULL "
+            "AND error IS NULL) "
+            "OR (status = 'ready' AND expected_sha256 IS NOT NULL "
+            "AND compressed_bytes IS NOT NULL AND artifact_id IS NOT NULL "
+            "AND manifest_sha256 IS NOT NULL AND entry_count IS NOT NULL "
+            "AND expanded_bytes IS NOT NULL AND error IS NULL) "
+            "OR (status = 'rejected' AND expected_sha256 IS NOT NULL "
+            "AND compressed_bytes IS NOT NULL AND artifact_id IS NULL "
+            "AND manifest_sha256 IS NULL AND entry_count IS NULL AND expanded_bytes IS NULL "
+            "AND error IS NOT NULL)",
+            name="lifecycle",
+        ),
+        CheckConstraint("updated_at >= created_at", name="timestamp_order"),
+        Index("ix_source_snapshots_workspace_created", "tenant_id", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    expected_sha256: Mapped[str | None] = mapped_column(String(64))
+    compressed_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    entry_count: Mapped[int | None] = mapped_column(BigInteger)
+    expanded_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+
+
+class SnapshotValidationJobRecord(Base):
+    """Retryable validation job for one finalized source upload."""
+
+    __tablename__ = "snapshot_validation_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "workspace_id", "snapshot_id"),
+            ("source_snapshots.tenant_id", "source_snapshots.workspace_id", "source_snapshots.id"),
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "snapshot_id"),
+        CheckConstraint("status IN ('pending', 'running', 'completed', 'failed')", name="status"),
+        CheckConstraint("attempt >= 1 AND attempt <= 100", name="attempt"),
+        CheckConstraint("expected_workspace_version >= 0", name="workspace_version"),
+        CheckConstraint("lease_generation >= 0", name="lease_generation"),
+        CheckConstraint(
+            "(status = 'pending' AND worker_id IS NULL AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND completed_at IS NULL) "
+            "OR (status = 'running' AND worker_id IS NOT NULL AND lease_token IS NOT NULL "
+            "AND lease_generation >= 1 AND lease_expires_at > started_at "
+            "AND started_at IS NOT NULL AND completed_at IS NULL) "
+            "OR (status IN ('completed', 'failed') AND worker_id IS NULL AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND started_at IS NOT NULL "
+            "AND completed_at >= started_at)",
+            name="lifecycle",
+        ),
+        Index("ix_snapshot_validation_jobs_claim", "status", "lease_expires_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    expected_workspace_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=_UTC_NOW,
+    )
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class SessionRecord(Base):
     """Durable tenant-owned conversation."""
 
@@ -100,6 +331,8 @@ class RunRecord(Base):
             name="status",
         ),
         CheckConstraint("attempt >= 1", name="attempt"),
+        CheckConstraint("execution_epoch >= 1", name="execution_epoch"),
+        CheckConstraint("execution_epoch <= attempt", name="execution_epoch_attempt"),
         CheckConstraint("priority >= -100 AND priority <= 100", name="priority"),
         CheckConstraint(
             "priority_class IN ('interactive', 'background', 'evaluation')",
@@ -172,6 +405,11 @@ class RunRecord(Base):
     )
     priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    execution_epoch: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("1"),
+    )
     lease_generation: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,

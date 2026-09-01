@@ -1,0 +1,20 @@
+[project]
+name = "artifact-store"
+version = "0.1.0"
+description = "S3-compatible immutable artifact adapter for the agent platform"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "agent-core",
+  "boto3>=1.40,<2",
+  "pydantic-settings>=2.9,<3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/artifact_store"]
+
+[tool.uv.sources]
+agent-core = { workspace = true }

@@ -78,6 +78,7 @@ class RunLease(DomainModel):
     lease_token: uuid.UUID
     generation: int = Field(ge=1)
     attempt: int = Field(ge=1)
+    execution_epoch: int = Field(default=1, ge=1)
     priority: int = Field(ge=-100, le=100)
     priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
     queued_at: AwareTimestamp | None = None

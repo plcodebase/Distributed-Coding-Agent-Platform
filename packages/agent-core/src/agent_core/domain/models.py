@@ -111,6 +111,7 @@ class Run(DomainModel):
     priority: int = Field(ge=-100, le=100)
     priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE
     attempt: int = Field(ge=1)
+    execution_epoch: int = Field(default=1, ge=1)
     assigned_worker_id: IdentifierString | None = None
     lease_expires_at: AwareTimestamp | None = None
     last_checkpoint_id: uuid.UUID | None = None
@@ -149,6 +150,12 @@ class Run(DomainModel):
                     },
                 )
         return super().model_copy(update=update, deep=deep)
+
+    @model_validator(mode="after")
+    def validate_execution_epoch(self) -> Self:
+        if self.execution_epoch > self.attempt:
+            raise ValueError("execution_epoch may not exceed the run attempt")
+        return self
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
