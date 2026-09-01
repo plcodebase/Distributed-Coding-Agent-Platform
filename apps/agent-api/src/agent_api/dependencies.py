@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from agent_api.auth import Authenticator
+    from agent_core.artifacts import Artifact, ObjectStore, SourceSnapshot, Workspace
     from agent_core.control import (
         ApprovalDecision,
         PersistedApproval,
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
         PersistedMemory,
         PersistedTaskState,
         RunCreationResult,
+        RunSubmission,
         TaskPlanUpdate,
     )
     from agent_core.domain.models import Run, Session
@@ -32,6 +34,45 @@ class SessionRepository(Protocol):
     async def get(self, tenant_id: uuid.UUID, session_id: uuid.UUID) -> Session | None: ...
 
 
+class WorkspaceRepository(Protocol):
+    """Tenant-scoped immutable workspace and artifact metadata."""
+
+    async def create(self, workspace: Workspace) -> Workspace: ...
+
+    async def get(self, tenant_id: uuid.UUID, workspace_id: uuid.UUID) -> Workspace | None: ...
+
+    async def create_snapshot(self, snapshot: SourceSnapshot) -> SourceSnapshot: ...
+
+    async def get_snapshot(
+        self,
+        tenant_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        snapshot_id: uuid.UUID,
+    ) -> SourceSnapshot | None: ...
+
+    async def begin_validation(
+        self,
+        snapshot: SourceSnapshot,
+        *,
+        job_id: uuid.UUID,
+    ) -> SourceSnapshot: ...
+
+    async def list_artifacts(
+        self,
+        tenant_id: uuid.UUID,
+        workspace_id: uuid.UUID,
+        *,
+        run_id: uuid.UUID | None = None,
+        limit: int = 100,
+    ) -> tuple[Artifact, ...]: ...
+
+    async def get_artifact(
+        self,
+        tenant_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+    ) -> Artifact | None: ...
+
+
 class RunRepository(Protocol):
     """Tenant-scoped run storage used by HTTP handlers."""
 
@@ -39,6 +80,15 @@ class RunRepository(Protocol):
         self,
         tenant_id: uuid.UUID,
         run: Run,
+        *,
+        idempotency_key: str,
+        creation_hash: str,
+    ) -> RunCreationResult: ...
+
+    async def create_submission(
+        self,
+        tenant_id: uuid.UUID,
+        submission: RunSubmission,
         *,
         idempotency_key: str,
         creation_hash: str,
@@ -193,6 +243,8 @@ class ApiServices:
     context: ContextRepository | None = None
     tasks: TaskRepository | None = None
     memories: MemoryRepository | None = None
+    workspaces: WorkspaceRepository | None = None
+    object_store: ObjectStore | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,4 +268,5 @@ __all__ = [
     "RunRepository",
     "SessionRepository",
     "TaskRepository",
+    "WorkspaceRepository",
 ]

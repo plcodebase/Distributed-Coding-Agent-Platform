@@ -10,11 +10,17 @@ from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
     PersistedApproval,
+    RunSubmission,
+    TaskStatus,
+    TrackedTask,
     run_creation_hash,
 )
 from agent_core.domain.base import FrozenJsonObject
+from agent_core.domain.models import Run
+from agent_core.domain.status import RunStatus
 from agent_core.event_store import MAX_EVENT_PAGE_SIZE, EventDraft, EventPage, StoredEvent
 from agent_core.scheduling import RunPriorityClass
+from agent_core.workspace_access import WorkspaceFileReference
 
 
 def test_run_creation_hash_is_canonical_and_payload_sensitive() -> None:
@@ -25,6 +31,104 @@ def test_run_creation_hash_is_canonical_and_payload_sensitive() -> None:
         priority_class=RunPriorityClass.BACKGROUND,
     )
     assert len(run_creation_hash(priority=0)) == 64
+
+    task = TrackedTask(id="inspect", title="Inspect the repository")
+    submission_hash = run_creation_hash(
+        priority=0,
+        task="Fix the failing test.",
+        initial_tasks=(task,),
+    )
+    assert submission_hash == run_creation_hash(
+        priority=0,
+        task="Fix the failing test.",
+        initial_tasks=(task,),
+    )
+    assert submission_hash != run_creation_hash(
+        priority=0,
+        task="Fix a different test.",
+        initial_tasks=(task,),
+    )
+    referenced = (WorkspaceFileReference(path="docs/plan.md"),)
+    assert submission_hash != run_creation_hash(
+        priority=0,
+        task="Fix the failing test.",
+        initial_tasks=(task,),
+        referenced_files=referenced,
+    )
+    assert run_creation_hash(
+        priority=0,
+        referenced_files=(
+            WorkspaceFileReference(path="a.txt"),
+            WorkspaceFileReference(path="b.txt"),
+        ),
+    ) != run_creation_hash(
+        priority=0,
+        referenced_files=(
+            WorkspaceFileReference(path="b.txt"),
+            WorkspaceFileReference(path="a.txt"),
+        ),
+    )
+
+
+def test_run_submission_validates_task_bytes_and_initial_plan() -> None:
+    now = datetime.now(UTC)
+    run = Run(
+        id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        status=RunStatus.QUEUED,
+        priority=0,
+        attempt=1,
+        created_at=now,
+    )
+    submission = RunSubmission(
+        run=run,
+        task=" Fix the repository. ",
+        initial_tasks=(
+            TrackedTask(
+                id="inspect",
+                title="Inspect",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+    )
+    assert submission.task == "Fix the repository."
+
+    with pytest.raises(ValidationError):
+        RunSubmission(run=run, task="🙂" * 20_000)
+    with pytest.raises(ValidationError):
+        RunSubmission(run=run, task=" ")
+
+
+def test_run_submission_validates_canonical_unique_workspace_references() -> None:
+    run = Run(
+        id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        status=RunStatus.QUEUED,
+        priority=0,
+        attempt=1,
+        created_at=datetime.now(UTC),
+    )
+    submission = RunSubmission(
+        run=run,
+        task="Use the supplied context.",
+        referenced_files=(WorkspaceFileReference(path="docs//plan.md"),),
+    )
+    assert submission.referenced_files[0].path == "docs/plan.md"
+
+    for invalid in ("/etc/passwd", "../secret", ".", ".GIT/config"):
+        with pytest.raises(ValidationError):
+            WorkspaceFileReference(path=invalid)
+    with pytest.raises(ValidationError):
+        RunSubmission(
+            run=run,
+            task="Use the supplied context.",
+            referenced_files=(
+                WorkspaceFileReference(path="docs/plan.md"),
+                WorkspaceFileReference(path="docs/plan.md"),
+            ),
+        )
 
 
 def test_approval_decision_requires_aware_time_and_closed_schema() -> None:

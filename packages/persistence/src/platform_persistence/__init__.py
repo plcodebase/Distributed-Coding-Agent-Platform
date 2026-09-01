@@ -35,6 +35,10 @@ from platform_persistence.repositories import (
     RunCreationResult,
     run_creation_hash,
 )
+from platform_persistence.workspaces import (
+    PostgresWorkspaceRepository,
+    source_snapshot_object_key,
+)
 
 __all__ = [
     "ApprovalDecision",
@@ -62,6 +66,8 @@ __all__ = [
     "PostgresTaskRepository",
     "PostgresTenantQuotaRepository",
     "PostgresWorkspaceLeaseStore",
+    "PostgresWorkspaceRepository",
     "RunCreationResult",
     "run_creation_hash",
+    "source_snapshot_object_key",
 ]

@@ -18,6 +18,7 @@ from agent_core.domain.models import (
 )
 from agent_core.gateway import MessageRole  # noqa: TC001 - Pydantic resolves role at runtime
 from agent_core.scheduling import RunPriorityClass
+from agent_core.workspace_access import WorkspaceFileReference  # noqa: TC001 - Pydantic field
 
 type IdempotencyKey = Annotated[
     str,
@@ -28,6 +29,9 @@ type IdempotencyKey = Annotated[
     ),
 ]
 MAX_PERSISTED_MEMORY_BYTES = 65_536
+MAX_INITIAL_TASK_BYTES = 65_536
+MAX_APPROVAL_RESPONSE_BYTES = 65_536
+MAX_REFERENCED_WORKSPACE_FILES = 32
 
 
 class RunCreationResult(DomainModel):
@@ -241,6 +245,31 @@ class TaskPlanUpdate(DomainModel):
         return self
 
 
+class RunSubmission(DomainModel):
+    """Atomic run, initial user task, and initial task-plan payload."""
+
+    run: Run
+    task: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=65_536),
+    ]
+    initial_tasks: tuple[TrackedTask, ...] = Field(default=(), max_length=500)
+    referenced_files: tuple[WorkspaceFileReference, ...] = Field(
+        default=(),
+        max_length=MAX_REFERENCED_WORKSPACE_FILES,
+    )
+
+    @model_validator(mode="after")
+    def validate_submission(self) -> Self:
+        if len(self.task.encode("utf-8")) > MAX_INITIAL_TASK_BYTES:
+            raise ValueError("initial task exceeds its UTF-8 byte limit")
+        TaskPlanUpdate(expected_version=0, tasks=self.initial_tasks)
+        paths = [item.path for item in self.referenced_files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("referenced workspace file paths must be unique")
+        return self
+
+
 class PersistedTaskState(DomainModel):
     """Latest durable, versioned task plan returned by task APIs."""
 
@@ -390,11 +419,24 @@ def run_creation_hash(
     *,
     priority: int,
     priority_class: RunPriorityClass = RunPriorityClass.INTERACTIVE,
+    task: str | None = None,
+    initial_tasks: tuple[TrackedTask, ...] | None = None,
+    referenced_files: tuple[WorkspaceFileReference, ...] | None = None,
 ) -> str:
     """Return the canonical payload identity for API run idempotency."""
 
+    payload: dict[str, object] = {
+        "priority": priority,
+        "priority_class": priority_class.value,
+    }
+    if task is not None:
+        payload["task"] = task
+    if initial_tasks is not None:
+        payload["initial_tasks"] = [item.model_dump(mode="json") for item in initial_tasks]
+    if referenced_files:
+        payload["referenced_files"] = [item.model_dump(mode="json") for item in referenced_files]
     encoded = json.dumps(
-        {"priority": priority, "priority_class": priority_class.value},
+        payload,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -403,6 +445,8 @@ def run_creation_hash(
 
 
 __all__ = [
+    "MAX_INITIAL_TASK_BYTES",
+    "MAX_REFERENCED_WORKSPACE_FILES",
     "ApprovalDecision",
     "ApprovalStatus",
     "ContextCompactionStatus",
@@ -417,6 +461,7 @@ __all__ = [
     "PersistedTaskPlan",
     "PersistedTaskState",
     "RunCreationResult",
+    "RunSubmission",
     "TaskPlanUpdate",
     "TaskStatus",
     "TrackedTask",

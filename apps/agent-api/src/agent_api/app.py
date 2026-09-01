@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import anyio
@@ -33,15 +33,27 @@ from agent_api.body_limit import (
 from agent_api.dependencies import ApiServices
 from agent_api.schemas import (
     ApprovalDecisionRequest,
+    ArtifactDownloadResponse,
+    ArtifactListResponse,
     CreateRunRequest,
     CreateSessionRequest,
+    CreateWorkspaceRequest,
     EventListResponse,
+    FinalizeSnapshotRequest,
     HealthResponse,
     MemoryListResponse,
     MemorySettingRequest,
     RewindRequest,
     RunCreationResponse,
     RunStatusResponse,
+    SnapshotUploadResponse,
+)
+from agent_core.artifacts import (
+    SourceSnapshot,
+    SourceSnapshotStatus,
+    Workspace,
+    WorkspaceStatus,
+    source_snapshot_object_key,
 )
 from agent_core.context import CONTEXT_COMPACTION_ROUTE
 from agent_core.control import (
@@ -50,6 +62,7 @@ from agent_core.control import (
     PersistedContextCompaction,
     PersistedMemory,
     PersistedTaskState,
+    RunSubmission,
     TaskPlanUpdate,
     run_creation_hash,
 )
@@ -72,6 +85,9 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
     max_request_body_bytes: int = MAX_HTTP_REQUEST_BODY_BYTES,
     telemetry: PlatformTelemetry | None = None,
     metrics_token: str | None = None,
+    max_snapshot_upload_bytes: int = 256 * 1024 * 1024,
+    snapshot_upload_ttl_seconds: int = 900,
+    artifact_download_ttl_seconds: int = 300,
 ) -> FastAPI:
     """Compose one dependency-injected API instance without global mutable state."""
 
@@ -87,6 +103,13 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         MIN_METRICS_TOKEN_BYTES <= len(metrics_token.encode("utf-8")) <= MAX_METRICS_TOKEN_BYTES
     ):
         raise ValueError("metrics_token must be between 16 bytes and 4 KiB")
+    for name, value, maximum in (
+        ("max_snapshot_upload_bytes", max_snapshot_upload_bytes, 1024 * 1024 * 1024),
+        ("snapshot_upload_ttl_seconds", snapshot_upload_ttl_seconds, 3600),
+        ("artifact_download_ttl_seconds", artifact_download_ttl_seconds, 3600),
+    ):
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise ValueError(f"{name} must be an integer in [1, {maximum}]")
     active_event_sockets: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -269,6 +292,15 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         body: CreateSessionRequest,
         identity: Annotated[Principal, Depends(principal)],
     ) -> Session:
+        if services.workspaces is not None:
+            workspace = await services.workspaces.get(identity.tenant_id, body.workspace_id)
+            if workspace is None:
+                raise _not_found("workspace", body.workspace_id)
+            if workspace.status is not WorkspaceStatus.READY:
+                raise DomainOperationError(
+                    code="workspace_not_ready",
+                    message="sessions require a validated workspace snapshot",
+                )
         now = datetime.now(UTC)
         session = Session(
             id=uuid.uuid4(),
@@ -282,6 +314,205 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             updated_at=now,
         )
         return await services.sessions.create(session)
+
+    @app.post("/v1/workspaces", response_model=Workspace, status_code=201)
+    async def create_workspace(
+        body: CreateWorkspaceRequest,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> Workspace:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        now = datetime.now(UTC)
+        workspace = Workspace(
+            id=uuid.uuid4(),
+            tenant_id=identity.tenant_id,
+            status=WorkspaceStatus.PENDING,
+            display_name=body.display_name,
+            created_at=now,
+            updated_at=now,
+        )
+        return await workspaces.create(workspace)
+
+    @app.get("/v1/workspaces/{workspace_id}", response_model=Workspace)
+    async def get_workspace(
+        workspace_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> Workspace:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        workspace = await workspaces.get(identity.tenant_id, workspace_id)
+        if workspace is None:
+            raise _not_found("workspace", workspace_id)
+        return workspace
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/snapshots",
+        response_model=SnapshotUploadResponse,
+        status_code=201,
+    )
+    async def create_source_snapshot(
+        workspace_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> SnapshotUploadResponse:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        object_store = _require_service(services.object_store, "artifact storage")
+        workspace = await workspaces.get(identity.tenant_id, workspace_id)
+        if workspace is None:
+            raise _not_found("workspace", workspace_id)
+        if workspace.status is WorkspaceStatus.ARCHIVED:
+            raise DomainOperationError(
+                code="workspace_state_conflict",
+                message="archived workspaces cannot accept source snapshots",
+            )
+        now = datetime.now(UTC)
+        snapshot_id = uuid.uuid4()
+        snapshot = SourceSnapshot(
+            id=snapshot_id,
+            tenant_id=identity.tenant_id,
+            workspace_id=workspace_id,
+            status=SourceSnapshotStatus.PENDING,
+            object_key=source_snapshot_object_key(
+                identity.tenant_id,
+                workspace_id,
+                snapshot_id,
+            ),
+            created_at=now,
+            updated_at=now,
+        )
+        upload = await object_store.create_upload(
+            object_key=snapshot.object_key,
+            content_type="application/gzip",
+            max_bytes=max_snapshot_upload_bytes,
+            expires_at=now + timedelta(seconds=snapshot_upload_ttl_seconds),
+        )
+        return SnapshotUploadResponse(
+            snapshot=await workspaces.create_snapshot(snapshot),
+            upload=upload,
+        )
+
+    @app.post(
+        "/v1/workspaces/{workspace_id}/snapshots/{snapshot_id}/finalize",
+        response_model=SourceSnapshot,
+        status_code=202,
+    )
+    async def finalize_source_snapshot(
+        workspace_id: uuid.UUID,
+        snapshot_id: uuid.UUID,
+        body: FinalizeSnapshotRequest,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> SourceSnapshot:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        object_store = _require_service(services.object_store, "artifact storage")
+        snapshot = await workspaces.get_snapshot(
+            identity.tenant_id,
+            workspace_id,
+            snapshot_id,
+        )
+        if snapshot is None:
+            raise _not_found("source snapshot", snapshot_id)
+        if body.compressed_bytes > max_snapshot_upload_bytes:
+            raise DomainOperationError(
+                code="snapshot_compressed_limit",
+                message="source archive exceeds its configured byte limit",
+            )
+        if snapshot.status is SourceSnapshotStatus.READY:
+            if (
+                snapshot.expected_sha256 == body.sha256
+                and snapshot.compressed_bytes == body.compressed_bytes
+            ):
+                return snapshot
+            raise DomainOperationError(
+                code="snapshot_state_conflict",
+                message="source snapshot is already finalized with different metadata",
+            )
+        if snapshot.status is SourceSnapshotStatus.REJECTED:
+            raise DomainOperationError(
+                code="snapshot_state_conflict",
+                message="rejected source snapshots cannot be finalized again",
+            )
+        object_stat = await object_store.head(snapshot.object_key)
+        if object_stat is None:
+            raise DomainOperationError(
+                code="snapshot_upload_in_progress",
+                message="source archive upload is not available",
+                retryable=True,
+            )
+        if (
+            object_stat.size_bytes != body.compressed_bytes
+            or object_stat.content_type != "application/gzip"
+        ):
+            raise DomainOperationError(
+                code="snapshot_upload_mismatch",
+                message="source archive metadata does not match the uploaded object",
+            )
+        validating = snapshot.model_copy(
+            update={
+                "status": SourceSnapshotStatus.VALIDATING,
+                "expected_sha256": body.sha256,
+                "compressed_bytes": body.compressed_bytes,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return await workspaces.begin_validation(validating, job_id=uuid.uuid4())
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/snapshots/{snapshot_id}",
+        response_model=SourceSnapshot,
+    )
+    async def get_source_snapshot(
+        workspace_id: uuid.UUID,
+        snapshot_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> SourceSnapshot:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        snapshot = await workspaces.get_snapshot(
+            identity.tenant_id,
+            workspace_id,
+            snapshot_id,
+        )
+        if snapshot is None:
+            raise _not_found("source snapshot", snapshot_id)
+        return snapshot
+
+    @app.get(
+        "/v1/workspaces/{workspace_id}/artifacts",
+        response_model=ArtifactListResponse,
+    )
+    async def list_workspace_artifacts(
+        workspace_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+        run_id: uuid.UUID | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> ArtifactListResponse:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        workspace = await workspaces.get(identity.tenant_id, workspace_id)
+        if workspace is None:
+            raise _not_found("workspace", workspace_id)
+        return ArtifactListResponse(
+            artifacts=await workspaces.list_artifacts(
+                identity.tenant_id,
+                workspace_id,
+                run_id=run_id,
+                limit=limit,
+            )
+        )
+
+    @app.get(
+        "/v1/artifacts/{artifact_id}/download",
+        response_model=ArtifactDownloadResponse,
+    )
+    async def download_artifact(
+        artifact_id: uuid.UUID,
+        identity: Annotated[Principal, Depends(principal)],
+    ) -> ArtifactDownloadResponse:
+        workspaces = _require_service(services.workspaces, "workspace storage")
+        object_store = _require_service(services.object_store, "artifact storage")
+        artifact = await workspaces.get_artifact(identity.tenant_id, artifact_id)
+        if artifact is None:
+            raise _not_found("artifact", artifact_id)
+        download = await object_store.create_download(
+            object_key=artifact.object.object_key,
+            expires_at=datetime.now(UTC) + timedelta(seconds=artifact_download_ttl_seconds),
+        )
+        return ArtifactDownloadResponse(artifact=artifact, download=download)
 
     @app.get("/v1/sessions/{session_id}", response_model=Session)
     async def get_session(
@@ -445,13 +676,22 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
             tracestate=trace_carrier.get("tracestate"),
             created_at=now,
         )
-        result = await services.runs.create_idempotent(
+        submission = RunSubmission(
+            run=run,
+            task=body.task,
+            initial_tasks=body.initial_tasks,
+            referenced_files=body.referenced_files,
+        )
+        result = await services.runs.create_submission(
             identity.tenant_id,
-            run,
+            submission,
             idempotency_key=idempotency_key,
             creation_hash=run_creation_hash(
                 priority=body.priority,
                 priority_class=body.priority_class,
+                task=submission.task,
+                initial_tasks=submission.initial_tasks,
+                referenced_files=submission.referenced_files,
             ),
         )
         if telemetry is not None and result.created:

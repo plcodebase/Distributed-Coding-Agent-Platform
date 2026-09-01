@@ -19,8 +19,10 @@ from agent_core.control import (
     PersistedMessage,
     PersistedTaskPlan,
     RunCreationResult,
+    RunSubmission,
     run_creation_hash,
 )
+from agent_core.domain.base import FrozenJsonObject, JsonObject
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import Checkpoint, ModelCall, Run, Session, ToolCall
 from agent_core.domain.status import (
@@ -30,6 +32,7 @@ from agent_core.domain.status import (
     ToolCallStatus,
 )
 from agent_core.domain.transitions import transition_run
+from agent_core.gateway import MessageRole
 from agent_core.scheduling import QueueAdmissionPolicy, RunPriorityClass
 from platform_persistence.capacity import ensure_tenant_quota
 from platform_persistence.fencing import assert_active_run_lease
@@ -106,6 +109,7 @@ _TOOL_CALL_PREDECESSORS: dict[ToolCallStatus, frozenset[ToolCallStatus]] = {
 }
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -158,10 +162,14 @@ class PostgresRunRepository:
         *,
         default_quota: TenantQuota | None = None,
         admission_policy: QueueAdmissionPolicy | None = None,
+        id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
+        wakeup: Callable[[uuid.UUID], Awaitable[None]] | None = None,
     ) -> None:
         self._sessions = sessions
         self._default_quota = default_quota or TenantQuota()
         self._admission_policy = admission_policy or QueueAdmissionPolicy()
+        self._id_factory = id_factory
+        self._wakeup = wakeup
 
     async def create_idempotent(
         self,
@@ -170,6 +178,49 @@ class PostgresRunRepository:
         *,
         idempotency_key: IdempotencyKey,
         creation_hash: str,
+    ) -> RunCreationResult:
+        result = await self._create(
+            tenant_id,
+            run,
+            idempotency_key=idempotency_key,
+            creation_hash=creation_hash,
+            submission=None,
+        )
+        await self._publish_wakeup(result.run.id)
+        return result
+
+    async def create_submission(
+        self,
+        tenant_id: uuid.UUID,
+        submission: RunSubmission,
+        *,
+        idempotency_key: IdempotencyKey,
+        creation_hash: str,
+    ) -> RunCreationResult:
+        """Atomically persist the run, user task, initial plan, and queue visibility."""
+
+        result = await self._create(
+            tenant_id,
+            submission.run,
+            idempotency_key=idempotency_key,
+            creation_hash=creation_hash,
+            submission=submission,
+        )
+        await self._publish_wakeup(result.run.id)
+        return result
+
+    async def _publish_wakeup(self, run_id: uuid.UUID) -> None:
+        if self._wakeup is not None:
+            await self._wakeup(run_id)
+
+    async def _create(
+        self,
+        tenant_id: uuid.UUID,
+        run: Run,
+        *,
+        idempotency_key: IdempotencyKey,
+        creation_hash: str,
+        submission: RunSubmission | None,
     ) -> RunCreationResult:
         try:
             idempotency_key = _IDEMPOTENCY_KEY_ADAPTER.validate_python(idempotency_key)
@@ -181,6 +232,9 @@ class PostgresRunRepository:
         expected_creation_hash = run_creation_hash(
             priority=run.priority,
             priority_class=run.priority_class,
+            task=submission.task if submission is not None else None,
+            initial_tasks=submission.initial_tasks if submission is not None else None,
+            referenced_files=submission.referenced_files if submission is not None else None,
         )
         if creation_hash != expected_creation_hash:
             raise DomainOperationError(
@@ -208,6 +262,8 @@ class PostgresRunRepository:
                     idempotency_key=idempotency_key,
                     creation_hash=creation_hash,
                 )
+            if submission is not None:
+                await self._lock_submission_session(database, tenant_id, run)
             quota = await ensure_tenant_quota(
                 database,
                 tenant_id,
@@ -303,6 +359,8 @@ class PostgresRunRepository:
                 .returning(RunRecord.id)
             )
             if inserted is not None:
+                if submission is not None:
+                    await self._insert_initial_state(database, tenant_id, submission)
                 return RunCreationResult(run=run, created=True)
             existing = await self._creation_record(
                 database,
@@ -318,6 +376,98 @@ class PostgresRunRepository:
                 run=run,
                 idempotency_key=idempotency_key,
                 creation_hash=creation_hash,
+            )
+
+    async def _insert_initial_state(
+        self,
+        database: AsyncSession,
+        tenant_id: uuid.UUID,
+        submission: RunSubmission,
+    ) -> None:
+        run = submission.run
+        next_sequence = (
+            int(
+                await database.scalar(
+                    select(func.coalesce(func.max(MessageRecord.sequence), 0)).where(
+                        MessageRecord.tenant_id == tenant_id,
+                        MessageRecord.session_id == run.session_id,
+                    )
+                )
+                or 0
+            )
+            + 1
+        )
+        message_metadata: JsonObject = {"source": "run_submission"}
+        if submission.referenced_files:
+            message_metadata["referenced_files"] = [
+                item.model_dump(mode="json") for item in submission.referenced_files
+            ]
+        message = PersistedMessage(
+            id=self._id_factory(),
+            session_id=run.session_id,
+            run_id=run.id,
+            sequence=next_sequence,
+            role=MessageRole.USER,
+            content=submission.task,
+            metadata=FrozenJsonObject(message_metadata),
+            created_at=run.created_at,
+        )
+        plan = PersistedTaskPlan(
+            id=self._id_factory(),
+            run_id=run.id,
+            version=1,
+            plan=FrozenJsonObject(
+                {"tasks": [task.model_dump(mode="json") for task in submission.initial_tasks]}
+            ),
+            created_at=run.created_at,
+        )
+        database.add(
+            MessageRecord(
+                id=message.id,
+                tenant_id=tenant_id,
+                session_id=message.session_id,
+                run_id=message.run_id,
+                sequence=message.sequence,
+                role=message.role.value,
+                content=message.content,
+                metadata_json=message.metadata.to_json_object(),
+                created_at=message.created_at,
+            )
+        )
+        database.add(
+            TaskPlanRecord(
+                id=plan.id,
+                tenant_id=tenant_id,
+                run_id=plan.run_id,
+                version=plan.version,
+                plan=plan.plan.to_json_object(),
+                created_at=plan.created_at,
+            )
+        )
+
+    @staticmethod
+    async def _lock_submission_session(
+        database: AsyncSession,
+        tenant_id: uuid.UUID,
+        run: Run,
+    ) -> None:
+        session = await database.scalar(
+            select(SessionRecord)
+            .where(
+                SessionRecord.tenant_id == tenant_id,
+                SessionRecord.id == run.session_id,
+            )
+            .with_for_update()
+        )
+        if session is None:
+            raise DomainOperationError(
+                code="session_not_found",
+                message="the run session was not found",
+            )
+        if session.workspace_id != run.workspace_id:
+            raise DomainOperationError(
+                code="run_workspace_mismatch",
+                message="the run workspace does not match its session",
             )
 
     @staticmethod
