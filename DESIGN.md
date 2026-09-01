@@ -1718,6 +1718,14 @@ attaches signed SPDX and SLSA predicates, signs the evidence manifest, and repea
 before promotion. Site admission must require the release workflow identity and attestations in
 addition to the portable digest/security policy.
 
+Implementation note: tenant data lifecycle is export-first and fail-closed. Migration `0017` adds
+legal holds, tenant tombstones, immutable audit-export evidence, and a fenced object-deletion
+outbox. Authenticated application access stops as soon as deletion is requested. Bounded workers
+delete immutable objects before metadata; finalization preserves compliance evidence. A read-only
+restore verifier requires the exact migration head, contiguous events, no deleted-tenant residue,
+and checksum-valid database/object evidence. Managed PITR, object versioning, KMS, rotation, RPO,
+and RTO remain site controls and require a retained target-environment rehearsal.
+
 ---
 
 # 13. Codex Implementation Rules
@@ -1793,6 +1801,7 @@ PR 40  Reviewed API, worker, and scheduler production composition
 PR 41  Durable context, memory, and task-plan composition
 PR 42  Kubernetes node topology and production static contracts
 PR 43  Production-readiness audit and release-gate closure
+PR 44  Data lifecycle, legal holds, and restore verification
 ```
 
 Each PR must include:

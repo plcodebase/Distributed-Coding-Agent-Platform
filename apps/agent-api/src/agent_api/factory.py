@@ -21,6 +21,7 @@ from platform_persistence import (
     PostgresApprovalRepository,
     PostgresAuditSink,
     PostgresContextRepository,
+    PostgresLifecycleRepository,
     PostgresMemoryRepository,
     PostgresRunRepository,
     PostgresSessionRepository,
@@ -138,6 +139,7 @@ def create_production_app(
     memories = PostgresMemoryRepository(database.sessions)
     workspaces = PostgresWorkspaceRepository(database.sessions)
     events = PostgresEventStore(database.sessions)
+    tenant_access = PostgresLifecycleRepository(database.sessions)
     telemetry = PlatformTelemetry(
         TelemetrySettings(
             service_name="agent-api",
@@ -158,6 +160,7 @@ def create_production_app(
         workspaces=workspaces,
         object_store=object_store,
         audit=PostgresAuditSink(database.sessions),
+        tenant_access=tenant_access,
     )
 
     async def close() -> None:

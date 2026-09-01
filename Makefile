@@ -30,10 +30,12 @@ RELEASE_COSIGN_SHA256 ?=
 RELEASE_PYTHON_SLIM_IMAGE ?=
 RELEASE_PYTHON_ALPINE_IMAGE ?=
 RELEASE_LITELLM_IMAGE ?=
+LIFECYCLE_ARGS ?=
+RECOVERY_ARGS ?=
 export UV_CACHE_DIR ?= $(CURDIR)/.cache/uv
 export PRE_COMMIT_HOME ?= $(CURDIR)/.cache/pre-commit
 
-.PHONY: bootstrap sync format lint typecheck unit integration coverage audit lock-check build-packages pre-commit check test release-check release-contract release-tool-contract release-evidence release-evidence-verify load-sim load-sim-all chaos-sim kubernetes-contract deployment-sim coding-sim quality-report final-compile final-baseline podman-preflight podman-images podman-production-images sandbox-security gateway-security postgres-security e2e-happy distributed-e2e migrate migration-check api compose-config compose-up compose-smoke compose-down
+.PHONY: bootstrap sync format lint typecheck unit integration coverage audit lock-check build-packages pre-commit check test release-check release-contract release-tool-contract release-evidence release-evidence-verify load-sim load-sim-all chaos-sim kubernetes-contract deployment-sim coding-sim quality-report final-compile final-baseline podman-preflight podman-images podman-production-images sandbox-security gateway-security postgres-security e2e-happy distributed-e2e migrate migration-check lifecycle-admin recovery-verify api compose-config compose-up compose-smoke compose-down
 
 bootstrap:
 	$(UV) python install 3.12
@@ -242,6 +244,14 @@ migrate:
 
 migration-check:
 	$(UV) run --env-file $(ENV_FILE) alembic check
+
+lifecycle-admin:
+	@test -n "$(strip $(LIFECYCLE_ARGS))" || { echo "Set LIFECYCLE_ARGS to one reviewed lifecycle command." >&2; exit 2; }
+	$(UV) run --env-file $(ENV_FILE) python -m scripts.data_lifecycle $(LIFECYCLE_ARGS)
+
+recovery-verify:
+	@test -n "$(strip $(RECOVERY_ARGS))" || { echo "Set RECOVERY_ARGS to one isolated-restore verification command." >&2; exit 2; }
+	$(UV) run --env-file $(ENV_FILE) python -m scripts.recovery_verification $(RECOVERY_ARGS)
 
 api:
 	$(UV) run --env-file $(ENV_FILE) uvicorn agent_api.factory:create_production_app --factory --host 127.0.0.1 --port 8000

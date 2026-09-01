@@ -28,9 +28,11 @@ final artifact download, and an epoch-isolated rewind with a different replaceme
 
 It is **not production-ready yet**. Durable rewind now forks a monotonic execution epoch and keeps
 abandoned transcript, tool, model, memory, approval, event, and artifact state out of the active
-branch. The remaining blockers include data-lifecycle controls and release-environment work: a site
-overlay, production identities and providers, managed backup/rotation configuration plus a retained
-restore rehearsal, a signed release/admission run, and live load/failure/rolling proof.
+branch. Data lifecycle now includes legal holds, bounded retention/deletion jobs, export-first
+tenant deletion, audit verification, and an isolated-restore consistency verifier. The remaining
+blockers are release-environment work: a site overlay, production identities and providers,
+managed backup/rotation configuration plus a retained restore rehearsal, a signed release/admission
+run, and live load/failure/rolling proof.
 
 The current workspace also contains the accumulated implementation as uncommitted tracked and
 untracked changes. Those changes are valid review inputs, not a release source revision. They must
@@ -46,7 +48,7 @@ builder will accept them.
 | 2. Editing/checkpoints | Live-verified locally with Podman | Detached private worktrees, descriptor-safe bounded tools, optimistic edit transactions, pre-mutation checkpoints, stable hashes, object-backed snapshots, final binary-safe patches, duplicate-outcome reuse, and epoch-isolated durable rewind are implemented. The distributed E2E completes epoch 1, rewinds to its first checkpoint, reuses a logical tool ID with different arguments in epoch 2, and proves the replacement patch is active while the abandoned patch remains auditable. | Repeat the same journey using promoted images and the target-cluster topology. |
 | 3. Sandbox runtime | Live-verified locally with Podman | Rootless Podman replaces the draft runtime. The node owns the socket behind mTLS; sandboxes have no network, read-only root, one workspace mount, non-root identity, reduced capabilities, seccomp, resource/output/time limits, process-group cancellation, and targeted cleanup. | Repeat the security suite on the release kernel/node/image combination and retain evidence; evaluate a stronger boundary for hostile multi-tenant code. |
 | 4. LLM gateway | Integrated; fake-upstream live verification | Agents SDK model-layer adapter, LiteLLM routes, typed normalization, durable request idempotency, timeout/retry/backoff, circuit breaker, rate and token limits, fallback tests, usage and cost attribution, and credential separation exist. | Validate at least two real production deployments, upstream fallback metadata, spend reconciliation, and provider outage behavior. |
-| 5. Sessions/API | Integrated; event transport live-verified locally | PostgreSQL/Alembic models, tenant-scoped FastAPI operations, OIDC/JWKS auth, request bounds, idempotent submissions, durable messages/events/state, replay, WebSocket streaming, approvals, rewind, artifacts, and audit writes exist. | Add complete retention, legal-hold, tenant-deletion, audit-export, and isolated-restore controls; repeat reconnect and process replacement through the target ingress/load balancer; configure and rehearse production issuer/JWKS, credential, and certificate rotation plus managed backups. |
+| 5. Sessions/API | Integrated; event transport and lifecycle storage live-verified locally | PostgreSQL/Alembic models, tenant-scoped FastAPI operations, OIDC/JWKS auth, request bounds, idempotent submissions, durable messages/events/state, replay, WebSocket streaming, approvals, rewind, artifacts, audit writes, legal holds, audit export, retention/deletion jobs, and tenant tombstones exist. A real PostgreSQL test proves the lifecycle migration, hold blocking, fenced cleanup retry, tombstoning, and isolated restore/object verification. | Repeat reconnect and process replacement through the target ingress/load balancer; configure and rehearse production issuer/JWKS, credential, and certificate rotation plus managed backups. |
 | 6. Distributed workers | Integrated and recovery path live-verified locally | API execution is separated; PostgreSQL `SKIP LOCKED` scheduling, workers, heartbeat leases, lost/requeue recovery, workspace fencing, cancellation, draining, epoch-fenced persistence, and Redis wake-up hints with polling fallback exist. The local two-epoch E2E resumes one run across worker instances A through E. | Demonstrate at least three simultaneously running worker processes, abrupt worker loss with lease expiry, and recovery in the deployed topology. |
 | 7. Concurrency | Contract and component-tested | Worker/sandbox/gateway/provider/tenant/workspace limits, admission, priorities, quotas, backpressure, queue metrics, HPAs, and deterministic load profiles exist. | No live 10/50/100-run campaign or production p50/p95/p99/resource evidence exists; HPA scale-up has not been observed on a target cluster. |
 | 8. Context/memory/tasks | Integrated and locally live-verified | Composable contributors, route budgets, token estimation, non-destructive explicit and proactive compaction, durable history, project instructions, submission-bound referenced files, a non-mutating protected-path-filtered current diff, redacted and byte-bounded recent durable tool outcomes, provenance-bound memory, extraction jobs, versioned task plans, and control APIs exist. The worker atomically schedules compaction at 3,072 post-watermark messages, before the fail-closed 4,096-message load ceiling. | Repeat the context-bearing journey with promoted images and live model routes; tune route budgets only from recorded production evidence. |
@@ -101,13 +103,17 @@ builder will accept them.
    - Exercise two real provider deployments through LiteLLM without placing provider credentials in
      workers, and reconcile gateway usage/cost with provider records.
 
-4. **Implement and rehearse data lifecycle and disaster recovery.**
-   - Add bounded retention and deletion jobs, legal holds, export-first tenant deletion, audit export
-     verification, fail-closed tenant access, a fenced object-deletion outbox, and a read-only
-     PostgreSQL/object restore verifier.
+4. **Configure and rehearse disaster recovery and rotation in the target environment.**
+   - The repository now implements retention/garbage-collection jobs, legal holds, export-first
+     tenant deletion, audit export verification, fail-closed tenant access, a fenced object-deletion
+     outbox, an operator CLI, and a read-only PostgreSQL/object restore verifier. The verifier passed
+     locally against a freshly migrated isolated PostgreSQL database and rejected altered object
+     evidence and the wrong migration head.
    - Configure managed PostgreSQL PITR, object-store versioning/replication/retention, KMS ownership,
-     and dual-trust key/certificate rotation. Rehearse a coordinated isolated restore and publish
-     RPO/RTO only from retained timed evidence.
+     and dual-trust key/certificate rotation under the site runbook. Rehearse a coordinated restore
+     into an isolated target environment and retain proof of database metadata, every referenced
+     object checksum, run/event state, tombstones, and tenant authorization. Publish RPO/RTO only
+     from that timed evidence.
 
 ### P1 — required for a complete first release
 
@@ -151,9 +157,11 @@ clean environment must apply migrations and deploy from only the promoted artifa
 
 ### Wave 3 — recovery and lifecycle operations
 
-Implement retention and deletion jobs, legal holds, audit export, tenant access denial, restore
-verification, and the certificate/credential/migration runbook. Configure provider-managed
+Retention and deletion jobs, legal holds, audit export, tenant access denial, restore verification,
+and the certificate/credential/migration runbook are implemented. Configure provider-managed
 database/object backups and rotations, then execute the runbook against an isolated target restore.
+Treat checksum, migration, event, audit, or tenant-reference divergence as a failed restore and
+retain the create-once verification report.
 
 ### Wave 4 — live acceptance campaign
 
@@ -176,14 +184,16 @@ Fresh local evidence for this review:
 - `make release-check`: passed;
 - Ruff formatting and lint: passed;
 - strict mypy: passed for 220 source files;
-- unit tests: passed;
+- unit tests: 855 passed;
 - branch coverage: 85.47% against an 85% gate;
 - integration tests: 5 passed, including 2 real uvicorn/TCP event-gateway cases;
 - pre-commit: passed;
 - frozen dependency audit: no known vulnerabilities;
 - lock verification: passed;
 - package build: all 14 workspace packages produced an sdist and wheel;
-- real-PostgreSQL security and persistence suite: passed;
+- lifecycle persistence adapter: 93% branch coverage from deterministic repository tests;
+- real-PostgreSQL security and persistence suite: 18 passed, including lifecycle and an isolated
+  restore verification;
 - focused real-PostgreSQL context/task/memory recomposition: 1 passed, including immutable
   submission reference recovery;
 - distributed production-boundary E2E: 1 passed locally in 21.70 seconds with real PostgreSQL,

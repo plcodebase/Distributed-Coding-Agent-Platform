@@ -246,6 +246,8 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         authorization: Annotated[str | None, Header()] = None,
     ) -> Principal:
         authenticated = await services.authenticator.authenticate(authorization)
+        if services.tenant_access is not None:
+            await services.tenant_access.require_active(authenticated.tenant_id)
         request.state.principal = authenticated
         if (
             services.audit is not None
@@ -943,10 +945,13 @@ def _require_service[T](service: T | None, feature: str) -> T:
 
 
 def _error_status(error: DomainOperationError) -> int:
-    if error.code == "authentication_required":
-        return 401
-    if error.code == "resource_not_found":
-        return 404
+    exact_status = {
+        "authentication_required": 401,
+        "resource_not_found": 404,
+        "tenant_not_active": 403,
+    }.get(error.code)
+    if exact_status is not None:
+        return exact_status
     if error.code.endswith("_conflict") or error.code.endswith("_in_progress"):
         return 409
     if error.code in {
@@ -1000,6 +1005,7 @@ def _domain_error_category(error: DomainOperationError) -> ErrorCategory:
     exact = {
         "authentication_required": ErrorCategory.AUTHENTICATION,
         "resource_not_found": ErrorCategory.VALIDATION,
+        "tenant_not_active": ErrorCategory.AUTHORIZATION,
     }
     if code in exact:
         return exact[code]

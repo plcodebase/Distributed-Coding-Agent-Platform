@@ -12,7 +12,12 @@ from agent_api.dependencies import EventGatewayServices
 from agent_api.event_app import create_event_gateway_app
 from agent_api.factory import _credentials_json
 from event_store import PostgresEventStore
-from platform_persistence import Database, DatabaseSettings, PostgresRunRepository
+from platform_persistence import (
+    Database,
+    DatabaseSettings,
+    PostgresLifecycleRepository,
+    PostgresRunRepository,
+)
 from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
@@ -91,6 +96,7 @@ def create_production_event_gateway_app(
         runs=PostgresRunRepository(database.sessions),
         events=PostgresEventStore(database.sessions),
         readiness=database,
+        tenant_access=PostgresLifecycleRepository(database.sessions),
     )
 
     async def close() -> None:

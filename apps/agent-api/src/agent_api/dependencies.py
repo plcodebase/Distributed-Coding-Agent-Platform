@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     )
     from agent_core.domain.models import Run, Session
     from agent_core.event_store import EventPage, StoredEvent
+    from agent_core.lifecycle import TenantAccessPolicy
 
 
 class SessionRepository(Protocol):
@@ -247,6 +248,7 @@ class ApiServices:
     workspaces: WorkspaceRepository | None = None
     object_store: ObjectStore | None = None
     audit: AuditSink | None = None
+    tenant_access: TenantAccessPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +259,7 @@ class EventGatewayServices:
     runs: RunRepository
     events: EventStore
     readiness: ReadinessProbe
+    tenant_access: TenantAccessPolicy | None = None
 
 
 __all__ = [

@@ -51,6 +51,10 @@ and separates tested controls from live deployment evidence.
   object checksums. Every mutation checkpoint retains the exact logical tool-call ID. Redis is a
   lossy wake-up hint; publication failure degrades to PostgreSQL polling and cannot make an accepted
   task disappear.
+- Tenant lifecycle state is checked after authentication by both control and event planes. Legal
+  holds block retention and deletion; export-first deletion uses checksum-verified audit evidence,
+  cooling-off, a fenced deletion outbox, and a retained tombstone. An isolated-restore verifier
+  checks migration, event, tenant-residue, and object-integrity invariants without mutating data.
 
 ## Residual risk and deferred controls
 
@@ -67,9 +71,10 @@ and separates tested controls from live deployment evidence.
   UID that owns the rootless Podman service can control that user's containers and workspaces.
 - CNI policy, kernel namespaces, cgroups, seccomp, rootless storage, and mTLS behavior vary by target
   cluster and must pass the security campaign on every supported node image.
-- Supply-chain scanning and portable admission contracts are implemented and component-tested.
-  Target managed backups, object replication/versioning, KMS and certificate/key rotation, site
-  signature admission, and a retained recovery rehearsal remain deployment work.
+- Lifecycle, retention, tenant deletion, audit export, restore verification, supply-chain scanning,
+  and portable admission contracts are implemented and component-tested. Target managed backups,
+  object replication/versioning, KMS and certificate/key rotation, site signature admission, and a
+  retained recovery rehearsal remain deployment work.
 
 The project does not claim a formal proof of isolation. It claims only the controls
 covered by the executable tests above.

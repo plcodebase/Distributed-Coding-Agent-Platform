@@ -5,6 +5,7 @@ import json
 import threading
 import uuid
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -296,6 +297,23 @@ class ReadinessFake:
         return self.value
 
 
+class TenantAccessFake:
+    def __init__(self, *, active: bool = True, broken: bool = False) -> None:
+        self.active = active
+        self.broken = broken
+        self.calls: list[uuid.UUID] = []
+
+    async def require_active(self, tenant_id: uuid.UUID) -> None:
+        self.calls.append(tenant_id)
+        if self.broken:
+            raise RuntimeError("lifecycle-database-secret-must-not-escape")
+        if not self.active:
+            raise DomainOperationError(
+                code="tenant_not_active",
+                message="the tenant is not accepting application operations",
+            )
+
+
 class ContextRepositoryFake:
     def __init__(self) -> None:
         self.values: dict[tuple[uuid.UUID, uuid.UUID, str], PersistedContextCompaction] = {}
@@ -515,6 +533,35 @@ def test_health_and_authentication_boundary() -> None:
     assert unauthenticated.json()["error"]["code"] == "authentication_required"
 
 
+def test_inactive_tenant_is_blocked_after_authentication_before_repository_access() -> None:
+    api_services, _, runs, _ = services()
+    access = TenantAccessFake(active=False)
+    client = TestClient(create_app(replace(api_services, tenant_access=access)))
+    run_id = uuid.uuid4()
+
+    response = client.get(f"/v1/runs/{run_id}", headers=authorization())
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "tenant_not_active"
+    assert runs.values == {}
+    assert access.calls == [TENANT_A]
+
+
+def test_lifecycle_dependency_failure_is_fail_closed_and_opaque() -> None:
+    api_services, _, _, _ = services()
+    access = TenantAccessFake(broken=True)
+    client = TestClient(
+        create_app(replace(api_services, tenant_access=access)),
+        raise_server_exceptions=False,
+    )
+
+    response = client.get(f"/v1/runs/{uuid.uuid4()}", headers=authorization())
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "lifecycle-database-secret" not in response.text
+
+
 def test_event_gateway_exposes_only_health_metrics_and_event_routes() -> None:
     api_services, sessions, runs, events = services()
     now = datetime.now(UTC)
@@ -642,6 +689,34 @@ def test_event_gateway_websocket_auth_not_found_replay_and_reconnect_metric() ->
     rendered = telemetry.metrics.render().decode("utf-8")
     assert "agent_platform_event_reconnects_total 1.0" in rendered
     telemetry.shutdown()
+
+
+def test_event_gateway_blocks_inactive_tenant_for_http_and_websocket() -> None:
+    api_services, _, runs, events = services()
+    access = TenantAccessFake(active=False)
+    event_services = EventGatewayServices(
+        authenticator=api_services.authenticator,
+        runs=runs,
+        events=events,
+        readiness=api_services.readiness,
+        tenant_access=access,
+    )
+    client = TestClient(create_event_gateway_app(event_services))
+    run_id = uuid.uuid4()
+
+    response = client.get(f"/v1/runs/{run_id}/events", headers=authorization())
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "tenant_not_active"
+    with (
+        pytest.raises(WebSocketDisconnect) as denied,
+        client.websocket_connect(
+            f"/v1/runs/{run_id}/stream",
+            headers=authorization(),
+        ),
+    ):
+        pass
+    assert denied.value.code == 4403
+    assert access.calls == [TENANT_A, TENANT_A]
 
 
 def test_production_event_gateway_factory_builds_event_only_graph() -> None:

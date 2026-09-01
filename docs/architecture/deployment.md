@@ -45,6 +45,13 @@ Rollout order:
 8. run the live deployment verifier before enabling production traffic;
 9. run bounded load, chaos, and coding campaigns and compile the final evidence report.
 
+Before step 1 is accepted, enable managed PostgreSQL PITR and object-store versioning/replication.
+Before traffic, restore both into an isolated environment and run `make recovery-verify`; checksum,
+tenant-residue, migration, audit, or event divergence is a failed deployment gate. Configure the
+retention/cleanup schedule and rehearse the legal-hold and tenant-deletion procedure. Certificate
+and credential rotations use overlapping trust followed by rolling drain/restart. See the
+[data lifecycle and recovery runbook](../operations/data-lifecycle-and-recovery.md).
+
 Worker termination is cooperative first and lease-recoverable second. The loopback `POST /drain`
 endpoint is invoked by `preStop`; readiness immediately fails, new claims stop, and the worker waits
 for active attempts. If the grace period expires, the scheduler requeues the expired fenced lease and

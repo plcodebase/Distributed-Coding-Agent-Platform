@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -19,8 +19,11 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select, update
+from scripts.recovery_verification import verify_restored_environment
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from agent_api import ApiServices, Principal, StaticTokenAuthenticator, create_app
 from agent_api.factory import AgentApiSettings, create_production_app
@@ -30,10 +33,15 @@ from agent_core.artifacts import (
     ObjectStat,
     PresignedDownload,
     PresignedUpload,
+    SourceSnapshot,
     SourceSnapshotStatus,
     StoredObject,
+    Workspace,
+    WorkspaceStatus,
     final_patch_object_key,
+    source_snapshot_object_key,
 )
+from agent_core.audit import AuditEntry
 from agent_core.control import (
     ApprovalDecision,
     ApprovalStatus,
@@ -55,7 +63,7 @@ from agent_core.distributed import (
     WorkspaceWriterLease,
 )
 from agent_core.domain.base import FrozenJsonObject
-from agent_core.domain.errors import DomainOperationError
+from agent_core.domain.errors import DomainOperationError, ErrorDetail
 from agent_core.domain.models import (
     Checkpoint,
     ModelCall,
@@ -84,6 +92,13 @@ from agent_core.gateway import (
     GatewayToolCall,
     MessageRole,
 )
+from agent_core.lifecycle import (
+    AuditExport,
+    AuditExportStatus,
+    LegalHold,
+    TenantLifecycleStatus,
+)
+from agent_core.lifecycle_service import AuditExportService
 from agent_core.loop import AgentLoop
 from agent_core.tools import (
     RegisteredTool,
@@ -101,11 +116,13 @@ from platform_persistence import (
     Database,
     DatabaseSettings,
     PostgresApprovalRepository,
+    PostgresAuditSink,
     PostgresContextRepository,
     PostgresExecutionRepository,
     PostgresGatewayCircuitBreaker,
     PostgresGatewayRateLimiter,
     PostgresGatewayRequestStore,
+    PostgresLifecycleRepository,
     PostgresMemoryRepository,
     PostgresRecoveryStore,
     PostgresRunQueue,
@@ -119,21 +136,26 @@ from platform_persistence import (
 from platform_persistence.models import (
     AgentEventRecord,
     ApprovalRecord,
+    AuditExportRecord,
+    AuditRecord,
     CheckpointRecord,
     MemoryExtractionJobRecord,
     MemoryRecord,
     MessageRecord,
     ModelCallRecord,
+    ObjectDeletionJobRecord,
     RunRecord,
     SessionRecord,
+    SourceSnapshotRecord,
     TaskPlanRecord,
     ToolCallRecord,
     WorkerRecord,
     WorkspaceLeaseRecord,
+    WorkspaceRecord,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 
 pytestmark = [
     pytest.mark.security,
@@ -403,6 +425,38 @@ def _migrated_database(url: str) -> Iterator[str]:
         yield url
         command.downgrade(configuration, "base")
         command.upgrade(configuration, "head")
+    finally:
+        if previous is None:
+            os.environ.pop("AGENT_PLATFORM_DATABASE_URL", None)
+        else:
+            os.environ["AGENT_PLATFORM_DATABASE_URL"] = previous
+
+
+@asynccontextmanager
+async def _isolated_migrated_database(base_url: str) -> AsyncIterator[str]:
+    parsed = make_url(base_url)
+    database_name = f"agent_restore_{uuid.uuid4().hex}"
+    admin_url = parsed.set(database="postgres").render_as_string(hide_password=False)
+    isolated_url = parsed.set(database=database_name).render_as_string(hide_password=False)
+    admin = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin.connect() as connection:
+            await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+        await asyncio.to_thread(_upgrade_database, isolated_url)
+        yield isolated_url
+    finally:
+        async with admin.connect() as connection:
+            await connection.execute(
+                text(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+            )
+        await admin.dispose()
+
+
+def _upgrade_database(url: str) -> None:
+    previous = os.environ.get("AGENT_PLATFORM_DATABASE_URL")
+    os.environ["AGENT_PLATFORM_DATABASE_URL"] = url
+    try:
+        command.upgrade(Config(str(ROOT / "alembic.ini")), "head")
     finally:
         if previous is None:
             os.environ.pop("AGENT_PLATFORM_DATABASE_URL", None)
@@ -2710,6 +2764,345 @@ async def test_production_api_restart_preserves_tenant_state_and_event_replay(
             headers=authorization,
         ) as websocket:
             assert websocket.receive_json()["sequence"] == 2
+
+
+@pytest.mark.asyncio
+async def test_isolated_restore_verification_checks_real_postgresql_and_object_bytes(
+    postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    async with _isolated_migrated_database(postgres_url) as restored_url:
+        database = Database(DatabaseSettings(database_url=restored_url))
+        repository = PostgresLifecycleRepository(database.sessions)
+        objects = _JourneyObjectStore()
+        service = AuditExportService(
+            repository,
+            objects,
+            temporary_parent=tmp_path,
+            clock=lambda: datetime.now(UTC),
+        )
+        tenant_id = uuid.uuid4()
+        export_id = uuid.uuid4()
+        try:
+            export = await service.export(
+                tenant_id,
+                export_id=export_id,
+                requested_by="recovery-operator",
+            )
+            report = await verify_restored_environment(
+                database,
+                objects,
+                backup_id="isolated-postgresql-restore",
+                source_revision="a" * 40,
+                temporary_parent=tmp_path,
+                verification_id=uuid.UUID(int=1),
+            )
+            assert report.migration_head == "0017"
+            assert report.object_count == 1
+            assert export.object is not None
+            assert report.object_bytes == export.object.size_bytes
+            assert {table.name: table.rows for table in report.table_counts}["audit_exports"] == 1
+
+            with pytest.raises(DomainOperationError) as wrong_head:
+                await verify_restored_environment(
+                    database,
+                    objects,
+                    backup_id="wrong-head",
+                    source_revision="a" * 40,
+                    temporary_parent=tmp_path,
+                    expected_migration_head="9999",
+                )
+            assert wrong_head.value.code == "restore_integrity_failed"
+
+            stored, content = objects.objects[export.object.object_key]
+            objects.objects[export.object.object_key] = (
+                stored,
+                bytes((content[0] ^ 1,)) + content[1:],
+            )
+            with pytest.raises(DomainOperationError) as tampered:
+                await verify_restored_environment(
+                    database,
+                    objects,
+                    backup_id="tampered-object",
+                    source_revision="a" * 40,
+                    temporary_parent=tmp_path,
+                )
+            assert tampered.value.code == "audit_export_invalid"
+        finally:
+            await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_export_hold_tombstone_and_fenced_cleanup_survive_postgresql(  # noqa: PLR0915 - end-to-end transactional lifecycle
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    repository = PostgresLifecycleRepository(database.sessions)
+    audit = PostgresAuditSink(database.sessions)
+    tenant_id = uuid.uuid4()
+    cleanup_tenant_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    export_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    hold_id = uuid.uuid4()
+    try:
+        workspace_id = uuid.uuid4()
+        snapshot_id = uuid.uuid4()
+        workspaces = PostgresWorkspaceRepository(database.sessions)
+        await workspaces.create(
+            Workspace(
+                id=workspace_id,
+                tenant_id=tenant_id,
+                status=WorkspaceStatus.PENDING,
+                display_name="tenant deletion fixture",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        snapshot_key = source_snapshot_object_key(tenant_id, workspace_id, snapshot_id)
+        await workspaces.create_snapshot(
+            SourceSnapshot(
+                id=snapshot_id,
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                status=SourceSnapshotStatus.PENDING,
+                object_key=snapshot_key,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await audit.append(
+            AuditEntry(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                subject="compliance-operator",
+                method="POST",
+                resource="/admin/audit-exports",
+                action="audit.export_requested",
+                request_id=str(export_id),
+                details={"purpose": "tenant-deletion"},
+                occurred_at=now - timedelta(seconds=1),
+            )
+        )
+        pending = await repository.create_audit_export(
+            AuditExport(
+                id=export_id,
+                tenant_id=tenant_id,
+                status=AuditExportStatus.PENDING,
+                requested_by="compliance-operator",
+                cutoff_at=now,
+                created_at=now,
+            )
+        )
+        batches = [
+            batch
+            async for batch in repository.iter_audit_entries(
+                tenant_id,
+                cutoff_at=now,
+                batch_size=1,
+            )
+        ]
+        assert [entry.action for batch in batches for entry in batch] == ["audit.export_requested"]
+        completed = await repository.complete_audit_export(
+            pending.model_copy(
+                update={
+                    "status": AuditExportStatus.COMPLETED,
+                    "object": StoredObject(
+                        object_key=(
+                            f"compliance/tenants/{tenant_id.hex}/audit/{export_id.hex}.jsonl"
+                        ),
+                        sha256="0" * 64,
+                        size_bytes=128,
+                        content_type="application/x-ndjson",
+                    ),
+                    "record_count": 1,
+                    "first_occurred_at": now - timedelta(seconds=1),
+                    "last_occurred_at": now - timedelta(seconds=1),
+                    "completed_at": now,
+                }
+            )
+        )
+        assert await repository.complete_audit_export(completed) == completed
+
+        hold = LegalHold(
+            id=hold_id,
+            tenant_id=tenant_id,
+            reason="preserve while request is reviewed",
+            placed_by="legal-operator",
+            placed_at=now,
+        )
+        assert await repository.place_legal_hold(hold) == hold
+        with pytest.raises(DomainOperationError) as held:
+            await repository.request_tenant_deletion(
+                tenant_id,
+                request_id=request_id,
+                requested_by="compliance-operator",
+                requested_at=now,
+                delete_after=now,
+                audit_export_id=export_id,
+            )
+        assert held.value.code == "tenant_legal_hold_active"
+        released_at = now + timedelta(microseconds=1)
+        released = await repository.release_legal_hold(
+            tenant_id,
+            hold_id,
+            released_by="legal-operator",
+            released_at=released_at,
+        )
+        assert released.released_at == released_at
+        assert (
+            await repository.release_legal_hold(
+                tenant_id,
+                hold_id,
+                released_by="legal-operator",
+                released_at=released_at + timedelta(seconds=1),
+            )
+            == released
+        )
+
+        requested = await repository.request_tenant_deletion(
+            tenant_id,
+            request_id=request_id,
+            requested_by="compliance-operator",
+            requested_at=now,
+            delete_after=now,
+            audit_export_id=export_id,
+        )
+        assert requested.status is TenantLifecycleStatus.DELETION_REQUESTED
+        with pytest.raises(DomainOperationError) as inactive:
+            await repository.require_active(tenant_id)
+        assert inactive.value.code == "tenant_not_active"
+        with pytest.raises(IntegrityError):
+            await workspaces.create(
+                Workspace(
+                    id=uuid.uuid4(),
+                    tenant_id=tenant_id,
+                    status=WorkspaceStatus.PENDING,
+                    display_name="must be rejected after deletion request",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        deleting = await repository.begin_tenant_deletion(tenant_id, occurred_at=now)
+        assert deleting.status is TenantLifecycleStatus.DELETING
+        assert await repository.enqueue_tenant_objects(tenant_id, limit=10) == 1
+        tenant_object_claim = await repository.claim_object_deletions(
+            "tenant-cleanup",
+            occurred_at=now,
+            lease_seconds=60,
+            limit=10,
+        )
+        assert len(tenant_object_claim) == 1
+        assert tenant_object_claim[0].object_key == snapshot_key
+        await repository.complete_object_deletion(tenant_object_claim[0])
+        deleted = await repository.finalize_tenant_deletion(tenant_id, occurred_at=now)
+        assert deleted.status is TenantLifecycleStatus.DELETED
+        assert await repository.get_tenant_lifecycle(tenant_id) == deleted
+
+        job_id = uuid.uuid4()
+        object_key = f"tenants/{cleanup_tenant_id.hex}/expired-patch"
+        async with database.sessions() as transaction, transaction.begin():
+            transaction.add(
+                ObjectDeletionJobRecord(
+                    id=job_id,
+                    tenant_id=cleanup_tenant_id,
+                    artifact_id=None,
+                    object_key=object_key,
+                    reason="retention_expired",
+                    status="pending",
+                    lease_generation=0,
+                    attempt=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        first_claim = await repository.claim_object_deletions(
+            "cleanup-1",
+            occurred_at=now,
+            lease_seconds=60,
+            limit=10,
+        )
+        assert len(first_claim) == 1
+        assert first_claim[0].lease_generation == 1
+        assert (
+            await repository.claim_object_deletions(
+                "cleanup-2",
+                occurred_at=now,
+                lease_seconds=60,
+                limit=10,
+            )
+            == ()
+        )
+        cleanup_hold = LegalHold(
+            id=uuid.uuid4(),
+            tenant_id=cleanup_tenant_id,
+            reason="preserve cleanup evidence",
+            placed_by="legal-operator",
+            placed_at=now,
+        )
+        with pytest.raises(DomainOperationError) as cleanup_in_progress:
+            await repository.place_legal_hold(cleanup_hold)
+        assert cleanup_in_progress.value.code == "legal_hold_cleanup_in_progress"
+        await repository.fail_object_deletion(
+            first_claim[0],
+            error=ErrorDetail(
+                code="object_store_unavailable",
+                message="object storage is unavailable",
+                retryable=True,
+            ),
+            occurred_at=now,
+        )
+        assert await repository.place_legal_hold(cleanup_hold) == cleanup_hold
+        assert (
+            await repository.claim_object_deletions(
+                "cleanup-2",
+                occurred_at=now,
+                lease_seconds=60,
+                limit=10,
+            )
+            == ()
+        )
+        await repository.release_legal_hold(
+            cleanup_tenant_id,
+            cleanup_hold.id,
+            released_by="legal-operator",
+            released_at=now,
+        )
+        second_claim = await repository.claim_object_deletions(
+            "cleanup-2",
+            occurred_at=now,
+            lease_seconds=60,
+            limit=10,
+        )
+        assert len(second_claim) == 1
+        assert second_claim[0].lease_generation == 2
+        assert second_claim[0].attempt == 2
+        await repository.complete_object_deletion(second_claim[0])
+        await repository.complete_object_deletion(second_claim[0])
+
+        async with database.sessions() as transaction:
+            preserved_export = await transaction.scalar(
+                select(func.count())
+                .select_from(AuditExportRecord)
+                .where(AuditExportRecord.tenant_id == tenant_id)
+            )
+            preserved_audit = await transaction.scalar(
+                select(func.count())
+                .select_from(AuditRecord)
+                .where(AuditRecord.tenant_id == tenant_id)
+            )
+            cleanup_job = await transaction.get(ObjectDeletionJobRecord, job_id)
+            deleted_workspace = await transaction.get(WorkspaceRecord, workspace_id)
+            deleted_snapshot = await transaction.get(SourceSnapshotRecord, snapshot_id)
+        assert preserved_export == 1
+        assert preserved_audit == 2
+        assert cleanup_job is not None
+        assert cleanup_job.status == "completed"
+        assert cleanup_job.outcome_lease_token == second_claim[0].lease_token
+        assert deleted_workspace is None
+        assert deleted_snapshot is None
+    finally:
+        await database.aclose()
 
 
 def _session(now: datetime) -> Session:

@@ -976,6 +976,10 @@ class AuditRecord(Base):
     __table_args__ = (
         CheckConstraint("method IN ('POST', 'PUT', 'PATCH', 'DELETE')", name="method"),
         CheckConstraint("jsonb_typeof(details) = 'object'", name="details_object"),
+        CheckConstraint(
+            "octet_length(details::text) <= 1000000",
+            name="details_bytes",
+        ),
         Index("ix_audit_log_tenant_occurred", "tenant_id", "occurred_at"),
     )
 
@@ -992,6 +996,220 @@ class AuditRecord(Base):
         nullable=False,
         server_default=_UTC_NOW,
     )
+
+
+class AuditExportRecord(Base):
+    """Immutable compliance export of one tenant's audit prefix."""
+
+    __tablename__ = "audit_exports"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("object_key"),
+        CheckConstraint("status IN ('pending', 'completed', 'failed')", name="status"),
+        CheckConstraint(
+            "object_key IS NULL OR object_key ~ '^[a-z0-9][a-z0-9._/-]*$'",
+            name="object_key",
+        ),
+        CheckConstraint("sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'", name="sha256"),
+        CheckConstraint("size_bytes IS NULL OR size_bytes BETWEEN 1 AND 1073741824", name="size"),
+        CheckConstraint(
+            "record_count IS NULL OR record_count BETWEEN 0 AND 10000000",
+            name="record_count",
+        ),
+        CheckConstraint(
+            "error IS NULL OR jsonb_typeof(error) = 'object'",
+            name="error_object",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND object_key IS NULL AND sha256 IS NULL "
+            "AND size_bytes IS NULL AND content_type IS NULL AND etag IS NULL "
+            "AND record_count IS NULL AND first_occurred_at IS NULL "
+            "AND last_occurred_at IS NULL AND completed_at IS NULL AND error IS NULL) "
+            "OR (status = 'completed' AND object_key IS NOT NULL AND sha256 IS NOT NULL "
+            "AND size_bytes IS NOT NULL AND content_type IS NOT NULL "
+            "AND record_count IS NOT NULL AND completed_at >= created_at AND error IS NULL "
+            "AND ((record_count = 0 AND first_occurred_at IS NULL "
+            "AND last_occurred_at IS NULL) OR (record_count > 0 "
+            "AND first_occurred_at IS NOT NULL AND last_occurred_at >= first_occurred_at "
+            "AND last_occurred_at <= cutoff_at))) "
+            "OR (status = 'failed' AND object_key IS NULL AND sha256 IS NULL "
+            "AND size_bytes IS NULL AND content_type IS NULL AND etag IS NULL "
+            "AND record_count IS NULL AND first_occurred_at IS NULL "
+            "AND last_occurred_at IS NULL AND completed_at IS NULL AND error IS NOT NULL)",
+            name="lifecycle",
+        ),
+        Index("ix_audit_exports_tenant_created", "tenant_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    cutoff_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    object_key: Mapped[str | None] = mapped_column(String(1024))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    content_type: Mapped[str | None] = mapped_column(String(255))
+    etag: Mapped[str | None] = mapped_column(String(1024))
+    record_count: Mapped[int | None] = mapped_column(BigInteger)
+    first_occurred_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_occurred_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_UTC_NOW
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+
+
+class TenantLifecycleRecord(Base):
+    """Tenant access tombstone and deletion state."""
+
+    __tablename__ = "tenant_lifecycle"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "audit_export_id"),
+            ("audit_exports.tenant_id", "audit_exports.id"),
+        ),
+        UniqueConstraint("request_id"),
+        CheckConstraint(
+            "status IN ('active', 'deletion_requested', 'deleting', 'deleted')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND request_id IS NULL AND requested_by IS NULL "
+            "AND requested_at IS NULL AND delete_after IS NULL AND audit_export_id IS NULL "
+            "AND deletion_started_at IS NULL AND deleted_at IS NULL) "
+            "OR (status = 'deletion_requested' AND request_id IS NOT NULL "
+            "AND requested_by IS NOT NULL AND requested_at IS NOT NULL "
+            "AND delete_after >= requested_at AND audit_export_id IS NOT NULL "
+            "AND deletion_started_at IS NULL AND deleted_at IS NULL) "
+            "OR (status = 'deleting' AND request_id IS NOT NULL AND requested_by IS NOT NULL "
+            "AND requested_at IS NOT NULL AND delete_after >= requested_at "
+            "AND audit_export_id IS NOT NULL AND deletion_started_at >= delete_after "
+            "AND deleted_at IS NULL) "
+            "OR (status = 'deleted' AND request_id IS NOT NULL AND requested_by IS NOT NULL "
+            "AND requested_at IS NOT NULL AND delete_after >= requested_at "
+            "AND audit_export_id IS NOT NULL AND deletion_started_at >= delete_after "
+            "AND deleted_at >= deletion_started_at)",
+            name="lifecycle",
+        ),
+        CheckConstraint(
+            "requested_by IS NULL OR octet_length(requested_by) BETWEEN 1 AND 1024",
+            name="requested_by_bytes",
+        ),
+        CheckConstraint(
+            "requested_at IS NULL OR updated_at >= requested_at",
+            name="updated_after_request",
+        ),
+        Index("ix_tenant_lifecycle_status_delete_after", "status", "delete_after"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    requested_by: Mapped[str | None] = mapped_column(String(255))
+    requested_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    delete_after: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    audit_export_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    deletion_started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_UTC_NOW
+    )
+
+
+class LegalHoldRecord(Base):
+    """Tenant-wide legal hold with an immutable placement and explicit release."""
+
+    __tablename__ = "legal_holds"
+    __table_args__ = (
+        CheckConstraint("octet_length(reason) BETWEEN 1 AND 8000", name="reason_bytes"),
+        CheckConstraint("octet_length(placed_by) BETWEEN 1 AND 1024", name="placed_by_bytes"),
+        CheckConstraint(
+            "expires_at IS NULL OR expires_at > placed_at",
+            name="expiry_order",
+        ),
+        CheckConstraint(
+            "(released_by IS NULL AND released_at IS NULL) OR "
+            "(released_by IS NOT NULL AND released_at >= placed_at)",
+            name="release_state",
+        ),
+        Index("ix_legal_holds_tenant_release_expiry", "tenant_id", "released_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(2000), nullable=False)
+    placed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    placed_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    released_by: Mapped[str | None] = mapped_column(String(255))
+    released_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ObjectDeletionJobRecord(Base):
+    """Retryable fenced outbox for object deletion before metadata removal."""
+
+    __tablename__ = "object_deletion_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("tenant_id", "artifact_id"),
+            ("artifacts.tenant_id", "artifacts.id"),
+        ),
+        UniqueConstraint("object_key"),
+        UniqueConstraint("lease_token"),
+        UniqueConstraint("outcome_lease_token"),
+        CheckConstraint("object_key ~ '^[a-z0-9][a-z0-9._/-]*$'", name="object_key"),
+        CheckConstraint(
+            "reason IN ('retention_expired', 'tenant_deletion')",
+            name="reason",
+        ),
+        CheckConstraint("status IN ('pending', 'running', 'completed', 'failed')", name="status"),
+        CheckConstraint("attempt BETWEEN 0 AND 100", name="attempt"),
+        CheckConstraint("lease_generation >= 0", name="lease_generation"),
+        CheckConstraint("error IS NULL OR jsonb_typeof(error) = 'object'", name="error_object"),
+        CheckConstraint(
+            "(status = 'pending' AND worker_id IS NULL AND lease_token IS NULL "
+            "AND outcome_lease_token IS NULL AND lease_expires_at IS NULL "
+            "AND completed_at IS NULL) "
+            "OR (status = 'running' AND worker_id IS NOT NULL AND lease_token IS NOT NULL "
+            "AND outcome_lease_token IS NULL "
+            "AND lease_generation >= 1 AND attempt >= 1 AND lease_expires_at > updated_at "
+            "AND completed_at IS NULL AND error IS NULL) "
+            "OR (status = 'completed' AND worker_id IS NULL AND lease_token IS NULL "
+            "AND outcome_lease_token IS NOT NULL AND lease_expires_at IS NULL "
+            "AND completed_at >= created_at AND error IS NULL) "
+            "OR (status = 'failed' AND worker_id IS NULL AND lease_token IS NULL "
+            "AND outcome_lease_token IS NOT NULL AND lease_expires_at IS NULL "
+            "AND completed_at IS NULL AND error IS NOT NULL)",
+            name="lifecycle",
+        ),
+        Index("ix_object_deletion_jobs_claim", "status", "lease_expires_at", "created_at"),
+        Index("ix_object_deletion_jobs_tenant_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    worker_id: Mapped[str | None] = mapped_column(String(255))
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    outcome_lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_UTC_NOW
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_UTC_NOW
+    )
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentEventRecord(Base):
@@ -1505,6 +1723,7 @@ class GatewayCircuitRecord(Base):
 __all__ = [
     "AgentEventRecord",
     "ApprovalRecord",
+    "AuditExportRecord",
     "AuditRecord",
     "CheckpointRecord",
     "ContextCompactionRecord",
@@ -1513,14 +1732,17 @@ __all__ = [
     "GatewayProviderCapacityRecord",
     "GatewayRateLimitRecord",
     "GatewayRequestRecord",
+    "LegalHoldRecord",
     "MemoryExtractionJobRecord",
     "MemoryRecord",
     "MessageRecord",
     "ModelCallRecord",
+    "ObjectDeletionJobRecord",
     "QueueAdmissionRecord",
     "RunRecord",
     "SessionRecord",
     "TaskPlanRecord",
+    "TenantLifecycleRecord",
     "TenantQuotaRecord",
     "ToolCallRecord",
 ]

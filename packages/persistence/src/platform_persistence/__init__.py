@@ -22,6 +22,7 @@ from platform_persistence.gateway_policies import (
     PostgresGatewayRateLimiter,
 )
 from platform_persistence.gateway_store import PostgresGatewayRequestStore
+from platform_persistence.lifecycle import PostgresLifecycleRepository
 from platform_persistence.repositories import (
     ApprovalDecision,
     ApprovalStatus,
@@ -60,6 +61,7 @@ __all__ = [
     "PostgresGatewayCircuitBreaker",
     "PostgresGatewayRateLimiter",
     "PostgresGatewayRequestStore",
+    "PostgresLifecycleRepository",
     "PostgresMemoryRepository",
     "PostgresRecoveryStore",
     "PostgresRunQueue",

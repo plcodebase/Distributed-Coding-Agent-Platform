@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from pydantic import ValidationError
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -21,7 +23,12 @@ from agent_core.event_store import (
     StoredEvent,
 )
 from platform_persistence import Base, Database, DatabaseSettings
-from platform_persistence.models import GatewayRequestRecord, ToolCallRecord
+from platform_persistence.models import (
+    AuditExportRecord,
+    GatewayRequestRecord,
+    ObjectDeletionJobRecord,
+    ToolCallRecord,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -30,6 +37,7 @@ EXPECTED_TABLES = {
     "agent_events",
     "approvals",
     "artifacts",
+    "audit_exports",
     "audit_log",
     "checkpoints",
     "context_compactions",
@@ -37,11 +45,13 @@ EXPECTED_TABLES = {
     "gateway_capacity_leases",
     "gateway_provider_capacity",
     "gateway_rate_limits",
+    "legal_holds",
     "gateway_circuits",
     "messages",
     "memories",
     "memory_extraction_jobs",
     "model_calls",
+    "object_deletion_jobs",
     "queue_admission",
     "runs",
     "run_leases",
@@ -49,6 +59,7 @@ EXPECTED_TABLES = {
     "snapshot_validation_jobs",
     "source_snapshots",
     "task_plans",
+    "tenant_lifecycle",
     "tenant_quotas",
     "tool_calls",
     "workers",
@@ -166,6 +177,18 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
                 ("tenant_id", "id", "workspace_id"),
             ),
         },
+        "tenant_lifecycle": {
+            (
+                ("tenant_id", "audit_export_id"),
+                ("tenant_id", "id"),
+            )
+        },
+        "object_deletion_jobs": {
+            (
+                ("tenant_id", "artifact_id"),
+                ("tenant_id", "id"),
+            )
+        },
     }
     for table_name, expected in expected_foreign_keys.items():
         actual = {
@@ -186,6 +209,8 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
 def test_nullable_json_objects_bind_python_none_as_sql_null() -> None:
     assert ToolCallRecord.result.type.none_as_null is True
     assert GatewayRequestRecord.error.type.none_as_null is True
+    assert AuditExportRecord.error.type.none_as_null is True
+    assert ObjectDeletionJobRecord.error.type.none_as_null is True
 
 
 def test_initial_migration_constraints_remain_compatible_with_head_metadata() -> None:
@@ -298,12 +323,34 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
             "snapshot_validation_jobs",
             "fk_workspaces_current_snapshot",
         ),
+        "0017_data_lifecycle.py": (
+            'revision: str = "0017"',
+            'down_revision: str | None = "0016"',
+            "audit_exports",
+            "tenant_lifecycle",
+            "legal_holds",
+            "object_deletion_jobs",
+            "ck_audit_log_details_bytes",
+            "agent_require_active_tenant_write",
+            "pg_advisory_xact_lock",
+            "active_tenant_write",
+        ),
     }
     migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"
     for filename, required_values in migration_requirements.items():
         content = (migration_root / filename).read_text(encoding="utf-8")
         for required in required_values:
             assert required in content
+
+
+def test_alembic_revision_graph_has_one_linear_head() -> None:
+    configuration = Config(str(ROOT / "alembic.ini"))
+    script = ScriptDirectory.from_config(configuration)
+
+    assert script.get_heads() == ["0017"]
+    assert [revision.revision for revision in script.walk_revisions()] == [
+        f"{sequence:04d}" for sequence in range(17, 0, -1)
+    ]
 
 
 def test_database_settings_are_closed_bounded_and_secret_safe() -> None:

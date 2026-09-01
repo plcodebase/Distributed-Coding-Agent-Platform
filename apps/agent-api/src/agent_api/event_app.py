@@ -104,7 +104,10 @@ def create_event_gateway_app(  # noqa: PLR0915 - explicit least-privilege route 
     async def principal(
         authorization: Annotated[str | None, Header()] = None,
     ) -> Principal:
-        return await services.authenticator.authenticate(authorization)
+        identity = await services.authenticator.authenticate(authorization)
+        if services.tenant_access is not None:
+            await services.tenant_access.require_active(identity.tenant_id)
+        return identity
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics(authorization: Annotated[str | None, Header()] = None) -> Response:
@@ -173,8 +176,10 @@ def create_event_gateway_app(  # noqa: PLR0915 - explicit least-privilege route 
             identity = await services.authenticator.authenticate(
                 websocket.headers.get("authorization")
             )
-        except DomainOperationError:
-            await websocket.close(code=4401)
+            if services.tenant_access is not None:
+                await services.tenant_access.require_active(identity.tenant_id)
+        except DomainOperationError as error:
+            await websocket.close(code=4401 if error.code == "authentication_required" else 4403)
             return
         except Exception:
             await websocket.close(code=1011)

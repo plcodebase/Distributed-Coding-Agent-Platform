@@ -560,6 +560,20 @@ not manufacture live deployment evidence. See the
 [production-readiness review](docs/architecture/production-readiness.md) for the remaining P0–P2
 gates.
 
+### Data lifecycle and recovery verification
+
+Migration `0017` and the lifecycle services add bounded audit exports, legal holds, export-first
+tenant deletion, fail-closed tenant API/event access, retention scans, and a fenced object-deletion
+outbox. Destructive administration requires exact tenant confirmation and never accepts model
+input. A separate read-only verifier checks an isolated PostgreSQL/object-store restore, streams and
+hashes every referenced object, validates audit-export structure and event continuity, and writes
+create-once recovery evidence.
+
+Operator commands and the boundaries that remain provider/site owned are documented in
+[`docs/operations/data-lifecycle-and-recovery.md`](docs/operations/data-lifecycle-and-recovery.md).
+The implementation does not claim a production RPO/RTO or successful backup until that runbook is
+executed against the target managed services.
+
 ### Production release supply chain
 
 The production image inventory contains platform, node, sandbox, and a mirrored exact LiteLLM
