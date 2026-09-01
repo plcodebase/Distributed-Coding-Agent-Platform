@@ -10,6 +10,12 @@ CORE_ROOTS = (
     Path("packages/sandbox-runtime/src"),
     Path("packages/telemetry/src"),
 )
+TRUSTED_COMPOSITION_ROOTS = frozenset(
+    {
+        Path("apps/agent-worker/src/agent_worker/production.py"),
+        Path("apps/scheduler/src/agent_scheduler/production.py"),
+    }
+)
 PERSISTENCE_ADAPTER_ROOTS = (
     Path("packages/persistence/src"),
     Path("packages/event-store/src"),
@@ -54,7 +60,12 @@ def imported_roots(path: Path) -> set[str]:
 @pytest.mark.parametrize(
     "path",
     sorted(
-        (path for root in CORE_ROOTS for path in root.rglob("*.py")),
+        (
+            path
+            for root in CORE_ROOTS
+            for path in root.rglob("*.py")
+            if path not in TRUSTED_COMPOSITION_ROOTS
+        ),
         key=str,
     ),
     ids=str,

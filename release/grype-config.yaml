@@ -1,0 +1,14 @@
+check-for-app-update: false
+only-fixed: false
+only-notfixed: false
+ignore-wontfix: ""
+ignore: []
+exclude: []
+vex-documents: []
+vex-add: []
+db:
+  auto-update: true
+  validate-by-hash-on-start: true
+  validate-age: true
+  max-allowed-built-age: 48h0m0s
+  require-update-check: true

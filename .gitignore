@@ -12,6 +12,7 @@ coverage.xml
 htmlcov/
 dist/
 build/
+release-evidence/
 .cache/
 .idea/
 .vscode/

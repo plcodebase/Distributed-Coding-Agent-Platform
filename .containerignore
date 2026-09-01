@@ -1,0 +1,12 @@
+**
+!pyproject.toml
+!uv.lock
+!apps/
+!apps/**
+!packages/
+!packages/**
+!services/
+!services/platform/
+!services/platform/Containerfile
+!services/node/
+!services/node/Containerfile

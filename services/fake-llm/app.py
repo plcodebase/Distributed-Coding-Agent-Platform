@@ -9,9 +9,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from coding_scenario import CodingAction, text_chunks, tool_chunks
+from coding_scenario import is_request as is_coding_scenario
+from coding_scenario import next_action as next_coding_action
+
 
 def _json_bytes(value: object) -> bytes:
-    return json.dumps(value, separators=(",", ":")).encode()
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -23,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "not found"}})
 
-    def do_POST(self) -> None:
+    def do_POST(self) -> None:  # noqa: PLR0911, PLR0912 - explicit test protocol paths
         if self.path != "/v1/chat/completions":
             self._write_json(HTTPStatus.NOT_FOUND, {"error": {"message": "not found"}})
             return
@@ -51,40 +55,75 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if not isinstance(request, dict):
+            self._write_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": {
+                        "message": "request must be an object",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+            return
+
         provider = os.getenv("FAKE_PROVIDER", "fake")
         text = os.getenv("FAKE_RESPONSE_TEXT", f"deterministic response from {provider}")
         response_id = f"chatcmpl-{provider}"
         model = str(request.get("model", "fake-model"))
+        coding_action: CodingAction | None = None
+        if is_coding_scenario(request):
+            if not bool(request.get("stream")):
+                self._write_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": {
+                            "message": "coding scenario requires streaming",
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+                return
+            try:
+                coding_action = next_coding_action(request)
+            except (TypeError, ValueError):
+                self._write_json(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": {
+                            "message": "coding scenario protocol failure",
+                            "type": "fake_scenario_error",
+                        }
+                    },
+                )
+                return
         if bool(request.get("stream")):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            chunks = (
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}}],
-                },
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": text}}],
-                },
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {
-                        "prompt_tokens": 1,
-                        "completion_tokens": 1,
-                        "total_tokens": 2,
-                    },
-                },
-            )
+            if coding_action is not None:
+                if isinstance(coding_action, str):
+                    chunks = text_chunks(
+                        response_id=response_id,
+                        model=model,
+                        text=coding_action,
+                    )
+                else:
+                    call_id, tool_name, arguments = coding_action
+                    chunks = tool_chunks(
+                        response_id=response_id,
+                        model=model,
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
+            else:
+                chunks = text_chunks(
+                    response_id=response_id,
+                    model=model,
+                    text=text,
+                )
             for chunk in chunks:
                 self.wfile.write(b"data: " + _json_bytes(chunk) + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")

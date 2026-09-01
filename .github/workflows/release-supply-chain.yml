@@ -1,0 +1,96 @@
+name: release-supply-chain
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: release-supply-chain-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-scan-sign-verify:
+    runs-on: [self-hosted, linux, podman, rootless, release]
+    timeout-minutes: 120
+    env:
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      PRE_COMMIT_HOME: ${{ github.workspace }}/.cache/pre-commit
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/agent-release-registry-auth.json
+      RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/agent-release-${{ github.run_id }}-${{ github.run_attempt }}
+      RELEASE_REGISTRY_HOST: ${{ vars.RELEASE_REGISTRY_HOST }}
+      RELEASE_REGISTRY_PREFIX: ${{ vars.RELEASE_REGISTRY_PREFIX }}
+      RELEASE_SOURCE_REVISION: ${{ github.sha }}
+      RELEASE_SOURCE_URI: ${{ github.server_url }}/${{ github.repository }}
+      RELEASE_CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+      RELEASE_CERTIFICATE_OIDC_ISSUER: https://token.actions.githubusercontent.com
+      RELEASE_GIT: ${{ vars.RELEASE_GIT_PATH }}
+      PODMAN: ${{ vars.RELEASE_PODMAN_PATH }}
+      RELEASE_SYFT: ${{ vars.RELEASE_SYFT_PATH }}
+      RELEASE_GRYPE: ${{ vars.RELEASE_GRYPE_PATH }}
+      RELEASE_COSIGN: ${{ vars.RELEASE_COSIGN_PATH }}
+      RELEASE_GIT_SHA256: ${{ vars.RELEASE_GIT_SHA256 }}
+      RELEASE_PODMAN_SHA256: ${{ vars.RELEASE_PODMAN_SHA256 }}
+      RELEASE_SYFT_SHA256: ${{ vars.RELEASE_SYFT_SHA256 }}
+      RELEASE_GRYPE_SHA256: ${{ vars.RELEASE_GRYPE_SHA256 }}
+      RELEASE_COSIGN_SHA256: ${{ vars.RELEASE_COSIGN_SHA256 }}
+      RELEASE_PYTHON_SLIM_IMAGE: ${{ vars.RELEASE_PYTHON_SLIM_IMAGE }}
+      RELEASE_PYTHON_ALPINE_IMAGE: ${{ vars.RELEASE_PYTHON_ALPINE_IMAGE }}
+      RELEASE_LITELLM_IMAGE: ${{ vars.RELEASE_LITELLM_IMAGE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@557e51de59eb14aaaba2ed9621916900a91d50c6 # v6.6.1
+        with:
+          version: "0.11.32"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-packages --frozen
+      - name: Require a version-tag release ref
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*) ;;
+            *) echo "release workflow requires a v* tag ref" >&2; exit 1 ;;
+          esac
+      - name: Re-run release quality gates
+        run: make release-check
+      - name: Validate Kubernetes release contracts
+        run: make kubernetes-contract
+      - name: Verify configured release executable checksums
+        run: make release-tool-contract
+      - name: Verify protected rootless Podman release runner
+        run: make podman-preflight
+      - name: Authenticate the release registry
+        env:
+          RELEASE_REGISTRY_PASSWORD: ${{ secrets.RELEASE_REGISTRY_PASSWORD }}
+          RELEASE_REGISTRY_USERNAME: ${{ secrets.RELEASE_REGISTRY_USERNAME }}
+        run: |
+          test -n "${RELEASE_REGISTRY_HOST}"
+          test -n "${RELEASE_REGISTRY_USERNAME}"
+          test -n "${RELEASE_REGISTRY_PASSWORD}"
+          printf '%s' "${RELEASE_REGISTRY_PASSWORD}" | "${PODMAN}" login \
+            "${RELEASE_REGISTRY_HOST}" \
+            --username "${RELEASE_REGISTRY_USERNAME}" \
+            --password-stdin
+      - name: Build, scan, sign, and attest immutable images
+        run: make release-evidence
+      - name: Reverify the promotion evidence and registry state
+        run: make release-evidence-verify
+      - name: Upload signed release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: ${{ env.RELEASE_EVIDENCE_DIR }}
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          "${PODMAN}" logout "${RELEASE_REGISTRY_HOST}" || true
+          rm -f -- "${REGISTRY_AUTH_FILE}"

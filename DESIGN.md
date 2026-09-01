@@ -356,6 +356,7 @@ class Session:
     status: SessionStatus
     approval_mode: ApprovalMode
     model_route: str
+    context_generation: int
     created_at: datetime
     updated_at: datetime
 ```
@@ -372,6 +373,7 @@ class Run:
     status: RunStatus
     priority: int
     attempt: int
+    execution_epoch: int
     assigned_worker_id: str | None
     lease_expires_at: datetime | None
     last_checkpoint_id: UUID | None
@@ -407,6 +409,7 @@ Every state transition must be validated centrally. Do not allow arbitrary statu
 class ToolCall:
     id: str
     run_id: UUID
+    execution_epoch: int
     turn_number: int
     tool_name: str
     arguments: dict
@@ -418,9 +421,11 @@ class ToolCall:
     completed_at: datetime | None
 ```
 
-`id` must be stable across task retries.
+`id` must be stable across task retries within one execution epoch.
 
-A database uniqueness constraint must prevent two successful executions for the same logical tool-call ID.
+A database uniqueness constraint must prevent two successful executions for the same logical
+tool-call ID and execution epoch. Rewind increments the epoch so a legitimate replacement call
+cannot collide with an abandoned future.
 
 ### 7.5 Checkpoint
 
@@ -429,6 +434,7 @@ class Checkpoint:
     id: UUID
     run_id: UUID
     session_id: UUID
+    execution_epoch: int
     message_sequence: int
     workspace_snapshot_uri: str
     workspace_revision: str
@@ -725,6 +731,12 @@ Implement a local coding agent before adding distribution.
     * tool failure
     * maximum-turn termination
 
+   The `agent-cli` application now closes tasks 5 and 6. It validates and safely renders the
+   existing fourteen-event JSON Lines protocol, while `InMemoryAgentSession` retains a bounded
+   provider-neutral transcript across serialized local runs. Local repository changes occur only
+   in a detached worktree; edits are explicit and commands use the hardened rootless Podman
+   sandbox behind a separate capability flag. The local session is deliberately non-durable.
+
 The Agents SDK can manage agent turns, tools, sessions, and human-in-the-loop interruptions, but platform-specific state, sandboxing, durable execution, and distributed recovery remain responsibilities of this project.
 
 ### Acceptance criteria
@@ -769,6 +781,9 @@ Make repository mutation safe, reviewable, and reversible.
    * restore repository snapshot
    * truncate conversation state
    * restore task-plan state
+   * atomically increment the durable execution epoch
+   * seed only the selected message/plan prefix into the new epoch
+   * preserve abandoned rows for audit while excluding them from active reads
 10. Add tests for:
 
     * conflicting edits
@@ -787,7 +802,10 @@ cancellation-safe rollback; and removal of later checkpoints when rewinding onto
 earlier branch. The linked worktree may add objects and its own administration data to
 the repository's common Git directory, but neither sequence changes a source branch,
 source index, source checkout file, or source status. Durable retention and
-cross-worker checkpoint ownership remain later persistence responsibilities.
+cross-worker checkpoint ownership remain later persistence responsibilities. Production
+composition additionally forks a PostgreSQL execution epoch on rewind, scopes fenced writes and
+idempotency to that epoch, invalidates stale context work, and gives replacement final patches a
+branch-specific object key.
 
 ### Acceptance criteria
 
@@ -1243,12 +1261,20 @@ Implement advanced agent behavior through a composable context pipeline.
 * Memory can be disabled per tenant or session.
 * Tests verify that critical active-task information survives compression.
 
-Implementation status through Sequence 32: the worker uses a contributor-based,
+Implementation status through the production-composition closure: the worker uses a contributor-based,
 route-budgeted context pipeline and gateway-backed compression. Explicit compaction
 requests are durable and idempotent, summaries refer to a source-message watermark,
 only one request may remain pending per session, and original messages remain
-append-only. Only unresolved task items are critical during compaction. Versioned task
-plans use compare-and-set updates. Durable run completion atomically enqueues bounded
+append-only. Production workers atomically schedule a deterministic pending compaction
+at 3,072 post-watermark messages, before the bounded 4,096-message history load would
+fail closed. Recent durable tool outcomes are recursively redacted and independently
+byte-bounded before context assembly. Only unresolved task items are critical during compaction.
+Production workers load project instruction files, submission-bound explicit file references, and a
+non-mutating current Git diff through the active lease-bound mTLS node capability. Every source is
+strict UTF-8, protected-path filtered where applicable, recursively redacted, independently bounded,
+and then subjected to the normal route budget. Explicit references participate in run idempotency;
+legacy runs without reference metadata remain valid.
+Versioned task plans use compare-and-set updates. Durable run completion atomically enqueues bounded
 memory extraction jobs; source messages stream in bounded batches and extraction has a
 deadline shorter than its lease. Reads are fenced at the caller's current time and only
 select messages belonging to the source run. Extracted memories carry tenant-scoped source
@@ -1307,7 +1333,7 @@ from Prometheus. The live CLI loads a trusted driver factory and delays target
 restoration until after observation for faults whose continued presence is the test.
 
 Sequences 29 and 30 add a Kustomize base for API, event gateway, scheduler, workers,
-and LiteLLM with separate token-free identities, zero Kubernetes API privileges,
+LiteLLM, and the sandbox-node DaemonSet with separate token-free identities, zero Kubernetes API privileges,
 non-root/read-only/seccomp defaults, resource/probe/disruption/topology policies,
 default-deny networking, explicit anti-affinity, exact Secret-key references, dedicated worker-node
 scheduling, HPA policies, and external
@@ -1317,9 +1343,9 @@ API. Worker and scheduler operations endpoints expose bounded health,
 metrics, and local drain behavior. An offline deployment state machine proves task
 conservation, queue-driven scale decisions, graceful drain, and forced-lease recovery;
 it is labelled simulation-only. A real cluster, external metrics adapter, managed
-service CIDRs, immutable image overlay, externally managed Secrets, and a safe
-cluster-specific Podman sandbox composition and object-backed cross-pod workspace checkpoints remain
-required for live acceptance. A concrete bounded Kubernetes driver can perform the rolling campaign
+service CIDRs, immutable image overlay, and externally managed Secrets remain required for live
+acceptance. Sequences 33–43 supply reviewed production composition, immutable workspace artifacts,
+object-backed cross-pod checkpoints, and the mTLS rootless-Podman node boundary. A concrete bounded Kubernetes driver can perform the rolling campaign
 when supplied an authenticated task probe; local tests inject fakes and do not contact a cluster.
 
 Sequence 31 adds 30 versioned deterministic coding tasks covering the ten specified
@@ -1670,7 +1696,8 @@ The sandbox enforces the maximum possible impact even after permission is grante
 2. Sandboxes receive no host cloud credentials.
 3. Sandboxes use temporary workspaces.
 4. Network is disabled by default.
-5. Host Podman service socket is never mounted.
+5. The Podman service socket is mounted only by the trusted sandbox node agent; it is never mounted
+   by API, event, scheduler, worker, gateway, or untrusted sandbox containers.
 6. Containers do not run privileged.
 7. Root filesystem is read-only.
 8. Workspace paths are canonicalized.
@@ -1682,6 +1709,14 @@ The sandbox enforces the maximum possible impact even after permission is grante
 14. Dependency and image scanning runs in CI.
 15. Approval decisions are stored durably.
 16. Tool arguments and decisions are included in the audit trail, subject to source-code privacy settings.
+
+Implementation note: the release path is rootless-Podman-only. A closed four-image inventory uses
+digest-injected bases and deny-first build contexts. The protected release workflow SHA-256 verifies
+Git, Podman, Syft, Grype, and Cosign, produces SPDX SBOMs, rejects unsuppressed High/Critical image
+findings with a fresh hash-validated vulnerability database, publishes only immutable digests,
+attaches signed SPDX and SLSA predicates, signs the evidence manifest, and repeats verification
+before promotion. Site admission must require the release workflow identity and attestations in
+addition to the portable digest/security policy.
 
 ---
 
@@ -1747,6 +1782,17 @@ PR 29  Kubernetes manifests
 PR 30  HPA, graceful draining, and deployment tests
 PR 31  Coding-task evaluation harness
 PR 32  Final benchmark report and architecture documentation
+PR 33  Immutable workspace and artifact storage
+PR 34  Atomic task submission and artifact APIs
+PR 35  Durable transcript, retry, approval, and audit state
+PR 36  Object-backed checkpoints, rewind, and final patches
+PR 37  OIDC authorization and production quotas
+PR 38  Exact gateway cost attribution and Redis wake-up hints
+PR 39  mTLS rootless-Podman sandbox node agent
+PR 40  Reviewed API, worker, and scheduler production composition
+PR 41  Durable context, memory, and task-plan composition
+PR 42  Kubernetes node topology and production static contracts
+PR 43  Production-readiness audit and release-gate closure
 ```
 
 Each PR must include:

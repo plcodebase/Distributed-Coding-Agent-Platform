@@ -48,8 +48,11 @@ untrusted exception text.
   retries remain gateway-owned and do not create extra semantic turns.
 - Inject the recursive secret redactor at the loop boundary. Initial context, tool
   stdout/stderr, structured results, and external structured errors are redacted before
-  gateway, event, or transcript use. Model calls containing sensitive arguments are
-  rejected without placing their raw arguments in events.
+  gateway, event, or transcript use. Model-text deltas pass through a stateful redactor
+  that retains only a bounded conservative suffix across fragments, then emits event-sized
+  sanitized chunks. Both raw input and expanded redacted output remain subject to the model
+  byte ceiling. Model calls containing sensitive arguments are rejected without placing
+  their raw arguments in events.
 - Represent provider argument parse failures as rejected normalized tool calls. The
   existing `model.tool_call_received` event records safe metadata and an error instead
   of arguments. A mixed valid/invalid turn is rejected atomically and consumes one
@@ -75,6 +78,8 @@ untrusted exception text.
   without disclosing their raw values.
 - Unexpected gateway and tool exception messages are not copied into events or model
   feedback. Known and patterned secrets in structured tool data are redacted as well.
+- Secrets split at any provider-fragment boundary are redacted before events, transcript,
+  or final output observe them; the redactor does not require buffering an entire turn.
 - The current loop is single-process and does not persist messages, model calls, tool
   results, or events. Persistence, approvals, checkpoints, replay, stable duplicate
   suppression across attempts, and cross-worker recovery remain later-sequence

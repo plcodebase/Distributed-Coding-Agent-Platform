@@ -50,3 +50,46 @@ non-production token. Do not put a real identity-provider credential in source c
 Use `make migration-check` after changing persistence models. Run
 `make postgres-security` for the opt-in real-PostgreSQL migration, idempotency,
 shared-policy, concurrent-sequence, and replay suite.
+
+## Local CLI
+
+Render persisted or streamed JSON-Line events without trusting their terminal contents:
+
+```console
+agent-platform render < events.jsonl
+```
+
+Run a bounded, non-durable local session against the configured LiteLLM endpoint. Repository reads
+are enabled by default and occur in a private detached worktree:
+
+```console
+agent-platform local --workspace ./sample-repository --task "Inspect the failing test"
+```
+
+Enable edits explicitly and save the final patch to a new path:
+
+```console
+agent-platform local \
+  --workspace ./sample-repository \
+  --task "Fix the failing test" \
+  --allow-edit \
+  --patch-output ./agent-result.patch
+```
+
+Commands require an additional capability and always use the rootless Podman sandbox. Build the
+sandbox image with `make podman-images` first:
+
+```console
+agent-platform local \
+  --workspace ./sample-repository \
+  --task "Fix and test the project" \
+  --allow-edit \
+  --allow-commands \
+  --sandbox-image localhost/agent-platform-sandbox:sequence-10 \
+  --patch-output ./agent-result.patch
+```
+
+The CLI never mutates the source checkout and never exposes a Docker-compatible execution path.
+Provider credentials are read from the existing `AGENT_PLATFORM_*` environment configuration;
+do not pass secrets as command-line arguments. Repeat `--task` to retain bounded conversation
+context across multiple runs in the same process.

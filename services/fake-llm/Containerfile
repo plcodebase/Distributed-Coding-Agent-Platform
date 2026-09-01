@@ -3,6 +3,7 @@ FROM python:3.12.11-alpine3.21
 RUN addgroup -S fake && adduser -S -G fake -u 10001 fake
 WORKDIR /app
 COPY --chown=fake:fake app.py /app/app.py
+COPY --chown=fake:fake coding_scenario.py /app/coding_scenario.py
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["python", "/app/app.py"]

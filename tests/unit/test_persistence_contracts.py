@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 EXPECTED_TABLES = {
     "agent_events",
     "approvals",
+    "artifacts",
+    "audit_log",
     "checkpoints",
     "context_compactions",
     "gateway_requests",
@@ -44,10 +46,13 @@ EXPECTED_TABLES = {
     "runs",
     "run_leases",
     "sessions",
+    "snapshot_validation_jobs",
+    "source_snapshots",
     "task_plans",
     "tenant_quotas",
     "tool_calls",
     "workers",
+    "workspaces",
     "workspace_writer_leases",
 }
 TENANT_OWNED_TABLES = EXPECTED_TABLES - {
@@ -81,6 +86,19 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
     }
     assert ("run_id", "sequence") in event_constraints
 
+    checkpoint_constraints = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in Base.metadata.tables["checkpoints"].constraints
+        if hasattr(constraint, "columns")
+    }
+    assert (
+        "tenant_id",
+        "run_id",
+        "execution_epoch",
+        "tool_call_id",
+    ) in checkpoint_constraints
+    assert ("tenant_id", "run_id", "message_sequence") not in checkpoint_constraints
+
     run_constraints = {
         tuple(column.name for column in constraint.columns)
         for constraint in Base.metadata.tables["runs"].constraints
@@ -90,7 +108,10 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
     assert ("tenant_id", "id", "session_id") in run_constraints
     assert ("tenant_id", "id", "workspace_id") in run_constraints
 
-    expected_foreign_keys = {
+    expected_foreign_keys: dict[
+        str,
+        set[tuple[tuple[str, ...], tuple[str, ...]]],
+    ] = {
         "runs": {
             (
                 ("tenant_id", "session_id", "workspace_id"),
@@ -115,8 +136,8 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
         },
         "approvals": {
             (
-                ("tenant_id", "run_id", "tool_call_id"),
-                ("tenant_id", "run_id", "tool_call_id"),
+                ("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
+                ("tenant_id", "run_id", "execution_epoch", "tool_call_id"),
             )
         },
         "workspace_writer_leases": {
@@ -124,6 +145,26 @@ def test_tenant_owned_tables_have_tenant_ids_and_required_uniqueness() -> None:
                 ("tenant_id", "run_id", "workspace_id"),
                 ("tenant_id", "id", "workspace_id"),
             )
+        },
+        "source_snapshots": {
+            (
+                ("tenant_id", "workspace_id"),
+                ("tenant_id", "id"),
+            ),
+            (
+                ("tenant_id", "workspace_id", "artifact_id"),
+                ("tenant_id", "workspace_id", "id"),
+            ),
+        },
+        "artifacts": {
+            (
+                ("tenant_id", "workspace_id"),
+                ("tenant_id", "id"),
+            ),
+            (
+                ("tenant_id", "run_id", "workspace_id"),
+                ("tenant_id", "id", "workspace_id"),
+            ),
         },
     }
     for table_name, expected in expected_foreign_keys.items():
@@ -186,7 +227,11 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
         for table in Base.metadata.sorted_tables
     }
     assert set(migrated) <= set(declared)
-    replaced_at_head = {("runs", "ck_runs_suspended_without_lease")}
+    replaced_at_head = {
+        ("artifacts", "ck_artifacts_object_key"),
+        ("runs", "ck_runs_suspended_without_lease"),
+        ("source_snapshots", "ck_source_snapshots_object_key"),
+    }
     for table_name, checks in migrated.items():
         for constraint_name, sql in checks.items():
             if (table_name, constraint_name) in replaced_at_head:
@@ -243,6 +288,15 @@ def test_initial_migration_constraints_remain_compatible_with_head_metadata() ->
             "traceparent",
             "tracestate",
             "ck_runs_traceparent",
+        ),
+        "0008_workspace_artifacts.py": (
+            'revision: str = "0008"',
+            'down_revision: str | None = "0007"',
+            "workspaces",
+            "source_snapshots",
+            "artifacts",
+            "snapshot_validation_jobs",
+            "fk_workspaces_current_snapshot",
         ),
     }
     migration_root = ROOT / "packages" / "persistence" / "migrations" / "versions"

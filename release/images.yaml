@@ -1,0 +1,27 @@
+version: agent-release-images-v1
+images:
+  - name: platform
+    repository: agent-platform
+    kind: build
+    context: .
+    containerfile: services/platform/Containerfile
+    build_args:
+      PYTHON_BASE_IMAGE: python-slim
+  - name: node
+    repository: agent-platform-node
+    kind: build
+    context: .
+    containerfile: services/node/Containerfile
+    build_args:
+      PYTHON_BASE_IMAGE: python-slim
+  - name: sandbox
+    repository: agent-platform-sandbox
+    kind: build
+    context: services/sandbox
+    containerfile: services/sandbox/Containerfile
+    build_args:
+      PYTHON_BASE_IMAGE: python-alpine
+  - name: litellm
+    repository: agent-platform-litellm
+    kind: mirror
+    source_requirement: litellm

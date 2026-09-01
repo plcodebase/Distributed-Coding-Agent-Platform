@@ -37,6 +37,7 @@ from agent_core.control import (
     PersistedMemory,
     PersistedTaskState,
     RunCreationResult,
+    RunSubmission,
     TaskPlanUpdate,
     memory_content_hash,
 )
@@ -51,7 +52,7 @@ from platform_telemetry import PlatformTelemetry, TelemetrySettings
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from starlette.types import ASGIApp, Message, Scope
+    from starlette.types import ASGIApp, Message, Receive, Scope
 
 
 TENANT_A = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -84,6 +85,7 @@ class RunRepositoryFake:
         self.values: dict[tuple[uuid.UUID, uuid.UUID], Run] = {}
         self.idempotency: dict[tuple[uuid.UUID, uuid.UUID, str], tuple[str, Run]] = {}
         self.cancel_calls = 0
+        self.submissions: list[RunSubmission] = []
 
     async def create_idempotent(
         self,
@@ -106,6 +108,22 @@ class RunRepositoryFake:
         self.values[(tenant_id, run.id)] = run
         self.idempotency[key] = (creation_hash, run)
         return RunCreationResult(run=run, created=True)
+
+    async def create_submission(
+        self,
+        tenant_id: uuid.UUID,
+        submission: RunSubmission,
+        *,
+        idempotency_key: str,
+        creation_hash: str,
+    ) -> RunCreationResult:
+        self.submissions.append(submission)
+        return await self.create_idempotent(
+            tenant_id,
+            submission.run,
+            idempotency_key=idempotency_key,
+            creation_hash=creation_hash,
+        )
 
     async def get(self, tenant_id: uuid.UUID, run_id: uuid.UUID) -> Run | None:
         return self.values.get((tenant_id, run_id))
@@ -166,6 +184,21 @@ class OverloadedRunRepository(RunRepositoryFake):
             message="the global run queue has reached its admission threshold",
             retryable=True,
             details={"retry_after_seconds": 2.25, "scope": "global_queue"},
+        )
+
+    async def create_submission(
+        self,
+        tenant_id: uuid.UUID,
+        submission: RunSubmission,
+        *,
+        idempotency_key: str,
+        creation_hash: str,
+    ) -> RunCreationResult:
+        return await self.create_idempotent(
+            tenant_id,
+            submission.run,
+            idempotency_key=idempotency_key,
+            creation_hash=creation_hash,
         )
 
 
@@ -702,7 +735,7 @@ def test_static_credential_json_is_secret_safe_and_rejects_duplicate_keys() -> N
 
 
 def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
-    api_services, sessions, _, _ = services()
+    api_services, sessions, runs, _ = services()
     client = TestClient(create_app(api_services))
     created_session = client.post(
         "/v1/sessions",
@@ -720,17 +753,32 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     first = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers=headers,
-        json={"priority": 7, "priority_class": "background"},
+        json={
+            "task": "Implement the requested change.",
+            "priority": 7,
+            "priority_class": "background",
+            "referenced_files": [{"path": "README.md"}],
+        },
     )
     second = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers=headers,
-        json={"priority": 7, "priority_class": "background"},
+        json={
+            "task": "Implement the requested change.",
+            "priority": 7,
+            "priority_class": "background",
+            "referenced_files": [{"path": "README.md"}],
+        },
     )
     conflict = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers=headers,
-        json={"priority": 8},
+        json={
+            "task": "Implement the requested change.",
+            "priority": 7,
+            "priority_class": "background",
+            "referenced_files": [{"path": "docs/design.md"}],
+        },
     )
 
     assert first.status_code == 200
@@ -740,6 +788,7 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     assert second.json()["run"]["id"] == first.json()["run"]["id"]
     assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "run_idempotency_conflict"
+    assert runs.submissions[0].referenced_files[0].path == "README.md"
 
     stored_session = sessions.values[(TENANT_A, uuid.UUID(session_id))]
     sessions.values[(TENANT_A, stored_session.id)] = stored_session.model_copy(
@@ -748,7 +797,7 @@ def test_session_and_run_creation_are_tenant_scoped_and_idempotent() -> None:
     inactive = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers={**authorization(), "Idempotency-Key": "inactive-session"},
-        json={},
+        json={"task": "This must not be accepted for an inactive session."},
     )
     assert inactive.status_code == 409
     assert inactive.json()["error"]["code"] == "session_state_conflict"
@@ -801,7 +850,7 @@ def test_compact_task_status_and_memory_operations_are_durable_and_tenant_scoped
     run = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers={**authorization(), "Idempotency-Key": "task-run"},
-        json={},
+        json={"task": "Track and complete the requested task."},
     ).json()["run"]
     run_id = uuid.UUID(run["id"])
     plan = client.put(
@@ -889,7 +938,7 @@ def test_run_overload_response_is_structured_and_retryable() -> None:
     response = client.post(
         f"/v1/sessions/{session['id']}/runs",
         headers={**authorization(), "Idempotency-Key": "overload-1"},
-        json={},
+        json={"task": "Exercise overload admission."},
     )
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "3"
@@ -972,6 +1021,37 @@ async def test_request_body_limit_bounds_chunked_and_rejects_duplicate_lengths()
     assert called is False
 
 
+@pytest.mark.asyncio
+async def test_request_body_limit_preserves_real_disconnect_channel() -> None:
+    incoming: deque[Message] = deque(
+        (
+            {"type": "http.request", "body": b"{}", "more_body": False},
+            {"type": "http.disconnect"},
+        )
+    )
+    observed: list[Message] = []
+
+    async def receive() -> Message:
+        return incoming.popleft()
+
+    async def send(_message: Message) -> None:
+        return None
+
+    async def downstream(_scope: Scope, replay: object, _send: object) -> None:
+        typed_replay = cast("Receive", replay)
+        observed.append(await typed_replay())
+        observed.append(await typed_replay())
+
+    middleware = RequestBodyLimitMiddleware(cast("ASGIApp", downstream))
+    await middleware(
+        cast("Scope", {"type": "http", "headers": [(b"content-length", b"2")]}),
+        receive,
+        send,
+    )
+
+    assert [message["type"] for message in observed] == ["http.request", "http.disconnect"]
+
+
 def test_cancel_rewind_approval_and_event_replay_do_not_cross_tenants() -> None:
     api_services, _, runs, events = services()
     approvals = api_services.approvals
@@ -985,7 +1065,7 @@ def test_cancel_rewind_approval_and_event_replay_do_not_cross_tenants() -> None:
     run = client.post(
         f"/v1/sessions/{session['id']}/runs",
         headers={**authorization(), "Idempotency-Key": "run-controls"},
-        json={},
+        json={"task": "Exercise run controls."},
     ).json()["run"]
     run_id = uuid.UUID(run["id"])
     approval_id = uuid.uuid4()
@@ -1156,7 +1236,7 @@ def test_metrics_endpoint_is_bounded_and_optionally_authenticated() -> None:
     invalid = client.post(
         "/v1/sessions",
         headers=authorization(),
-        json={},
+        json={"task": "Preserve the incoming trace context."},
     )
     assert invalid.status_code == 422
     response = client.get("/metrics", headers=authorization(token))
@@ -1227,7 +1307,7 @@ def test_run_creation_persists_current_w3c_context_for_worker_handoff() -> None:
             "Idempotency-Key": "trace-handoff",
             "traceparent": "00-33333333333333333333333333333333-4444444444444444-01",
         },
-        json={},
+        json={"task": "Preserve the incoming trace context."},
     )
 
     assert response.status_code == 200
@@ -1242,7 +1322,7 @@ def test_run_creation_persists_current_w3c_context_for_worker_handoff() -> None:
     replay = client.post(
         f"/v1/sessions/{session_id}/runs",
         headers={**authorization(), "Idempotency-Key": "trace-handoff"},
-        json={},
+        json={"task": "Preserve the incoming trace context."},
     )
     assert replay.status_code == 200
     metrics = telemetry.metrics.render().decode("utf-8")

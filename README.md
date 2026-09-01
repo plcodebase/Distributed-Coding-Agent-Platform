@@ -4,6 +4,13 @@ This repository implements the system specified in [`DESIGN.md`](DESIGN.md). Wor
 delivered phase by phase so each layer has a runnable verification gate before later
 distributed-system and sandbox features are added.
 
+Implementation sequence does not by itself imply production readiness. The current
+[production-readiness matrix](docs/architecture/production-readiness.md) distinguishes typed
+contracts, component-tested behavior, production integration, and live deployment evidence. The
+core coding path and reviewed production composition are implemented and component-tested. A
+target-cluster distributed E2E, target-cluster security evidence, production overlay, and
+operational rehearsals remain release blockers.
+
 ## Implemented sequences
 
 ### Sequence 1: repository bootstrap and CI
@@ -57,6 +64,23 @@ Sequence 4 provides:
   SDK tracing, cancellation cleanup, and explicit client lifecycle ownership;
 - deterministic SDK unit tests plus a real fragmented-SSE integration test using an
   in-process server and no external credentials.
+
+### Local CLI and in-memory developer session
+
+The Phase 1 developer interface provides:
+
+- an `agent-platform render` command that validates bounded strict-UTF-8 JSON Lines against the
+  fourteen-event union, rejects duplicate keys, escapes terminal controls, and avoids rendering
+  tool arguments or result bodies;
+- an `agent-platform local` command backed by a bounded in-memory transcript and the same
+  `AgentLoop`, gateway, validation, redaction, and limit policies as the platform;
+- a private detached worktree so local execution never modifies the source checkout directly;
+- read-only tools by default, explicit `--allow-edit`, and rootless-Podman command execution only
+  when both `--allow-edit` and `--allow-commands` are supplied;
+- exclusive caller-selected patch output with a reported SHA-256 identity.
+
+This mode is for local development and is not durable. Use the HTTP API and distributed workers
+for approval suspension, recovery, audit, and process-independent sessions.
 
 ### Sequence 5: contained read and search tools
 
@@ -120,10 +144,13 @@ Sequence 7 provides:
   finalized side effects;
 - rewind of active commands, workspace revision, transcript, task plan, and context
   summary, with later abandoned checkpoints invalidated;
+- durable rewind forks a monotonic execution epoch, scopes tool/model/event idempotency and final
+  artifacts to that branch, preserves abandoned rows for audit, and rejects stale-epoch workers;
 - same-run duplicate reuse without a second checkpoint or repeated mutation.
 
-The current checkpoint coordinator is intentionally in-memory. Durable checkpoint,
-message, event, and replay storage remains a persistence-sequence responsibility.
+The Sequence 7 coordinator is intentionally in-memory for isolated tests. Production composition
+now substitutes the durable PostgreSQL/object-store coordinator and transcript journal described in
+the production-closure section below.
 
 ### Sequence 8: sandbox contract and local development adapter
 
@@ -379,7 +406,11 @@ explicit preservation of recent conversation/tool pairs, active files, unresolve
 items, and errors. Completed/cancelled task history is compressible. The compaction API
 creates at most one pending request per session at a message watermark and records the
 actual `summarization` route; workers record summary usage without updating or deleting
-the source transcript.
+the source transcript. Production workers also schedule an idempotent compaction at
+3,072 post-watermark messages, leaving headroom below the fail-closed 4,096-message
+history ceiling. Explicit compaction remains available through the control API. Recovered
+terminal tool outcomes enter the recent-results contributor only after recursive secret
+redaction and a per-result 64 KiB UTF-8 ceiling.
 
 ### Sequence 24: long-term memory and task tracking
 
@@ -460,15 +491,14 @@ so the intended fault remains active during observation where required.
 ### Sequence 29: Kubernetes deployment manifests
 
 Sequence 29 adds a Kustomize base for independently scaled API, event gateway,
-scheduler, worker, and LiteLLM workloads. Every workload has a separate token-free
+scheduler, worker, and LiteLLM workloads plus a sandbox-node DaemonSet. Every workload has a separate token-free
 ServiceAccount, zero Kubernetes API privileges, non-root/read-only/seccomp security
 contexts, resource bounds, probes, disruption budgets, topology spread, and anti-affinity. Workers
 target dedicated sandbox nodes. NetworkPolicy defaults to deny; only LiteLLM receives
 provider credentials and public provider egress. Secrets use exact key references, metrics producers
 declare scrape endpoints, and the event gateway has an event-only route/dependency graph. Managed
-data services, durable workspace snapshots, Secrets,
-ingress/TLS, image digests, and cluster-specific sandbox composition remain
-operator-supplied overlays. A fail-closed static validator checks these contracts
+data services, Secrets, ingress/TLS, and image digests remain operator-supplied overlays. A
+fail-closed static validator checks these contracts
 without requiring a cluster.
 
 ### Sequence 30: autoscaling, draining, and deployment verification
@@ -513,6 +543,42 @@ to byte-identical final reports.
 Consolidated architecture, deployment, reliability, and evaluation guides record the
 production boundaries and remaining external acceptance work.
 
+### Sequences 33–43: production composition closure
+
+The production closure adds immutable source/snapshot/checkpoint/final-patch object storage;
+atomic task submission; durable approval decisions, retry schedules, full normalized transcripts,
+checkpoint messages, audit records, and rewind; exact model-cost and context-budget configuration;
+lease-bound project instructions, explicit referenced-file context, and a non-mutating filtered
+current Git diff;
+Redis wake-up hints with PostgreSQL polling fallback; and reviewed API, worker, scheduler, and node
+composition roots. The sandbox boundary is a private mTLS node agent that alone owns the rootless
+Podman socket. Kubernetes manifests now inject collision-free pod identities, use the same
+host/container workspace path, and name the reviewed production factories directly.
+
+These sequences move the repository from component contracts to integrated production code; they do
+not manufacture live deployment evidence. See the
+[production-readiness review](docs/architecture/production-readiness.md) for the remaining P0–P2
+gates.
+
+### Production release supply chain
+
+The production image inventory contains platform, node, sandbox, and a mirrored exact LiteLLM
+input. Release builds inject digest-pinned bases, internally enforce exact deny-first Podman build
+contexts, and require a clean checkout plus SHA-256-verified Git, Podman, Syft, Grype, and Cosign
+executables. Every image is
+SBOMed as SPDX JSON and scanned with a fixed, non-suppressing Grype policy before publication. The
+workflow signs immutable registry digests, attaches and decodes SPDX and SLSA attestations, signs the
+bounded evidence manifest, and reverifies it before upload. Static validation runs in every release
+check:
+
+```shell
+make release-contract
+```
+
+The protected-runner variables, release execution, independent promotion verification, failure
+handling, and remaining site-admission requirement are documented in
+[`docs/operations/release-supply-chain.md`](docs/operations/release-supply-chain.md).
+
 ## Local setup
 
 ```shell
@@ -533,25 +599,23 @@ deterministic fake providers. `make migrate` creates the durable control-plane s
 `make api` serves the authenticated API on `127.0.0.1:8000`. The fake LiteLLM routes are
 the default local configuration and do not need provider credentials.
 
-Worker and scheduler processes use trusted application composition factories:
+Worker and scheduler processes use the reviewed production composition factories:
 
 ```shell
-uv run python -m agent_worker --factory your_app.workers:create_worker
-uv run python -m agent_scheduler --factory your_app.scheduler:create_scheduler
+uv run python -m agent_worker --factory agent_worker.production:create_production_worker
+uv run python -m agent_scheduler --factory agent_scheduler.production:create_production_scheduler
 ```
 
-The worker command starts three OS processes by default. A production factory must
-inject the PostgreSQL queue/stores, gateway client, durable checkpoint coordinator,
-workspace snapshot restorer, and sandbox; each worker index must map to a unique worker
-ID. The same application-owned `PlatformTelemetry` instance should be injected into
-the worker, executor, agent loop, gateway client, queue monitor, and sandbox so child
-spans and metrics share one lifecycle. These are deployment composition references,
-not model- or user-controlled values.
+The worker command starts three OS processes by default for local operation. Production settings
+compose PostgreSQL stores, Redis hints, gateway policy, durable context/checkpoints, and the mTLS
+node sandbox. Kubernetes uses one worker process per pod and derives unique worker/scheduler
+identities from the pod UID. Factory references are trusted deployment configuration, never model-
+or user-controlled values.
 
 Kubernetes deployment starts at
 [`deployments/kubernetes/README.md`](deployments/kubernetes/README.md). The base must
-be completed by a production overlay and a trusted worker/scheduler composition; it is
-not safe to give worker pods a broad host Podman socket. Static manifests and simulated
+be completed by a production overlay. Only the trusted node-agent DaemonSet mounts the rootless
+Podman socket; worker pods and sandboxes never receive it. Static manifests and simulated
 benchmark reports are not evidence of live horizontal scaling or coding performance.
 
 Do not put real credentials in `.env.example`, source control, worker environments, or
@@ -564,8 +628,11 @@ make podman-images
 make sandbox-security
 make gateway-security ENV_FILE=.env
 make postgres-security
+make e2e-happy ENV_FILE=.env
 ```
 
 `gateway-security` expects the local gateway services to be available and uses only the
 gateway key from the selected environment file. The test itself recreates and later
-stops its three targeted LiteLLM/fake-provider services.
+stops its three targeted LiteLLM/fake-provider services. The deterministic coding-agent
+path and its remaining product-level gaps are documented in
+[`docs/operations/coding-agent-e2e.md`](docs/operations/coding-agent-e2e.md).

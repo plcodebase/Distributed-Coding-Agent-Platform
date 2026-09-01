@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -13,15 +14,28 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from agent_api import ApiServices, Principal, StaticTokenAuthenticator, create_app
 from agent_api.factory import AgentApiSettings, create_production_app
+from agent_core.artifacts import (
+    Artifact,
+    ArtifactKind,
+    ObjectStat,
+    PresignedDownload,
+    PresignedUpload,
+    SourceSnapshotStatus,
+    StoredObject,
+    final_patch_object_key,
+)
 from agent_core.control import (
+    ApprovalDecision,
     ApprovalStatus,
     MemoryExtractionStatus,
     MemoryKind,
@@ -86,6 +100,7 @@ from gateway_client import GatewayRequestClaimStatus
 from platform_persistence import (
     Database,
     DatabaseSettings,
+    PostgresApprovalRepository,
     PostgresContextRepository,
     PostgresExecutionRepository,
     PostgresGatewayCircuitBreaker,
@@ -98,6 +113,7 @@ from platform_persistence import (
     PostgresSessionRepository,
     PostgresTaskRepository,
     PostgresWorkspaceLeaseStore,
+    PostgresWorkspaceRepository,
     run_creation_hash,
 )
 from platform_persistence.models import (
@@ -109,6 +125,7 @@ from platform_persistence.models import (
     MessageRecord,
     ModelCallRecord,
     RunRecord,
+    SessionRecord,
     TaskPlanRecord,
     ToolCallRecord,
     WorkerRecord,
@@ -197,6 +214,106 @@ class CountingMutationHandler:
                 "workspace_revision": "duplicate-revision",
             }
         )
+
+
+class _Ready:
+    async def ready(self) -> bool:
+        return True
+
+
+class _JourneyObjectStore:
+    def __init__(self) -> None:
+        self.stats: dict[str, ObjectStat] = {}
+        self.objects: dict[str, tuple[StoredObject, bytes]] = {}
+
+    async def ready(self) -> bool:
+        return True
+
+    async def create_upload(
+        self,
+        *,
+        object_key: str,
+        content_type: str,
+        max_bytes: int,
+        expires_at: datetime,
+    ) -> PresignedUpload:
+        return PresignedUpload(
+            object_key=object_key,
+            url=f"memory://upload/{object_key}",
+            content_type=content_type,
+            headers={"x-amz-meta-max-bytes": str(max_bytes)},
+            expires_at=expires_at,
+        )
+
+    async def create_download(
+        self,
+        *,
+        object_key: str,
+        expires_at: datetime,
+    ) -> PresignedDownload:
+        if object_key not in self.objects:
+            raise DomainOperationError(
+                code="artifact_not_found",
+                message="the immutable object does not exist",
+            )
+        return PresignedDownload(
+            url=f"memory://download/{object_key}",
+            expires_at=expires_at,
+        )
+
+    async def head(self, object_key: str) -> ObjectStat | None:
+        return self.stats.get(object_key)
+
+    async def download_to_path(
+        self,
+        object_key: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+        expected_sha256: str,
+    ) -> StoredObject:
+        stored, content = self.objects[object_key]
+        assert len(content) <= max_bytes
+        assert stored.sha256 == expected_sha256
+        await asyncio.to_thread(destination.write_bytes, content)
+        return stored
+
+    async def upload_from_path(
+        self,
+        object_key: str,
+        source: Path,
+        *,
+        content_type: str,
+        max_bytes: int,
+    ) -> StoredObject:
+        content = await asyncio.to_thread(source.read_bytes)
+        assert len(content) <= max_bytes
+        stored = self.record(object_key, content, content_type=content_type)
+        return stored
+
+    async def delete(self, object_key: str) -> None:
+        self.stats.pop(object_key, None)
+        self.objects.pop(object_key, None)
+
+    async def aclose(self) -> None:
+        return None
+
+    def record(self, object_key: str, content: bytes, *, content_type: str) -> StoredObject:
+        stored = StoredObject(
+            object_key=object_key,
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+            content_type=content_type,
+            etag=hashlib.md5(content, usedforsecurity=False).hexdigest(),
+        )
+        self.objects[object_key] = (stored, content)
+        self.stats[object_key] = ObjectStat(
+            object_key=object_key,
+            size_bytes=len(content),
+            content_type=content_type,
+            etag=stored.etag,
+        )
+        return stored
 
 
 async def wait_for_worker_idle(worker: WorkerService) -> None:
@@ -352,6 +469,234 @@ async def test_sessions_runs_and_gateway_requests_survive_recomposition(
         assert other_tenant.status is GatewayRequestClaimStatus.EXECUTE
     finally:
         await recomposed.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rewind_forks_durable_execution_without_replaying_abandoned_future(  # noqa: PLR0915 - complete real-PostgreSQL branch journey
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    context = PostgresContextRepository(database.sessions)
+    tasks = PostgresTaskRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    recovery = PostgresRecoveryStore(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now).model_copy(update={"memory_enabled": False})
+    run = _run(session, now).model_copy(update={"priority": 100})
+    checkpoint_id = uuid.uuid4()
+    worker_id = f"rewind-worker-{run.id.hex}"
+    messages = (
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=run.id,
+            sequence=1,
+            role=MessageRole.USER,
+            content="base request",
+            metadata={"source": "run_submission"},
+            created_at=now,
+        ),
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=run.id,
+            sequence=2,
+            role=MessageRole.ASSISTANT,
+            content="checkpoint response",
+            metadata={"transcript_index": 2},
+            created_at=now + timedelta(seconds=1),
+        ),
+        PersistedMessage(
+            id=uuid.uuid4(),
+            session_id=session.id,
+            run_id=run.id,
+            sequence=3,
+            role=MessageRole.TOOL,
+            content='{"abandoned":true}',
+            metadata={"tool_call_id": "repeat-call", "transcript_index": 3},
+            created_at=now + timedelta(seconds=3),
+        ),
+    )
+    checkpoint = Checkpoint(
+        id=checkpoint_id,
+        run_id=run.id,
+        session_id=session.id,
+        tool_call_id="repeat-call",
+        message_sequence=2,
+        messages=(
+            FrozenJsonObject({"role": "user", "content": "base request"}),
+            FrozenJsonObject({"role": "assistant", "content": "checkpoint response"}),
+        ),
+        workspace_snapshot_uri="s3://agent-platform/checkpoint-before-abandoned-future",
+        workspace_revision="revision-at-checkpoint",
+        task_plan=FrozenJsonObject({"steps": []}),
+        created_at=now + timedelta(seconds=2),
+    )
+    arguments = FrozenJsonObject({"path": "README.md"})
+    old_tool = ToolCall(
+        id="repeat-call",
+        run_id=run.id,
+        turn_number=1,
+        tool_name="read_file",
+        arguments=arguments,
+        argument_hash=canonical_argument_hash(arguments),
+        status=ToolCallStatus.COMPLETED,
+        result=FrozenJsonObject({"content": "abandoned"}),
+        started_at=now + timedelta(seconds=3),
+        completed_at=now + timedelta(seconds=4),
+    )
+    try:
+        await sessions.create(session)
+        await runs.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key=f"rewind-branch-{run.id}",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+        for message in messages:
+            await execution.append_message(TENANT_ID, message)
+        await execution.save_task_plan(
+            TENANT_ID,
+            PersistedTaskPlan(
+                id=uuid.uuid4(),
+                run_id=run.id,
+                version=1,
+                plan={"steps": []},
+                created_at=now,
+            ),
+        )
+        await execution.create_checkpoint(TENANT_ID, checkpoint)
+        await execution.save_tool_call(TENANT_ID, old_tool)
+        compaction = await context.request_compaction(
+            TENANT_ID,
+            session.id,
+            compaction_id=uuid.uuid4(),
+            idempotency_key=f"rewind-compaction-{run.id}",
+            route_name="coding-default",
+            requested_at=now + timedelta(seconds=4),
+        )
+        assert compaction is not None
+        cancelled = await runs.request_cancel(
+            TENANT_ID,
+            run.id,
+            occurred_at=now + timedelta(seconds=5),
+        )
+        assert cancelled is not None and cancelled.status is RunStatus.CANCELLED
+
+        rewound = await runs.rewind(TENANT_ID, run.id, checkpoint.id)
+        assert rewound is not None
+        assert rewound.execution_epoch == 2
+        assert rewound.status is RunStatus.QUEUED
+        assert rewound.last_checkpoint_id == checkpoint.id
+        current_session = await sessions.get(TENANT_ID, session.id)
+        assert current_session is not None and current_session.context_generation == 2
+        superseded = await context.get(TENANT_ID, session.id, compaction.id)
+        assert superseded is not None and superseded.status.value == "failed"
+
+        current_messages = await context.list_messages(TENANT_ID, session.id)
+        assert [message.content for message in current_messages] == [
+            "base request",
+            "checkpoint response",
+        ]
+        current_plan = await tasks.get(TENANT_ID, run.id)
+        assert current_plan is not None and current_plan.execution_epoch == 2
+
+        await queue.register_worker(
+            WorkerRegistration(
+                worker_id=worker_id,
+                supported_sandbox_types=("podman",),
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now + timedelta(seconds=6),
+                last_heartbeat_at=now + timedelta(seconds=6),
+            )
+        )
+        lease = await queue.claim(
+            worker_id,
+            occurred_at=now + timedelta(seconds=6),
+            lease_duration=timedelta(minutes=1),
+        )
+        assert lease is not None and lease.run_id == run.id and lease.execution_epoch == 2
+        lease = await queue.start(lease, occurred_at=now + timedelta(seconds=7))
+        recovered = await recovery.load(lease)
+        assert [message.content for message in recovered.messages] == [
+            "base request",
+            "checkpoint response",
+        ]
+        assert recovered.prior_tool_outcomes == ()
+
+        replayed_tool = old_tool.model_copy(
+            update={
+                "execution_epoch": 2,
+                "status": ToolCallStatus.RECEIVED,
+                "result": None,
+                "started_at": None,
+                "completed_at": None,
+            }
+        )
+        assert await execution.save_tool_call_fenced(lease, replayed_tool) == replayed_tool
+        with pytest.raises(DomainOperationError) as stale:
+            await execution.save_tool_call_fenced(
+                lease.model_copy(update={"execution_epoch": 1}),
+                old_tool,
+            )
+        assert stale.value.code == "run_lease_lost"
+
+        async with database.sessions() as sql:
+            branch_rows = tuple(
+                await sql.scalars(
+                    select(MessageRecord)
+                    .where(
+                        MessageRecord.tenant_id == TENANT_ID,
+                        MessageRecord.run_id == run.id,
+                    )
+                    .order_by(MessageRecord.execution_epoch, MessageRecord.sequence)
+                )
+            )
+            tool_epochs = tuple(
+                await sql.scalars(
+                    select(ToolCallRecord.execution_epoch)
+                    .where(
+                        ToolCallRecord.tenant_id == TENANT_ID,
+                        ToolCallRecord.run_id == run.id,
+                        ToolCallRecord.tool_call_id == old_tool.id,
+                    )
+                    .order_by(ToolCallRecord.execution_epoch)
+                )
+            )
+        assert [(row.execution_epoch, row.content) for row in branch_rows] == [
+            (1, "base request"),
+            (1, "checkpoint response"),
+            (1, '{"abandoned":true}'),
+            (2, "base request"),
+            (2, "checkpoint response"),
+        ]
+        assert tool_epochs == (1, 2)
+        await queue.finish(
+            lease,
+            RunExecutionResult(status=RunStatus.COMPLETED),
+            occurred_at=now + timedelta(seconds=8),
+        )
+    finally:
+        async with database.sessions() as sql, sql.begin():
+            await sql.execute(
+                delete(WorkspaceLeaseRecord).where(
+                    WorkspaceLeaseRecord.tenant_id == TENANT_ID,
+                    WorkspaceLeaseRecord.workspace_id == run.workspace_id,
+                )
+            )
+            await sql.execute(
+                delete(SessionRecord).where(
+                    SessionRecord.tenant_id == TENANT_ID,
+                    SessionRecord.id == session.id,
+                )
+            )
+            await sql.execute(delete(WorkerRecord).where(WorkerRecord.worker_id == worker_id))
+        await database.aclose()
 
 
 @pytest.mark.asyncio
@@ -650,6 +995,7 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         id=uuid.uuid4(),
         run_id=primary.id,
         session_id=session.id,
+        tool_call_id="mutating-call-1",
         message_sequence=1,
         workspace_snapshot_uri="s3://agent-platform/recovery-checkpoint",
         workspace_revision="revision-before-recovery",
@@ -658,7 +1004,6 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         created_at=now + timedelta(seconds=2),
     )
     await execution.create_checkpoint(TENANT_ID, checkpoint)
-    await runs.rewind(TENANT_ID, primary.id, checkpoint.id)
     arguments = FrozenJsonObject({"path": "README.md", "old": "a", "new": "b"})
     completed_tool = ToolCall(
         id="mutating-call-1",
@@ -678,7 +1023,6 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         started_at=now + timedelta(seconds=3),
         completed_at=now + timedelta(seconds=4),
     )
-    await execution.save_tool_call(TENANT_ID, completed_tool)
 
     worker_ids = ("worker-a", "worker-b", "worker-c")
     for worker_id in worker_ids:
@@ -711,6 +1055,13 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
             lease_duration=timedelta(seconds=10),
         )
         assert writer_a is not None
+        await execution.complete_checkpoint_fenced(
+            worker_a,
+            checkpoint.id,
+            workspace_snapshot_uri="s3://agent-platform/recovery-post-edit",
+            workspace_revision="revision-after-edit",
+        )
+        await execution.save_tool_call_fenced(worker_a, completed_tool)
 
         other_lease = await queue.claim(
             "worker-b",
@@ -758,7 +1109,9 @@ async def test_worker_loss_reclaims_checkpoint_and_terminal_tool_without_duplica
         assert writer_b.generation > writer_a.generation
 
         restored = await recovery.load(worker_b)
-        assert restored.checkpoint == checkpoint
+        assert restored.checkpoint is not None
+        assert restored.checkpoint.id == checkpoint.id
+        assert restored.checkpoint.tool_call_id == completed_tool.id
         assert restored.workspace_restore_revision == "revision-after-edit"
         assert restored.context_summary == "durable summary"
         assert restored.prior_tool_outcomes[0].tool_call_id == completed_tool.id
@@ -971,6 +1324,7 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         id=uuid.uuid4(),
         run_id=run.id,
         session_id=session.id,
+        tool_call_id="worker-service-tool",
         message_sequence=2,
         workspace_snapshot_uri="s3://agent-platform/worker-service-recovery",
         workspace_revision="revision-before-tool",
@@ -978,7 +1332,6 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         created_at=now + timedelta(seconds=1),
     )
     await execution.create_checkpoint(TENANT_ID, checkpoint)
-    await runs.rewind(TENANT_ID, run.id, checkpoint.id)
     arguments = FrozenJsonObject({"path": "README.md", "old": "a", "new": "b"})
     completed_tool = ToolCall(
         id="worker-service-tool",
@@ -998,7 +1351,6 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
         started_at=now + timedelta(seconds=2),
         completed_at=now + timedelta(seconds=3),
     )
-    await execution.save_tool_call(TENANT_ID, completed_tool)
     await queue.register_worker(
         WorkerRegistration(
             worker_id="abandoned-worker",
@@ -1017,7 +1369,20 @@ async def test_reassigned_worker_service_restores_post_tool_revision_and_complet
             lease_duration=timedelta(seconds=5),
         )
         assert abandoned is not None and abandoned.run_id == run.id
-        await queue.start(abandoned, occurred_at=now + timedelta(seconds=5))
+        abandoned = await queue.start(abandoned, occurred_at=now + timedelta(seconds=5))
+        abandoned_writer = await workspaces.acquire(
+            abandoned,
+            occurred_at=now + timedelta(seconds=5),
+            lease_duration=timedelta(seconds=5),
+        )
+        assert abandoned_writer is not None
+        await execution.complete_checkpoint_fenced(
+            abandoned,
+            checkpoint.id,
+            workspace_snapshot_uri="s3://agent-platform/worker-service-post-tool",
+            workspace_revision="revision-after-tool",
+        )
+        await execution.save_tool_call_fenced(abandoned, completed_tool)
         recovered = await queue.recover_expired(
             occurred_at=now + timedelta(seconds=10),
             limit=10,
@@ -1221,6 +1586,7 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
         id=uuid.uuid4(),
         run_id=run.id,
         session_id=session.id,
+        tool_call_id="tool-call-1",
         message_sequence=1,
         workspace_snapshot_uri="s3://agent-platform/checkpoint",
         workspace_revision="revision-1",
@@ -1328,7 +1694,7 @@ async def test_execution_entities_are_durable_and_tool_ids_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_context_task_and_memory_state_survives_postgresql_recomposition(
+async def test_context_task_and_memory_state_survives_postgresql_recomposition(  # noqa: PLR0915
     postgres_url: str,
 ) -> None:
     database = Database(DatabaseSettings(database_url=postgres_url))
@@ -1357,10 +1723,18 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
             sequence=1,
             role=MessageRole.USER,
             content="Preserve this durable source message.",
+            metadata=FrozenJsonObject(
+                {
+                    "source": "run_submission",
+                    "referenced_files": [{"path": "README.md"}],
+                }
+            ),
             created_at=now,
         ),
     )
     try:
+        references = await context.referenced_files_for_run(TENANT_ID, run.id)
+        assert [item.path for item in references] == ["README.md"]
         compaction_id = uuid.uuid4()
         requested = await context.request_compaction(
             TENANT_ID,
@@ -1399,6 +1773,38 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
             completed_at=now + timedelta(seconds=3),
         )
         assert completed is not None and completed.summary is not None
+        await execution.append_message(
+            TENANT_ID,
+            PersistedMessage(
+                id=uuid.uuid4(),
+                session_id=session.id,
+                run_id=run.id,
+                sequence=2,
+                role=MessageRole.USER,
+                content="Schedule the next bounded compaction proactively.",
+                created_at=now + timedelta(seconds=4),
+            ),
+        )
+        automatic = await context.request_compaction_if_needed(
+            TENANT_ID,
+            session.id,
+            after_message_sequence=completed.source_message_sequence,
+            threshold_messages=1,
+            route_name=session.model_route,
+            requested_at=now + timedelta(seconds=5),
+        )
+        replayed_automatic = await context.request_compaction_if_needed(
+            TENANT_ID,
+            session.id,
+            after_message_sequence=completed.source_message_sequence,
+            threshold_messages=1,
+            route_name=session.model_route,
+            requested_at=now + timedelta(seconds=6),
+        )
+        assert automatic is not None
+        assert automatic.source_message_sequence == 2
+        assert automatic.idempotency_key == "auto-context-1-2"
+        assert replayed_automatic == automatic
 
         task_state = await tasks.update(
             TENANT_ID,
@@ -1410,7 +1816,7 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
                 }
             ),
             plan_id=uuid.uuid4(),
-            created_at=now + timedelta(seconds=4),
+            created_at=now + timedelta(seconds=7),
         )
         assert task_state is not None and task_state.version == 1
         with pytest.raises(DomainOperationError) as stale:
@@ -1419,7 +1825,7 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
                 run.id,
                 TaskPlanUpdate(expected_version=0, tasks=()),
                 plan_id=uuid.uuid4(),
-                created_at=now + timedelta(seconds=5),
+                created_at=now + timedelta(seconds=8),
             )
         assert stale.value.code == "task_plan_version_conflict"
 
@@ -1432,7 +1838,7 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
             kind=MemoryKind.DECISION,
             content=memory_content,
             content_hash=memory_content_hash(memory_content),
-            extracted_at=now + timedelta(seconds=6),
+            extracted_at=now + timedelta(seconds=9),
         )
         async with database.sessions() as transaction, transaction.begin():
             transaction.add(
@@ -1453,7 +1859,7 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
             TENANT_ID,
             session.id,
             enabled=False,
-            updated_at=now + timedelta(seconds=7),
+            updated_at=now + timedelta(seconds=10),
         )
         assert await memories.list_active(TENANT_ID, session.id) == ()
 
@@ -1463,7 +1869,7 @@ async def test_context_task_and_memory_state_survives_postgresql_recomposition(
                 .select_from(MessageRecord)
                 .where(MessageRecord.session_id == session.id)
             )
-        assert message_count == 1
+        assert message_count == 2
     finally:
         await database.aclose()
 
@@ -1605,6 +2011,7 @@ async def test_relational_constraints_reject_cross_entity_mismatches(
         id=uuid.uuid4(),
         run_id=first_run.id,
         session_id=second_session.id,
+        tool_call_id="mismatched-checkpoint-call",
         message_sequence=0,
         workspace_snapshot_uri="s3://agent-platform/invalid",
         workspace_revision="invalid",
@@ -1646,6 +2053,7 @@ async def test_relational_constraints_reject_cross_entity_mismatches(
         id=uuid.uuid4(),
         run_id=second_run.id,
         session_id=second_session.id,
+        tool_call_id="second-checkpoint-call",
         message_sequence=0,
         workspace_snapshot_uri="s3://agent-platform/second",
         workspace_revision="second",
@@ -1653,6 +2061,24 @@ async def test_relational_constraints_reject_cross_entity_mismatches(
         created_at=now,
     )
     await execution.create_checkpoint(TENANT_ID, second_checkpoint)
+    same_turn_checkpoint = second_checkpoint.model_copy(
+        update={
+            "id": uuid.uuid4(),
+            "tool_call_id": "second-checkpoint-call-b",
+            "workspace_snapshot_uri": "s3://agent-platform/second-b",
+            "workspace_revision": "second-b",
+        }
+    )
+    await execution.create_checkpoint(TENANT_ID, same_turn_checkpoint)
+    duplicate_tool_binding = second_checkpoint.model_copy(
+        update={
+            "id": uuid.uuid4(),
+            "workspace_snapshot_uri": "s3://agent-platform/second-conflict",
+            "workspace_revision": "second-conflict",
+        }
+    )
+    with pytest.raises(IntegrityError):
+        await execution.create_checkpoint(TENANT_ID, duplicate_tool_binding)
     with pytest.raises(IntegrityError):
         async with database.sessions() as transaction, transaction.begin():
             await transaction.execute(
@@ -1709,6 +2135,452 @@ async def test_relational_constraints_reject_cross_entity_mismatches(
 
 
 @pytest.mark.asyncio
+async def test_api_to_recovered_worker_event_replay_and_artifact_journey(  # noqa: PLR0915
+    postgres_url: str,
+) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    approvals = PostgresApprovalRepository(database.sessions)
+    events = PostgresEventStore(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    queue = PostgresRunQueue(database.sessions)
+    workspace_leases = PostgresWorkspaceLeaseStore(database.sessions)
+    recovery = PostgresRecoveryStore(database.sessions)
+    workspaces = PostgresWorkspaceRepository(database.sessions)
+    objects = _JourneyObjectStore()
+    services = ApiServices(
+        authenticator=StaticTokenAuthenticator(
+            {
+                API_TOKEN: Principal(tenant_id=TENANT_ID, subject="journey-user"),
+                OTHER_API_TOKEN: Principal(
+                    tenant_id=OTHER_TENANT_ID,
+                    subject="other-user",
+                ),
+            }
+        ),
+        sessions=sessions,
+        runs=runs,
+        approvals=approvals,
+        events=events,
+        readiness=_Ready(),
+        workspaces=workspaces,
+        object_store=objects,
+    )
+    authorization = {"Authorization": f"Bearer {API_TOKEN}"}
+    other_authorization = {"Authorization": f"Bearer {OTHER_API_TOKEN}"}
+    task = "Apply the durable edit once, recover, and publish the patch."
+
+    try:
+        app = create_app(services)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            workspace_response = await client.post(
+                "/v1/workspaces",
+                headers=authorization,
+                json={"display_name": "distributed journey"},
+            )
+            assert workspace_response.status_code == 201
+            workspace_id = uuid.UUID(workspace_response.json()["id"])
+            upload_response = await client.post(
+                f"/v1/workspaces/{workspace_id}/snapshots",
+                headers=authorization,
+            )
+            assert upload_response.status_code == 201
+            snapshot_body = upload_response.json()["snapshot"]
+            snapshot_id = uuid.UUID(snapshot_body["id"])
+            source_key = snapshot_body["object_key"]
+            source_content = b"deterministic-source-archive"
+            source_object = objects.record(
+                source_key,
+                source_content,
+                content_type="application/gzip",
+            )
+            finalize_response = await client.post(
+                f"/v1/workspaces/{workspace_id}/snapshots/{snapshot_id}/finalize",
+                headers=authorization,
+                json={
+                    "sha256": source_object.sha256,
+                    "compressed_bytes": source_object.size_bytes,
+                },
+            )
+            assert finalize_response.status_code == 202
+
+        claimed_validation = await workspaces.claim_validation_job(
+            "journey-validator",
+            occurred_at=datetime.now(UTC),
+            lease_seconds=30,
+        )
+        assert claimed_validation is not None
+        validation_lease, validating = claimed_validation
+        source_artifact_id = uuid.uuid4()
+        ready_snapshot = validating.model_copy(
+            update={
+                "status": SourceSnapshotStatus.READY,
+                "artifact_id": source_artifact_id,
+                "manifest_sha256": source_object.sha256,
+                "entry_count": 1,
+                "expanded_bytes": len(source_content),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await workspaces.complete_validation(
+            ready_snapshot,
+            Artifact(
+                id=source_artifact_id,
+                tenant_id=TENANT_ID,
+                workspace_id=workspace_id,
+                kind=ArtifactKind.SOURCE_SNAPSHOT,
+                object=source_object,
+                created_at=ready_snapshot.updated_at,
+            ),
+            lease=validation_lease,
+        )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            session_response = await client.post(
+                "/v1/sessions",
+                headers=authorization,
+                json={"workspace_id": str(workspace_id)},
+            )
+            assert session_response.status_code == 201
+            session_id = uuid.UUID(session_response.json()["id"])
+            run_response = await client.post(
+                f"/v1/sessions/{session_id}/runs",
+                headers={**authorization, "Idempotency-Key": "distributed-journey"},
+                json={"task": task, "priority": 100},
+            )
+            assert run_response.status_code == 200
+            run_id = uuid.UUID(run_response.json()["run"]["id"])
+
+        now = datetime.now(UTC) + timedelta(seconds=1)
+        await queue.register_worker(
+            WorkerRegistration(
+                worker_id="journey-abandoned",
+                supported_sandbox_types=("podman",),
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+        abandoned = await queue.claim(
+            "journey-abandoned",
+            occurred_at=now,
+            lease_duration=timedelta(seconds=2),
+        )
+        assert abandoned is not None and abandoned.run_id == run_id
+        abandoned = await queue.start(
+            abandoned,
+            occurred_at=now + timedelta(milliseconds=1),
+        )
+        abandoned_writer = await workspace_leases.acquire(
+            abandoned,
+            occurred_at=now + timedelta(milliseconds=2),
+            lease_duration=timedelta(seconds=2),
+        )
+        assert abandoned_writer is not None
+        tool_arguments = FrozenJsonObject({"path": "README.md", "old": "before", "new": "after"})
+        checkpoint = Checkpoint(
+            id=uuid.uuid4(),
+            run_id=run_id,
+            session_id=session_id,
+            tool_call_id="durable-edit",
+            message_sequence=1,
+            messages=(
+                FrozenJsonObject(
+                    {
+                        "role": MessageRole.USER.value,
+                        "content": task,
+                        "tool_call_id": None,
+                        "tool_calls": [],
+                    }
+                ),
+            ),
+            workspace_snapshot_uri="s3://agent-platform/pre-edit",
+            workspace_revision="revision-before-edit",
+            task_plan=FrozenJsonObject({}),
+            created_at=now + timedelta(milliseconds=3),
+        )
+        await execution.create_checkpoint_fenced(abandoned, checkpoint)
+        await execution.complete_checkpoint_fenced(
+            abandoned,
+            checkpoint.id,
+            workspace_snapshot_uri="s3://agent-platform/post-edit",
+            workspace_revision="revision-after-edit",
+        )
+        completed_tool = ToolCall(
+            id="durable-edit",
+            run_id=run_id,
+            turn_number=1,
+            tool_name="edit_file",
+            arguments=tool_arguments,
+            argument_hash=canonical_argument_hash(tool_arguments),
+            status=ToolCallStatus.COMPLETED,
+            workspace_version="revision-after-edit",
+            result=FrozenJsonObject(
+                {
+                    "path": "README.md",
+                    "workspace_revision": "revision-after-edit",
+                }
+            ),
+            started_at=now + timedelta(milliseconds=4),
+            completed_at=now + timedelta(milliseconds=5),
+        )
+        await execution.save_tool_call_fenced(abandoned, completed_tool)
+
+        recovered_runs = await queue.recover_expired(
+            occurred_at=now + timedelta(seconds=3),
+            limit=10,
+        )
+        assert [run.id for run in recovered_runs] == [run_id]
+
+        restorer = RecordingWorkspaceRestorer()
+        mutation = CountingMutationHandler()
+        tools = ToolRegistry(
+            (
+                RegisteredTool(
+                    name="edit_file",
+                    description="Edit one file",
+                    arguments_type=ReplayEditArguments,
+                    handler=mutation,
+                    effect=ToolEffect.WORKSPACE_MUTATION,
+                ),
+            )
+        )
+
+        def loop_factory(
+            lease: RunLease,
+            writer_lease: WorkspaceWriterLease,
+            state: RunRecoveryState,
+        ) -> AgentLoop:
+            assert writer_lease.run_id == lease.run_id
+            assert state.checkpoint is not None
+            assert state.checkpoint.tool_call_id == completed_tool.id
+            return AgentLoop(
+                gateway=ScriptedModelGateway(
+                    (
+                        ScriptedGatewayTurn.tool_calls(
+                            GatewayToolCall(
+                                id=completed_tool.id,
+                                name=completed_tool.tool_name,
+                                arguments=completed_tool.arguments,
+                            )
+                        ),
+                        ScriptedGatewayTurn.text("Recovered without repeating the edit."),
+                    )
+                ),
+                tools=tools,
+                clock=SteppingClock(now + timedelta(seconds=4)),
+                id_generator=SequentialIdGenerator(),
+            )
+
+        patch = b"diff --git a/README.md b/README.md\n"
+        final_object = objects.record(
+            final_patch_object_key(TENANT_ID, workspace_id, run_id),
+            patch,
+            content_type="text/x-diff",
+        )
+        final_artifact_id = uuid.uuid5(uuid.NAMESPACE_URL, final_object.object_key)
+
+        async def finalize_attempt(
+            lease: RunLease,
+            loop: AgentLoop,
+            result: RunExecutionResult,
+        ) -> None:
+            del loop
+            assert result.status is RunStatus.COMPLETED
+            await workspaces.create_artifact_fenced(
+                lease,
+                Artifact(
+                    id=final_artifact_id,
+                    tenant_id=lease.tenant_id,
+                    workspace_id=lease.workspace_id,
+                    run_id=lease.run_id,
+                    kind=ArtifactKind.FINAL_PATCH,
+                    object=final_object,
+                    created_at=now + timedelta(seconds=4),
+                ),
+            )
+
+        worker = WorkerService(
+            config=WorkerConfig(worker_id="journey-replacement"),
+            queue=queue,
+            workspace_leases=workspace_leases,
+            recovery=recovery,
+            restorer=restorer,
+            executor=AgentLoopRunExecutor(
+                loop_factory=loop_factory,
+                events=events,
+                tool_calls=execution,
+                attempt_finalizer=finalize_attempt,
+            ),
+            clock=SteppingWorkerClock(now + timedelta(seconds=4)),
+        )
+        assert await worker.run_once() is True
+        await wait_for_worker_idle(worker)
+        assert mutation.calls == 0
+        assert restorer.calls[0][1] == checkpoint.id
+        assert restorer.calls[0][3] == "revision-after-edit"
+
+        restarted_transport = httpx.ASGITransport(app=create_app(services))
+        async with httpx.AsyncClient(
+            transport=restarted_transport,
+            base_url="http://testserver",
+        ) as restarted:
+            status_response = await restarted.get(
+                f"/v1/runs/{run_id}/status",
+                headers=authorization,
+            )
+            assert status_response.status_code == 200
+            assert status_response.json()["run"]["status"] == RunStatus.COMPLETED.value
+            first_replay = await restarted.get(
+                f"/v1/runs/{run_id}/events?after=0&limit=100",
+                headers=authorization,
+            )
+            second_replay = await restarted.get(
+                f"/v1/runs/{run_id}/events?after=0&limit=100",
+                headers=authorization,
+            )
+            assert first_replay.status_code == second_replay.status_code == 200
+            assert first_replay.json() == second_replay.json()
+            sequences = [event["sequence"] for event in first_replay.json()["events"]]
+            assert sequences == list(range(1, len(sequences) + 1))
+            artifacts_response = await restarted.get(
+                f"/v1/workspaces/{workspace_id}/artifacts?run_id={run_id}",
+                headers=authorization,
+            )
+            assert artifacts_response.status_code == 200
+            assert [artifact["id"] for artifact in artifacts_response.json()["artifacts"]] == [
+                str(final_artifact_id)
+            ]
+            download_response = await restarted.get(
+                f"/v1/artifacts/{final_artifact_id}/download",
+                headers=authorization,
+            )
+            assert download_response.status_code == 200
+            assert download_response.json()["artifact"]["object"]["sha256"] == (
+                hashlib.sha256(patch).hexdigest()
+            )
+            assert download_response.json()["download"]["url"].startswith("memory://download/")
+            assert (
+                await restarted.get(
+                    f"/v1/artifacts/{final_artifact_id}/download",
+                    headers=other_authorization,
+                )
+            ).status_code == 404
+
+        async with database.sessions() as query:
+            tool_count = await query.scalar(
+                select(func.count())
+                .select_from(ToolCallRecord)
+                .where(
+                    ToolCallRecord.run_id == run_id,
+                    ToolCallRecord.tool_call_id == completed_tool.id,
+                )
+            )
+        assert tool_count == 1
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_last_approval_decision_flushes_before_run_resume(postgres_url: str) -> None:
+    database = Database(DatabaseSettings(database_url=postgres_url))
+    sessions = PostgresSessionRepository(database.sessions)
+    runs = PostgresRunRepository(database.sessions)
+    approvals = PostgresApprovalRepository(database.sessions)
+    execution = PostgresExecutionRepository(database.sessions)
+    now = datetime.now(UTC)
+    session = _session(now)
+    run = _run(session, now).model_copy(update={"priority": 100})
+    approval_id = uuid.uuid4()
+    tool_call_id = "flush-before-resume"
+    try:
+        await sessions.create(session)
+        await runs.create_idempotent(
+            TENANT_ID,
+            run,
+            idempotency_key=f"approval-flush-{run.id}",
+            creation_hash=run_creation_hash(priority=run.priority),
+        )
+        lease_queue = PostgresRunQueue(database.sessions)
+        worker_id = f"approval-flush-{uuid.uuid4()}"
+        await lease_queue.register_worker(
+            WorkerRegistration(
+                worker_id=worker_id,
+                supported_sandbox_types=("podman",),
+                total_slots=1,
+                available_slots=1,
+                status=WorkerStatus.ACTIVE,
+                registered_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+        lease = await lease_queue.claim(
+            worker_id,
+            occurred_at=now + timedelta(milliseconds=1),
+            lease_duration=timedelta(seconds=30),
+        )
+        assert lease is not None and lease.run_id == run.id
+        lease = await lease_queue.start(lease, occurred_at=now + timedelta(milliseconds=2))
+        arguments = FrozenJsonObject({"path": "README.md"})
+        tool = ToolCall(
+            id=tool_call_id,
+            run_id=run.id,
+            turn_number=1,
+            tool_name="edit_file",
+            arguments=arguments,
+            argument_hash=canonical_argument_hash(arguments),
+            status=ToolCallStatus.WAITING_APPROVAL,
+        )
+        await execution.save_tool_call_fenced(lease, tool)
+        approval = PersistedApproval(
+            id=approval_id,
+            run_id=run.id,
+            status=ApprovalStatus.PENDING,
+            reason="Approve the edit.",
+            arguments=arguments,
+            requested_at=now + timedelta(milliseconds=3),
+        )
+        await execution.create_approval_fenced(
+            lease,
+            approval,
+            tool_call_id=tool_call_id,
+        )
+        await lease_queue.finish(
+            lease,
+            RunExecutionResult(status=RunStatus.WAITING_APPROVAL),
+            occurred_at=now + timedelta(milliseconds=4),
+        )
+
+        decided = await approvals.decide(
+            TENANT_ID,
+            run.id,
+            approval_id,
+            ApprovalDecision(
+                approved=True,
+                decided_by="regression-test",
+                decided_at=now + timedelta(milliseconds=5),
+            ),
+        )
+
+        resumed = await runs.get(TENANT_ID, run.id)
+        assert decided is not None and decided.status is ApprovalStatus.APPROVED
+        assert resumed is not None and resumed.status is RunStatus.QUEUED
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
 async def test_production_api_restart_preserves_tenant_state_and_event_replay(
     postgres_url: str,
 ) -> None:
@@ -1730,30 +2602,67 @@ async def test_production_api_restart_preserves_tenant_state_and_event_replay(
     authorization = {"Authorization": f"Bearer {API_TOKEN}"}
     other_authorization = {"Authorization": f"Bearer {OTHER_API_TOKEN}"}
 
+    bootstrap_database = Database(database_settings)
+    bootstrap_session = _session(datetime.now(UTC))
+    await PostgresSessionRepository(bootstrap_database.sessions).create(bootstrap_session)
+    await bootstrap_database.aclose()
+    session_id = bootstrap_session.id
+
     with TestClient(
         create_production_app(
             api_settings=api_settings,
             database_settings=database_settings,
         )
     ) as client:
-        session_response = client.post(
-            "/v1/sessions",
-            headers=authorization,
-            json={"workspace_id": str(uuid.uuid4())},
-        )
-        assert session_response.status_code == 201
-        session_id = uuid.UUID(session_response.json()["id"])
+        assert client.get(f"/v1/sessions/{session_id}", headers=authorization).status_code == 200
         run_response = client.post(
             f"/v1/sessions/{session_id}/runs",
             headers={**authorization, "Idempotency-Key": "api-restart-run"},
-            json={"priority": 3},
+            json={
+                "task": "Verify durable run submission after API restart.",
+                "initial_tasks": [{"id": "verify", "title": "Verify persistence"}],
+                "priority": 3,
+            },
         )
         assert run_response.status_code == 200
         run_id = uuid.UUID(run_response.json()["run"]["id"])
+        replay_response = client.post(
+            f"/v1/sessions/{session_id}/runs",
+            headers={**authorization, "Idempotency-Key": "api-restart-run"},
+            json={
+                "task": "Verify durable run submission after API restart.",
+                "initial_tasks": [{"id": "verify", "title": "Verify persistence"}],
+                "priority": 3,
+            },
+        )
+        assert replay_response.status_code == 200
+        assert replay_response.json()["created"] is False
+        assert uuid.UUID(replay_response.json()["run"]["id"]) == run_id
 
     event_database = Database(database_settings)
     event_store = PostgresEventStore(event_database.sessions)
     try:
+        async with event_database.sessions() as transaction:
+            messages = tuple(
+                (
+                    await transaction.scalars(
+                        select(MessageRecord).where(MessageRecord.run_id == run_id)
+                    )
+                ).all()
+            )
+            plans = tuple(
+                (
+                    await transaction.scalars(
+                        select(TaskPlanRecord).where(TaskPlanRecord.run_id == run_id)
+                    )
+                ).all()
+            )
+        assert len(messages) == 1
+        assert messages[0].content == "Verify durable run submission after API restart."
+        assert messages[0].sequence == 1
+        assert len(plans) == 1
+        assert plans[0].version == 1
+        assert plans[0].plan["tasks"][0]["id"] == "verify"
         for message_count in (1, 2):
             await event_store.append(
                 TENANT_ID,

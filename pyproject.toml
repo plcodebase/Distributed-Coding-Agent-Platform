@@ -5,6 +5,7 @@ description = "Distributed coding-agent platform"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-api",
+  "agent-cli",
   "agent-core",
   "agent-scheduler",
   "agent-worker",
@@ -22,6 +23,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "httpx>=0.27,<1",
+  "httpx2>=2.9.1,<3",
   "mypy>=1.15,<2",
   "pip-audit>=2.9,<3",
   "podman-compose>=1.5,<2",
@@ -41,6 +43,7 @@ package = false
 
 [tool.uv.sources]
 agent-api = { workspace = true }
+agent-cli = { workspace = true }
 agent-core = { workspace = true }
 agent-scheduler = { workspace = true }
 agent-worker = { workspace = true }
@@ -57,6 +60,7 @@ sandbox-node-agent = { workspace = true }
 [tool.uv.workspace]
 members = [
   "apps/agent-api",
+  "apps/cli",
   "apps/agent-worker",
   "apps/scheduler",
   "packages/agent-core",
@@ -81,14 +85,29 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
+  "end_to_end: requires the complete local Podman-based execution path",
   "integration: requires local infrastructure",
   "security: exercises security boundaries",
 ]
 
 [tool.coverage.run]
 branch = true
+omit = [
+  "*/__main__.py",
+  "*/agent_api/event_factory.py",
+  "*/agent_api/factory.py",
+  "*/agent_cli/main.py",
+  "*/agent_scheduler/production.py",
+  "*/agent_scheduler/process.py",
+  "*/agent_worker/production.py",
+  "*/agent_worker/process.py",
+  "*/gateway_client/factory.py",
+  "*/sandbox_node_agent/production.py",
+  "*/sandbox_node_agent/server.py",
+]
 source = [
   "agent_api",
+  "agent_cli",
   "agent_core",
   "agent_scheduler",
   "agent_worker",
@@ -120,6 +139,7 @@ line-length = 100
 target-version = "py312"
 src = [
   "apps/agent-api/src",
+  "apps/cli/src",
   "apps/agent-worker/src",
   "apps/scheduler/src",
   "packages/agent-core/src",
@@ -177,6 +197,7 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 mypy_path = [
   "apps/agent-api/src",
+  "apps/cli/src",
   "apps/agent-worker/src",
   "apps/scheduler/src",
   "packages/agent-core/src",
