@@ -55,6 +55,7 @@ from agent_core.artifacts import (
     WorkspaceStatus,
     source_snapshot_object_key,
 )
+from agent_core.audit import AuditEntry
 from agent_core.context import CONTEXT_COMPACTION_ROUTE
 from agent_core.control import (
     ApprovalDecision,
@@ -76,6 +77,7 @@ type CloseCallback = Callable[[], Awaitable[None]]
 type RequestHandler = Callable[[Request], Awaitable[Response]]
 MIN_METRICS_TOKEN_BYTES = 16
 MAX_METRICS_TOKEN_BYTES = 4_096
+MAX_REQUEST_ID_CHARS = 255
 
 
 def create_app(  # noqa: PLR0915 - explicit route table remains locally auditable
@@ -244,6 +246,34 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
         authorization: Annotated[str | None, Header()] = None,
     ) -> Principal:
         authenticated = await services.authenticator.authenticate(authorization)
+        request.state.principal = authenticated
+        if (
+            services.audit is not None
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and not getattr(request.state, "audit_recorded", False)
+        ):
+            supplied_request_id = request.headers.get("x-request-id", "")
+            request_id = (
+                supplied_request_id
+                if 1 <= len(supplied_request_id) <= MAX_REQUEST_ID_CHARS
+                and all(
+                    character.isalnum() or character in "._:-" for character in supplied_request_id
+                )
+                else str(uuid.uuid4())
+            )
+            await services.audit.append(
+                AuditEntry(
+                    id=uuid.uuid4(),
+                    tenant_id=authenticated.tenant_id,
+                    subject=authenticated.subject,
+                    method=request.method,
+                    resource=request.url.path,
+                    action=f"http.{request.method.lower()}",
+                    request_id=request_id,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+            request.state.audit_recorded = True
         if telemetry is not None:
             span = getattr(request.state, "telemetry_span", None)
             if span is not None:

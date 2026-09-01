@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
     from agent_api.auth import Authenticator
     from agent_core.artifacts import Artifact, ObjectStore, SourceSnapshot, Workspace
+    from agent_core.audit import AuditSink
     from agent_core.control import (
         ApprovalDecision,
         PersistedApproval,
@@ -245,6 +246,7 @@ class ApiServices:
     memories: MemoryRepository | None = None
     workspaces: WorkspaceRepository | None = None
     object_store: ObjectStore | None = None
+    audit: AuditSink | None = None
 
 
 @dataclass(frozen=True, slots=True)

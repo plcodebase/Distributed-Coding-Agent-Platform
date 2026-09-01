@@ -85,7 +85,9 @@ class RequestBodyLimitMiddleware:
         async def replay() -> Message:
             if messages:
                 return messages.popleft()
-            return {"type": "http.request", "body": b"", "more_body": False}
+            # Continue with the underlying receive channel so streaming
+            # responses observe only an actual client disconnect.
+            return await receive()
 
         await self._app(scope, replay, send)
 

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, Self
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agent_api.app import create_app
-from agent_api.auth import Principal, StaticTokenAuthenticator
+from agent_api.auth import OidcAuthenticator, Principal, StaticTokenAuthenticator
 from agent_api.dependencies import ApiServices
 from agent_core.capacity import TenantQuota
 from agent_core.scheduling import QueueAdmissionPolicy
@@ -46,9 +46,20 @@ class AgentApiSettings(BaseSettings):
         frozen=True,
     )
 
-    api_credentials_json: SecretStr = Field(
-        description="JSON map from bearer tokens to tenant_id and subject"
+    auth_mode: Literal["static", "oidc"] = "static"
+    api_credentials_json: SecretStr | None = Field(
+        default=None, description="JSON map from bearer tokens to tenant_id and subject"
     )
+    oidc_issuer: str | None = Field(default=None, max_length=2048)
+    oidc_audience: str | None = Field(default=None, max_length=1024)
+    oidc_jwks_url: str | None = Field(default=None, max_length=2048)
+    oidc_tenant_claim: str = Field(
+        default="tenant_id",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$",
+    )
+    oidc_jwks_cache_seconds: float = Field(default=300, ge=0, le=3600)
+    oidc_clock_skew_seconds: float = Field(default=30, ge=0, le=300)
+    environment: Literal["development", "test", "production"] = "development"
     tenant_active_run_limit: int = Field(default=4, ge=1, le=10_000)
     tenant_queued_run_limit: int = Field(default=100, ge=1, le=100_000)
     tenant_gateway_request_limit: int = Field(default=4, ge=1, le=10_000)
@@ -57,6 +68,34 @@ class AgentApiSettings(BaseSettings):
     telemetry_environment: str = Field(default="development", min_length=1, max_length=128)
     otlp_http_endpoint: str | None = Field(default=None, max_length=2_048)
     metrics_token: SecretStr | None = None
+    max_source_snapshot_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1,
+        le=1024 * 1024 * 1024,
+    )
+    snapshot_upload_ttl_seconds: int = Field(default=900, ge=1, le=3600)
+    artifact_download_ttl_seconds: int = Field(default=300, ge=1, le=3600)
+
+    @model_validator(mode="after")
+    def validate_authentication(self) -> Self:
+        oidc = (self.oidc_issuer, self.oidc_audience, self.oidc_jwks_url)
+        if self.auth_mode == "static":
+            if self.api_credentials_json is None:
+                raise ValueError("static authentication requires api_credentials_json")
+            if any(value is not None for value in oidc):
+                raise ValueError("static authentication may not include OIDC settings")
+            if self.environment == "production":
+                raise ValueError("production API authentication requires OIDC")
+        else:
+            if self.api_credentials_json is not None or any(value is None for value in oidc):
+                raise ValueError("OIDC authentication requires only issuer, audience, and JWKS URL")
+            issuer = self.oidc_issuer or ""
+            jwks_url = self.oidc_jwks_url or ""
+            if self.environment == "production" and not (
+                issuer.startswith("https://") and jwks_url.startswith("https://")
+            ):
+                raise ValueError("production OIDC endpoints must use HTTPS")
+        return self
 
 
 def create_production_app(
@@ -67,7 +106,7 @@ def create_production_app(
     """Create an independently owned API and PostgreSQL dependency graph."""
 
     resolved_api = api_settings or AgentApiSettings()
-    authenticator = StaticTokenAuthenticator(_credentials(resolved_api))
+    authenticator = _authenticator(resolved_api)
     database = Database(database_settings or DatabaseSettings())
     default_quota = TenantQuota(
         max_active_runs=resolved_api.tenant_active_run_limit,
@@ -109,9 +148,13 @@ def create_production_app(
 
     async def close() -> None:
         try:
-            await database.aclose()
+            if isinstance(authenticator, OidcAuthenticator):
+                await authenticator.aclose()
         finally:
-            telemetry.shutdown()
+            try:
+                await database.aclose()
+            finally:
+                telemetry.shutdown()
 
     return create_app(
         services,
@@ -122,11 +165,37 @@ def create_production_app(
             if resolved_api.metrics_token is not None
             else None
         ),
+        max_snapshot_upload_bytes=resolved_api.max_source_snapshot_bytes,
+        snapshot_upload_ttl_seconds=resolved_api.snapshot_upload_ttl_seconds,
+        artifact_download_ttl_seconds=resolved_api.artifact_download_ttl_seconds,
     )
 
 
 def _credentials(settings: AgentApiSettings) -> dict[str, Principal]:
+    if settings.api_credentials_json is None:
+        raise ValueError("static credentials are not configured")
     return _credentials_json(settings.api_credentials_json.get_secret_value())
+
+
+def _authenticator(
+    settings: AgentApiSettings,
+) -> StaticTokenAuthenticator | OidcAuthenticator:
+    if settings.auth_mode == "static":
+        return StaticTokenAuthenticator(_credentials(settings))
+    if (
+        settings.oidc_issuer is None
+        or settings.oidc_audience is None
+        or settings.oidc_jwks_url is None
+    ):
+        raise ValueError("OIDC settings are incomplete")
+    return OidcAuthenticator(
+        issuer=settings.oidc_issuer,
+        audience=settings.oidc_audience,
+        jwks_url=settings.oidc_jwks_url,
+        tenant_claim=settings.oidc_tenant_claim,
+        cache_seconds=settings.oidc_jwks_cache_seconds,
+        clock_skew_seconds=settings.oidc_clock_skew_seconds,
+    )
 
 
 def _credentials_json(raw: str) -> dict[str, Principal]:
