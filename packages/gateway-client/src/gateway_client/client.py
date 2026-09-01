@@ -10,13 +10,16 @@ import random
 import time
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
 from agent_core.domain.base import DomainModel
 from agent_core.domain.errors import DomainOperationError, ErrorDetail
+from agent_core.domain.models import ModelCall
+from agent_core.domain.status import ModelCallStatus
 from agent_core.gateway import (
     GatewayEvent,
     GatewayRequest,
@@ -38,11 +41,12 @@ from gateway_client.reliability import (
 from platform_telemetry import ErrorCategory, PlatformTelemetry, TelemetryContext
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
     from types import TracebackType
 
     from agent_core.capacity import GatewayCapacityLease, GatewayCapacityStore
     from agent_core.domain.models import Sha256Hex
+    from agent_core.gateway_reliability import ModelCallSink
 
 
 DEFAULT_MODEL_ROUTES = (
@@ -124,6 +128,46 @@ class GatewayClientConfig(DomainModel):
         return self
 
 
+class RoutePrice(DomainModel):
+    """USD per million tokens for one stable logical model route."""
+
+    input_usd_per_million: Decimal = Field(ge=0, max_digits=20, decimal_places=10)
+    output_usd_per_million: Decimal = Field(ge=0, max_digits=20, decimal_places=10)
+    cached_input_usd_per_million: Decimal = Field(
+        default=Decimal(0),
+        ge=0,
+        max_digits=20,
+        decimal_places=10,
+    )
+
+
+class ConfiguredCostCalculator:
+    """Deterministically attribute normalized usage from platform-owned route prices."""
+
+    def __init__(self, prices: Mapping[str, RoutePrice]) -> None:
+        if not prices:
+            raise ValueError("at least one route price is required")
+        if any(not isinstance(price, RoutePrice) for price in prices.values()):
+            raise TypeError("route prices must be validated RoutePrice values")
+        self._prices = dict(prices)
+
+    def calculate(self, route_name: str, event: GatewayResponseCompleted) -> Decimal:
+        price = self._prices.get(route_name)
+        if price is None:
+            raise DomainOperationError(
+                code="gateway_price_missing",
+                message="the selected route has no configured price",
+                details={"route_name": route_name},
+            )
+        uncached = max(0, event.input_tokens - event.cached_tokens)
+        million = Decimal(1_000_000)
+        return (
+            Decimal(uncached) * price.input_usd_per_million
+            + Decimal(event.cached_tokens) * price.cached_input_usd_per_million
+            + Decimal(event.output_tokens) * price.output_usd_per_million
+        ) / million
+
+
 class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
     """Validate, bound, and lifecycle-manage normalized gateway streams."""
 
@@ -141,6 +185,9 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         capacity_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         random_value: Callable[[], float] = random.random,
         telemetry: PlatformTelemetry | None = None,
+        cost_calculator: ConfiguredCostCalculator | None = None,
+        model_calls: ModelCallSink | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._gateway = gateway
         self._config = config or GatewayClientConfig()
@@ -166,6 +213,11 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         self._capacity_sleep = capacity_sleep
         self._random_value = random_value
         self._telemetry = telemetry
+        self._cost_calculator = cost_calculator
+        self._model_calls = model_calls
+        if not callable(clock):
+            raise TypeError("gateway clock must be callable")
+        self._clock = clock
         self._close_lock = asyncio.Lock()
         self._closing = False
         self._cleanup_required = False
@@ -284,6 +336,11 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         if stored_events is not None:
             if self._telemetry is not None:
                 self._telemetry.metrics.record_replay("gateway")
+            await self._attribute_model_call(
+                request,
+                _require_terminal_event(list(stored_events), request),
+                retry_count=0,
+            )
             for event in stored_events:
                 yield event
             return
@@ -512,7 +569,21 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
             attempt_stream = self._stream_attempt(request)
             try:
                 try:
-                    async for event in attempt_stream:
+                    async for streamed_event in attempt_stream:
+                        event = streamed_event
+                        if (
+                            isinstance(event, GatewayResponseCompleted)
+                            and event.estimated_cost_usd is None
+                            and self._cost_calculator is not None
+                        ):
+                            event = event.model_copy(
+                                update={
+                                    "estimated_cost_usd": self._cost_calculator.calculate(
+                                        request.route_name,
+                                        event,
+                                    )
+                                }
+                            )
                         attempt_events.append(event)
                         retained_events.append(event)
                         if not isinstance(event, GatewayResponseCompleted):
@@ -547,6 +618,11 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
                 request_hash,
                 tuple(retained_events),
                 execution_state,
+            )
+            await self._attribute_model_call(
+                request,
+                terminal,
+                retry_count=attempt - 1,
             )
             yield terminal
             return
@@ -848,6 +924,46 @@ class GatewayClient(AbstractAsyncContextManager["GatewayClient"]):
         self._telemetry.metrics.model_tokens.labels(route=route, direction="cached").inc(
             event.cached_tokens
         )
+
+    async def _attribute_model_call(
+        self,
+        request: GatewayRequest,
+        event: GatewayResponseCompleted,
+        *,
+        retry_count: int,
+    ) -> None:
+        if self._model_calls is None:
+            return
+        now = self._clock()
+        try:
+            model_call = ModelCall(
+                id=request.model_call_id,
+                run_id=request.run_id,
+                execution_epoch=request.execution_epoch,
+                request_id=request.request_id,
+                route_name=request.route_name,
+                provider=event.provider,
+                model=event.model,
+                status=ModelCallStatus.COMPLETED,
+                input_tokens=event.input_tokens,
+                output_tokens=event.output_tokens,
+                cached_tokens=event.cached_tokens,
+                estimated_cost_usd=event.estimated_cost_usd,
+                retry_count=retry_count,
+                fallback_count=0,
+                started_at=now,
+                completed_at=now,
+            )
+            await self._model_calls.save_model_call(request.tenant_id, model_call)
+        except DomainOperationError:
+            raise
+        except Exception:
+            raise DomainOperationError(
+                code="gateway_attribution_unavailable",
+                message="the completed model call could not be attributed durably",
+                retryable=True,
+                details={"request_id": request.request_id},
+            ) from None
 
     def _record_provider_attempt(self, request: GatewayRequest, *, outcome: str) -> None:
         if self._telemetry is not None:

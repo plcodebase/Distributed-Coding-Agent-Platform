@@ -13,7 +13,10 @@ from agent_core.capacity import (
 )
 from agent_core.domain.base import DomainModel
 from agent_core.domain.errors import ErrorDetail  # noqa: TC001 - Pydantic resolves at runtime
-from agent_core.domain.models import Sha256Hex  # noqa: TC001 - Pydantic resolves at runtime
+from agent_core.domain.models import (  # noqa: TC001 - Pydantic resolves at runtime
+    ModelCall,
+    Sha256Hex,
+)
 from agent_core.gateway import (
     GatewayEvent,
     GatewayRequestIdentifier,
@@ -100,6 +103,13 @@ class GatewayRequestStore(Protocol):
         """Release an admission claim before any provider attempt was made."""
 
 
+class ModelCallSink(Protocol):
+    """Durable accounting boundary for completed logical model calls."""
+
+    async def save_model_call(self, tenant_id: uuid.UUID, model_call: ModelCall) -> ModelCall:
+        """Persist idempotent provider, usage, retry, and cost attribution."""
+
+
 class GatewayRateLimiter(Protocol):
     """Tenant-and-route admission boundary for one logical model request."""
 
@@ -129,4 +139,5 @@ __all__ = [
     "GatewayRequestClaim",
     "GatewayRequestClaimStatus",
     "GatewayRequestStore",
+    "ModelCallSink",
 ]

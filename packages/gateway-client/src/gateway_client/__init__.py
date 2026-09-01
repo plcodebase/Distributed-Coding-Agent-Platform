@@ -6,8 +6,10 @@ from gateway_client.client import (
     MAX_GATEWAY_REQUEST_BYTES,
     MAX_GATEWAY_STREAM_BYTES,
     MAX_GATEWAY_STREAM_EVENTS,
+    ConfiguredCostCalculator,
     GatewayClient,
     GatewayClientConfig,
+    RoutePrice,
 )
 from gateway_client.reliability import (
     GatewayCapacityStore,
@@ -28,6 +30,7 @@ __all__ = [
     "MAX_GATEWAY_REQUEST_BYTES",
     "MAX_GATEWAY_STREAM_BYTES",
     "MAX_GATEWAY_STREAM_EVENTS",
+    "ConfiguredCostCalculator",
     "GatewayCapacityStore",
     "GatewayCircuitBreaker",
     "GatewayClient",
@@ -40,4 +43,5 @@ __all__ = [
     "InMemoryGatewayCircuitBreaker",
     "InMemoryGatewayRateLimiter",
     "InMemoryGatewayRequestStore",
+    "RoutePrice",
 ]

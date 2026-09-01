@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
@@ -22,11 +24,18 @@ from agent_core.gateway import (
     GatewayToolDefinition,
     MessageRole,
 )
-from gateway_client import GatewayClient, GatewayClientConfig
+from gateway_client import (
+    ConfiguredCostCalculator,
+    GatewayClient,
+    GatewayClientConfig,
+    RoutePrice,
+)
 from platform_telemetry import PlatformTelemetry, TelemetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
+
+    from agent_core.domain.models import ModelCall
 
 
 class ScriptedGateway:
@@ -77,6 +86,15 @@ class BlockingClose:
         self.calls += 1
         self.started.set()
         await self.release.wait()
+
+
+class ModelCallSink:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, ModelCall]] = []
+
+    async def save_model_call(self, tenant_id: UUID, model_call: ModelCall) -> ModelCall:
+        self.calls.append((tenant_id, model_call))
+        return model_call
 
 
 def request(
@@ -164,6 +182,51 @@ async def test_client_records_content_free_model_latency_and_token_telemetry() -
     assert 'outcome="success",route="coding-default"} 1.0' in payload
     assert "sensitive" not in payload
     telemetry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_client_attributes_configured_cost_and_durable_model_call() -> None:
+    sink = ModelCallSink()
+    delegate = ScriptedGateway(
+        [
+            GatewayResponseCompleted(
+                finish_reason=GatewayFinishReason.STOP,
+                input_tokens=1_000_000,
+                output_tokens=500_000,
+                cached_tokens=250_000,
+                provider="upstream",
+                model="model-v1",
+            )
+        ]
+    )
+    timestamp = datetime(2026, 1, 2, tzinfo=UTC)
+    client = GatewayClient(
+        delegate,
+        cost_calculator=ConfiguredCostCalculator(
+            {
+                "coding-default": RoutePrice(
+                    input_usd_per_million=Decimal("2"),
+                    cached_input_usd_per_million=Decimal("0.5"),
+                    output_usd_per_million=Decimal("4"),
+                )
+            }
+        ),
+        model_calls=sink,
+        clock=lambda: timestamp,
+    )
+
+    events = [event async for event in client.stream(request())]
+
+    terminal = cast("GatewayResponseCompleted", events[-1])
+    assert terminal.estimated_cost_usd == Decimal("3.625")
+    assert len(sink.calls) == 1
+    tenant_id, attributed = sink.calls[0]
+    assert tenant_id == request().tenant_id
+    assert attributed.estimated_cost_usd == Decimal("3.625")
+    assert attributed.provider == "upstream"
+    assert attributed.model == "model-v1"
+    assert attributed.started_at == timestamp
+    assert attributed.completed_at == timestamp
 
 
 @pytest.mark.asyncio
