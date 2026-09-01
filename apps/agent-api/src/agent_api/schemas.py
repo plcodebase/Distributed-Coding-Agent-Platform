@@ -114,6 +114,13 @@ class RunCreationResponse(DomainModel):
 
 class ApprovalDecisionRequest(DomainModel):
     approved: bool
+    response: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, min_length=1, max_length=65_536),
+        ]
+        | None
+    ) = None
 
 
 class RewindRequest(DomainModel):

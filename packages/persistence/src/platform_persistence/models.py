@@ -382,8 +382,13 @@ class RunRecord(Base):
             "OR (assigned_worker_id IS NULL AND lease_expires_at IS NULL)",
             name="suspended_without_lease",
         ),
+        CheckConstraint(
+            "(status = 'retry_pending') = (retry_ready_at IS NOT NULL)",
+            name="retry_ready_state",
+        ),
         Index("ix_runs_tenant_session_created", "tenant_id", "session_id", "created_at"),
         Index("ix_runs_status_created", "status", "created_at"),
+        Index("ix_runs_retry_ready", "status", "retry_ready_at"),
         Index(
             "ix_runs_queue_claim",
             "status",
@@ -417,6 +422,7 @@ class RunRecord(Base):
     )
     assigned_worker_id: Mapped[str | None] = mapped_column(String(255))
     lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    retry_ready_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
     last_checkpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     cancellation_requested: Mapped[bool] = mapped_column(
         Boolean,
@@ -811,6 +817,11 @@ class ApprovalRecord(Base):
             "AND decided_at >= requested_at)",
             name="decision_state",
         ),
+        CheckConstraint(
+            "response IS NULL OR octet_length(response) BETWEEN 1 AND 65536",
+            name="response_bytes",
+        ),
+        UniqueConstraint("tenant_id", "run_id", "tool_call_id"),
         Index("ix_approvals_run_status", "tenant_id", "run_id", "status"),
     )
 
@@ -832,6 +843,7 @@ class ApprovalRecord(Base):
         server_default=_UTC_NOW,
     )
     decided_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
+    response: Mapped[str | None] = mapped_column(Text)
 
 
 class CheckpointRecord(Base):

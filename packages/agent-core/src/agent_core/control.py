@@ -58,6 +58,13 @@ class ApprovalDecision(DomainModel):
         StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
     ]
     decided_at: AwareTimestamp
+    response: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, min_length=1, max_length=65_536),
+        ]
+        | None
+    ) = None
 
 
 class PersistedApproval(DomainModel):
@@ -71,16 +78,26 @@ class PersistedApproval(DomainModel):
     decided_by: str | None = None
     requested_at: AwareTimestamp
     decided_at: AwareTimestamp | None = None
+    response: str | None = None
 
     @model_validator(mode="after")
     def validate_decision(self) -> Self:
         if self.status is ApprovalStatus.PENDING:
-            if self.decided_by is not None or self.decided_at is not None:
+            if (
+                self.decided_by is not None
+                or self.decided_at is not None
+                or self.response is not None
+            ):
                 raise ValueError("pending approval may not contain decision metadata")
         elif self.decided_by is None or self.decided_at is None:
             raise ValueError("decided approval requires subject and timestamp")
         if self.decided_at is not None and self.decided_at < self.requested_at:
             raise ValueError("approval decision may not precede its request")
+        if (
+            self.response is not None
+            and len(self.response.encode("utf-8")) > MAX_APPROVAL_RESPONSE_BYTES
+        ):
+            raise ValueError("approval response exceeds its UTF-8 byte limit")
         return self
 
 

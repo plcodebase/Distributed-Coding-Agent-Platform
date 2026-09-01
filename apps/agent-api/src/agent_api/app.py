@@ -790,6 +790,7 @@ def create_app(  # noqa: PLR0915 - explicit route table remains locally auditabl
                 approved=body.approved,
                 decided_by=identity.subject,
                 decided_at=datetime.now(UTC),
+                response=body.response,
             ),
         )
         if approval is None:
