@@ -19,6 +19,7 @@ from agent_core.context import (
     GatewayContextCompressor,
     ReferencedContextFile,
     Utf8TokenEstimator,
+    WorkspaceContextSnapshot,
 )
 from agent_core.domain import DomainOperationError
 from agent_core.fakes import ScriptedGatewayTurn, ScriptedModelGateway, SequentialIdGenerator
@@ -115,6 +116,28 @@ def _pipeline(
         ),
         compressor=compressor,
     )
+
+
+def test_workspace_context_snapshot_is_closed_canonical_and_bounded() -> None:
+    snapshot = WorkspaceContextSnapshot(
+        project_instructions="instructions",
+        referenced_files=(
+            ReferencedContextFile(path="docs//design.md", content="design", active=True),
+        ),
+        current_git_diff="+ change",
+    )
+    assert snapshot.referenced_files[0].path == "docs/design.md"
+    assert snapshot.model_dump(mode="json")["referenced_files"] == [
+        {"path": "docs/design.md", "content": "design", "active": True}
+    ]
+
+    for invalid in ("../outside", ".git/config", "."):
+        with pytest.raises(ValidationError):
+            ReferencedContextFile(path=invalid, content="content")
+    with pytest.raises(ValidationError):
+        WorkspaceContextSnapshot.model_validate({"unexpected": True})
+    with pytest.raises(ValidationError):
+        WorkspaceContextSnapshot(project_instructions="x" * (1024 * 1024 + 1))
 
 
 @pytest.mark.asyncio
