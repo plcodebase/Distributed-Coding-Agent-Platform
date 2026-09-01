@@ -11,25 +11,42 @@ from scripts.kubernetes_contracts import (
     load_manifest_documents,
     main,
     validate_kubernetes_contract,
+    validate_production_admission_contract,
 )
 
 ROOT = Path("deployments/kubernetes/base")
+PRODUCTION = Path("deployments/kubernetes/production")
 
 
 def test_base_kubernetes_contract_is_complete_and_hardened() -> None:
     summary = validate_kubernetes_contract(ROOT)
 
     assert summary.deployments == 5
-    assert summary.services == 5
-    assert summary.service_accounts == 5
+    assert summary.daemonsets == 1
+    assert summary.services == 6
+    assert summary.service_accounts == 6
     assert summary.disruption_budgets == 5
     assert summary.network_policies >= 7
+
+
+def test_production_admission_contract_is_fail_closed() -> None:
+    validate_production_admission_contract(PRODUCTION)
+
+
+def test_production_admission_contract_rejects_audit_only_binding(tmp_path: Path) -> None:
+    documents = [copy.deepcopy(item) for item in load_manifest_documents(PRODUCTION)]
+    binding = next(item for item in documents if item["kind"] == "ValidatingAdmissionPolicyBinding")
+    binding["spec"]["validationActions"] = ["Audit"]
+    _write_documents(tmp_path, documents)
+
+    with pytest.raises(KubernetesContractError, match="must deny"):
+        validate_production_admission_contract(tmp_path)
 
 
 def test_manifest_validator_cli_reports_bounded_summary(capsys: pytest.CaptureFixture[str]) -> None:
     main((str(ROOT),))
 
-    assert capsys.readouterr().out.startswith("validated 39 documents")
+    assert capsys.readouterr().out.startswith("validated 47 documents")
 
 
 def test_secrets_are_referenced_by_exact_keys_and_provider_keys_are_litellm_only() -> None:
@@ -151,6 +168,40 @@ def test_validator_rejects_missing_metrics_discovery_and_anti_affinity(tmp_path:
     api["spec"]["template"]["spec"]["affinity"]["podAntiAffinity"] = {}
     _write_documents(tmp_path, documents)
     with pytest.raises(KubernetesContractError, match="anti-affinity"):
+        validate_kubernetes_contract(tmp_path)
+
+
+def test_validator_rejects_node_workspace_namespace_mismatch(tmp_path: Path) -> None:
+    documents = [copy.deepcopy(item) for item in load_manifest_documents(ROOT)]
+    node = next(
+        item
+        for item in documents
+        if item["kind"] == "DaemonSet" and item["metadata"]["name"] == "sandbox-node-agent"
+    )
+    container = node["spec"]["template"]["spec"]["containers"][0]
+    workspace_mount = next(
+        item for item in container["volumeMounts"] if item["name"] == "workspaces"
+    )
+    workspace_mount["mountPath"] = "/workspaces"
+    _write_documents(tmp_path, documents)
+
+    with pytest.raises(KubernetesContractError, match="identical host and container path"):
+        validate_kubernetes_contract(tmp_path)
+
+
+def test_validator_rejects_shared_worker_identity(tmp_path: Path) -> None:
+    documents = [copy.deepcopy(item) for item in load_manifest_documents(ROOT)]
+    worker = next(
+        item
+        for item in documents
+        if item["kind"] == "Deployment" and item["metadata"]["name"] == "agent-worker"
+    )
+    container = worker["spec"]["template"]["spec"]["containers"][0]
+    instance = next(item for item in container["env"] if item["name"] == "AGENT_WORKER_INSTANCE_ID")
+    instance["valueFrom"] = {"fieldRef": {"fieldPath": "metadata.name"}}
+    _write_documents(tmp_path, documents)
+
+    with pytest.raises(KubernetesContractError, match="must come from the pod UID"):
         validate_kubernetes_contract(tmp_path)
 
 

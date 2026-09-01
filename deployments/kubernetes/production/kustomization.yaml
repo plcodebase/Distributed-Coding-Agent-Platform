@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - admission-policy.yaml
+
+# This layer adds fail-closed admission only. A site-specific overlay must replace every
+# workload image with a registry digest, the documentation OIDC endpoints and managed-data
+# CIDRs, then label the target namespace agent-platform.openai.com/production=true.

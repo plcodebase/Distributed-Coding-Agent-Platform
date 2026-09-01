@@ -1,0 +1,77 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agent-platform-production-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  validations:
+    - expression: >-
+        object.spec.containers.all(container,
+          container.image.matches('^[^:@]+(?:/[^:@]+)+@sha256:[0-9a-f]{64}$')) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(container,
+          container.image.matches('^[^:@]+(?:/[^:@]+)+@sha256:[0-9a-f]{64}$'))) &&
+        (!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(container,
+          container.image.matches('^[^:@]+(?:/[^:@]+)+@sha256:[0-9a-f]{64}$')))
+      message: Every platform container image must use an immutable registry SHA-256 digest.
+    - expression: >-
+        object.spec.containers.all(container,
+          has(container.securityContext) &&
+          container.securityContext.allowPrivilegeEscalation == false &&
+          container.securityContext.readOnlyRootFilesystem == true &&
+          has(container.securityContext.capabilities) &&
+          container.securityContext.capabilities.drop.exists(capability, capability == 'ALL'))
+      message: Platform containers must retain the reviewed non-escalating read-only security context.
+    - expression: >-
+        object.spec.hostNetwork == false &&
+        object.spec.hostPID == false &&
+        object.spec.hostIPC == false &&
+        object.spec.automountServiceAccountToken == false &&
+        has(object.spec.securityContext) &&
+        object.spec.securityContext.runAsNonRoot == true &&
+        has(object.spec.securityContext.seccompProfile) &&
+        object.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+      message: Platform pods must remain non-root, isolated, tokenless, and seccomp-confined.
+    - expression: >-
+        object.spec.serviceAccountName == 'sandbox-node-agent'
+          ? object.spec.volumes.filter(volume, has(volume.hostPath)).all(volume,
+              (volume.name == 'podman-socket' &&
+               volume.hostPath.path == '/run/user/1000/podman/podman.sock' &&
+               volume.hostPath.type == 'Socket') ||
+              (volume.name == 'workspaces' &&
+               volume.hostPath.path == '/var/lib/agent-platform/workspaces' &&
+               volume.hostPath.type == 'Directory'))
+          : object.spec.volumes.all(volume, !has(volume.hostPath))
+      message: Host paths are prohibited except for the node agent's exact rootless socket and workspace.
+    - expression: >-
+        object.spec.serviceAccountName == 'sandbox-node-agent' ||
+        object.spec.containers.all(container,
+          !has(container.volumeMounts) || container.volumeMounts.all(mount,
+            mount.mountPath != '/run/user/1000/podman/podman.sock'))
+      message: Only the sandbox node agent may mount the rootless Podman socket.
+    - expression: >-
+        object.spec.serviceAccountName == 'litellm' ||
+        object.spec.containers.all(container,
+          (!has(container.envFrom) || container.envFrom.all(source,
+            !has(source.secretRef) || source.secretRef.name != 'agent-platform-provider')) &&
+          (!has(container.env) || container.env.all(variable,
+            !has(variable.valueFrom) || !has(variable.valueFrom.secretKeyRef) ||
+            variable.valueFrom.secretKeyRef.name != 'agent-platform-provider')))
+      message: Provider credentials may be referenced only by LiteLLM.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agent-platform-production-pods
+spec:
+  policyName: agent-platform-production-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        agent-platform.openai.com/production: "true"

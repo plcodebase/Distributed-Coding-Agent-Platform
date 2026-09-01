@@ -33,3 +33,12 @@ metadata: {name: litellm}
 spec:
   selector: {app.kubernetes.io/name: litellm}
   ports: [{name: http, port: 4000, targetPort: http}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: sandbox-node-agent}
+spec:
+  sessionAffinity: ClientIP
+  sessionAffinityConfig: {clientIP: {timeoutSeconds: 10800}}
+  selector: {app.kubernetes.io/name: sandbox-node-agent}
+  ports: [{name: https, port: 9443, targetPort: https}]

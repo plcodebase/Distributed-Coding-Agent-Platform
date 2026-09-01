@@ -8,6 +8,11 @@ data:
   AGENT_PLATFORM_LOG_LEVEL: INFO
   AGENT_PLATFORM_GATEWAY_URL: http://litellm:4000
   AGENT_PLATFORM_TELEMETRY_ENVIRONMENT: production
+  AGENT_PLATFORM_AUTH_MODE: oidc
+  AGENT_PLATFORM_OIDC_ISSUER: https://identity.example.invalid
+  AGENT_PLATFORM_OIDC_AUDIENCE: agent-platform
+  AGENT_PLATFORM_OIDC_JWKS_URL: https://identity.example.invalid/.well-known/jwks.json
+  AGENT_PLATFORM_S3_ENCRYPTION: AES256
 ---
 apiVersion: v1
 kind: ConfigMap

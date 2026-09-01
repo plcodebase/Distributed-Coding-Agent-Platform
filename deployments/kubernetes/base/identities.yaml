@@ -28,6 +28,12 @@ metadata:
   name: litellm
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-node-agent
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -53,3 +59,5 @@ subjects:
     name: agent-worker
   - kind: ServiceAccount
     name: litellm
+  - kind: ServiceAccount
+    name: sandbox-node-agent

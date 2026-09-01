@@ -38,14 +38,18 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        - podSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}
+        - podSelector:
+            matchExpressions:
+              - {key: app.kubernetes.io/name, operator: In, values: [agent-worker, scheduler]}
       ports: [{protocol: TCP, port: 4000}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: {name: allow-worker-to-litellm}
 spec:
-  podSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: In, values: [agent-worker, scheduler]}
   policyTypes: [Egress]
   egress:
     - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: litellm}}}]
@@ -84,15 +88,38 @@ spec:
 # endpoint ranges for each managed service. Keep these role-specific edges split.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
-metadata: {name: allow-api-database}
+metadata: {name: allow-api-data-services}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: agent-api}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.0.2.0/24}}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6379}, {protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-event-database}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: event-gateway}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.0.2.0/24}}]
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-control-plane-identity-egress}
 spec:
   podSelector:
     matchExpressions:
       - {key: app.kubernetes.io/name, operator: In, values: [agent-api, event-gateway]}
   policyTypes: [Egress]
   egress:
-    - to: [{ipBlock: {cidr: 192.0.2.0/24}}]
-      ports: [{protocol: TCP, port: 5432}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+      ports: [{protocol: TCP, port: 443}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -102,7 +129,7 @@ spec:
   policyTypes: [Egress]
   egress:
     - to: [{ipBlock: {cidr: 192.0.2.0/24}}]
-      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6379}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 6379}, {protocol: TCP, port: 443}]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -115,4 +142,33 @@ spec:
       ports:
         - {protocol: TCP, port: 5432}
         - {protocol: TCP, port: 6379}
-        - {protocol: TCP, port: 443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-worker-to-sandbox-node}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: sandbox-node-agent}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}}]
+      ports: [{protocol: TCP, port: 9443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-worker-sandbox-node-egress}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: agent-worker}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: sandbox-node-agent}}}]
+      ports: [{protocol: TCP, port: 9443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-sandbox-node-data-services}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: sandbox-node-agent}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.0.2.0/24}}]
+      ports: [{protocol: TCP, port: 5432}, {protocol: TCP, port: 443}]

@@ -1,6 +1,6 @@
 # ADR 0029: Kubernetes deployment boundary
 
-- Status: Accepted
+- Status: Accepted; amended by ADR 0033
 - Date: 2026-08-11
 - Sequence: 29
 
@@ -24,5 +24,6 @@ containers.
 ## Consequences
 
 The deployment security intent is reviewable without a cluster or Kubernetes client dependency.
-Operators must supply a safe cluster-specific sandbox composition; the base never grants a host
-runtime socket or privileged nested-container access.
+ADR 0033 supplies the reviewed sandbox composition. The trusted sandbox-node DaemonSet mounts only
+the rootless Podman service socket and exposes a private mTLS API; general workers and untrusted
+sandboxes receive neither a host runtime socket nor privileged nested-container access.

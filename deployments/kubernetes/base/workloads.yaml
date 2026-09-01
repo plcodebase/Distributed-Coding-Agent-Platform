@@ -42,8 +42,11 @@ spec:
           ports: [{name: http, containerPort: 8000}]
           envFrom: [{configMapRef: {name: agent-platform-config}}]
           env:
-            - {name: AGENT_PLATFORM_API_CREDENTIALS_JSON, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: api-credentials-json}}}
             - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: database-url}}}
+            - {name: AGENT_PLATFORM_REDIS_URL, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: redis-url}}}
+            - {name: AGENT_PLATFORM_S3_ENDPOINT, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: s3-endpoint}}}
+            - {name: AGENT_PLATFORM_S3_ACCESS_KEY, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: s3-access-key}}}
+            - {name: AGENT_PLATFORM_S3_SECRET_KEY, valueFrom: {secretKeyRef: {name: agent-platform-api-runtime, key: s3-secret-key}}}
           readinessProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /health/live, port: http}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
           resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: "1", memory: 1Gi}}
@@ -94,7 +97,6 @@ spec:
           ports: [{name: http, containerPort: 8000}]
           envFrom: [{configMapRef: {name: agent-platform-config}}]
           env:
-            - {name: AGENT_PLATFORM_EVENT_CREDENTIALS_JSON, valueFrom: {secretKeyRef: {name: agent-platform-event-runtime, key: event-credentials-json}}}
             - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-event-runtime, key: database-url}}}
           readinessProbe: {httpGet: {path: /health/ready, port: http}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /health/live, port: http}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
@@ -141,11 +143,16 @@ spec:
         - name: scheduler
           image: agent-platform:0.1.0
           imagePullPolicy: IfNotPresent
-          args: ["-m", "agent_scheduler", "--factory", "$(AGENT_PLATFORM_SCHEDULER_FACTORY)", "--operations-port", "9090"]
+          args: ["-m", "agent_scheduler", "--factory", "agent_scheduler.production:create_production_scheduler", "--operations-port", "9090"]
           env:
-            - {name: AGENT_PLATFORM_SCHEDULER_FACTORY, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: scheduler-factory}}}
+            - {name: AGENT_SCHEDULER_INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
             - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: database-url}}}
             - {name: AGENT_PLATFORM_REDIS_URL, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: redis-url}}}
+            - {name: AGENT_PLATFORM_S3_ENDPOINT, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: s3-endpoint}}}
+            - {name: AGENT_PLATFORM_S3_ACCESS_KEY, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: s3-access-key}}}
+            - {name: AGENT_PLATFORM_S3_SECRET_KEY, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: s3-secret-key}}}
+            - {name: AGENT_PLATFORM_GATEWAY_API_KEY, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: gateway-api-key}}}
+            - {name: AGENT_SCHEDULER_ROUTE_PRICES_JSON, valueFrom: {secretKeyRef: {name: agent-platform-scheduler-runtime, key: route-prices-json}}}
           envFrom: [{configMapRef: {name: agent-platform-config}}]
           readinessProbe: {httpGet: {path: /ready, port: ops}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
           livenessProbe: {httpGet: {path: /live, port: ops}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
@@ -181,7 +188,7 @@ spec:
       hostPID: false
       hostIPC: false
       terminationGracePeriodSeconds: 180
-      securityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       nodeSelector: {agent-platform.openai.com/sandbox-worker: "true"}
       tolerations:
         - {key: agent-platform.openai.com/sandbox-worker, operator: Equal, value: "true", effect: NoSchedule}
@@ -196,17 +203,18 @@ spec:
         - name: agent-worker
           image: agent-platform:0.1.0
           imagePullPolicy: IfNotPresent
-          args: ["-m", "agent_worker", "--factory", "$(AGENT_PLATFORM_WORKER_FACTORY)", "--processes", "1", "--operations-port", "9090"]
+          args: ["-m", "agent_worker", "--factory", "agent_worker.production:create_production_worker", "--processes", "1", "--operations-port", "9090"]
           env:
-            - {name: AGENT_PLATFORM_WORKER_FACTORY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: worker-factory}}}
-            - {name: AGENT_PLATFORM_WORKER_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
+            - {name: AGENT_WORKER_INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
             - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: database-url}}}
             - {name: AGENT_PLATFORM_REDIS_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: redis-url}}}
-            - {name: AGENT_PLATFORM_OBJECT_STORE_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-url}}}
-            - {name: AGENT_PLATFORM_OBJECT_STORE_ACCESS_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-access-key}}}
-            - {name: AGENT_PLATFORM_OBJECT_STORE_SECRET_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: object-store-secret-key}}}
             - {name: AGENT_PLATFORM_GATEWAY_API_KEY, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: gateway-api-key}}}
-            - {name: AGENT_PLATFORM_WORKSPACE_SNAPSHOT_URL, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: workspace-snapshot-url}}}
+            - {name: AGENT_WORKER_ROUTE_PRICES_JSON, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: route-prices-json}}}
+            - {name: AGENT_WORKER_ROUTE_CONTEXT_BUDGETS_JSON, valueFrom: {secretKeyRef: {name: agent-platform-worker-runtime, key: route-context-budgets-json}}}
+            - {name: AGENT_WORKER_NODE_AGENT_URL, value: https://sandbox-node-agent:9443}
+            - {name: AGENT_WORKER_NODE_AGENT_CA_FILE, value: /var/run/agent-node-tls/ca.crt}
+            - {name: AGENT_WORKER_NODE_AGENT_CERTIFICATE_FILE, value: /var/run/agent-node-tls/tls.crt}
+            - {name: AGENT_WORKER_NODE_AGENT_PRIVATE_KEY_FILE, value: /var/run/agent-node-tls/tls.key}
           envFrom: [{configMapRef: {name: agent-platform-config}}]
           ports: [{name: ops, containerPort: 9090}]
           readinessProbe: {httpGet: {path: /ready, port: ops}, periodSeconds: 3, timeoutSeconds: 2, failureThreshold: 2}
@@ -222,10 +230,10 @@ spec:
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 65532, runAsGroup: 65532, capabilities: {drop: [ALL]}}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}
-            - {name: workspaces, mountPath: /workspaces}
+            - {name: node-tls, mountPath: /var/run/agent-node-tls, readOnly: true}
       volumes:
         - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
-        - {name: workspaces, emptyDir: {sizeLimit: 20Gi}}
+        - {name: node-tls, secret: {secretName: agent-platform-worker-node-tls, defaultMode: 0440}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -283,3 +291,71 @@ spec:
       volumes:
         - {name: config, configMap: {name: litellm-config}}
         - {name: tmp, emptyDir: {sizeLimit: 64Mi}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sandbox-node-agent
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: sandbox-node-agent}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: sandbox-node-agent, agent-platform.openai.com/role: sandbox-node}
+    spec:
+      serviceAccountName: sandbox-node-agent
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 180
+      nodeSelector: {agent-platform.openai.com/sandbox-worker: "true"}
+      tolerations:
+        - {key: agent-platform.openai.com/sandbox-worker, operator: Equal, value: "true", effect: NoSchedule}
+      securityContext: {runAsNonRoot: true, fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app.kubernetes.io/name: sandbox-node-agent}}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app.kubernetes.io/name: sandbox-node-agent}}}
+      containers:
+        - name: sandbox-node-agent
+          image: agent-platform-node:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["-m", "sandbox_node_agent"]
+          ports: [{name: https, containerPort: 9443}]
+          envFrom: [{configMapRef: {name: agent-platform-config}}]
+          env:
+            - {name: AGENT_PLATFORM_DATABASE_URL, valueFrom: {secretKeyRef: {name: agent-platform-node-runtime, key: database-url}}}
+            - {name: AGENT_PLATFORM_S3_ENDPOINT, valueFrom: {secretKeyRef: {name: agent-platform-node-runtime, key: s3-endpoint}}}
+            - {name: AGENT_PLATFORM_S3_ACCESS_KEY, valueFrom: {secretKeyRef: {name: agent-platform-node-runtime, key: s3-access-key}}}
+            - {name: AGENT_PLATFORM_S3_SECRET_KEY, valueFrom: {secretKeyRef: {name: agent-platform-node-runtime, key: s3-secret-key}}}
+            - {name: AGENT_NODE_SANDBOX_IMAGE, valueFrom: {secretKeyRef: {name: agent-platform-node-runtime, key: sandbox-image-digest}}}
+            - {name: AGENT_NODE_WORKSPACE_PARENT, value: /var/lib/agent-platform/workspaces}
+            - {name: AGENT_NODE_PODMAN_EXECUTABLE, value: /usr/bin/podman}
+            - {name: AGENT_NODE_PODMAN_SOCKET, value: /run/user/1000/podman/podman.sock}
+            - {name: AGENT_NODE_PODMAN_HOME, value: /home/agent-node}
+            - {name: AGENT_NODE_GIT_EXECUTABLE, value: /usr/bin/git}
+            - {name: AGENT_NODE_RIPGREP_EXECUTABLE, value: /usr/bin/rg}
+            - {name: AGENT_NODE_TLS_CA_FILE, value: /var/run/agent-node-tls/ca.crt}
+            - {name: AGENT_NODE_TLS_CERTIFICATE_FILE, value: /var/run/agent-node-tls/tls.crt}
+            - {name: AGENT_NODE_TLS_PRIVATE_KEY_FILE, value: /var/run/agent-node-tls/tls.key}
+          readinessProbe: {tcpSocket: {port: https}, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3}
+          livenessProbe: {tcpSocket: {port: https}, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 3}
+          resources: {requests: {cpu: 500m, memory: 512Mi}, limits: {cpu: "2", memory: 2Gi}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsUser: 1000, runAsGroup: 1000, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: workspaces, mountPath: /var/lib/agent-platform/workspaces}
+            - {name: podman-socket, mountPath: /run/user/1000/podman/podman.sock}
+            - {name: node-home, mountPath: /home/agent-node}
+            - {name: node-tls, mountPath: /var/run/agent-node-tls, readOnly: true}
+      volumes:
+        - {name: tmp, emptyDir: {sizeLimit: 256Mi}}
+        - {name: workspaces, hostPath: {path: /var/lib/agent-platform/workspaces, type: Directory}}
+        - {name: podman-socket, hostPath: {path: /run/user/1000/podman/podman.sock, type: Socket}}
+        - {name: node-home, emptyDir: {sizeLimit: 64Mi}}
+        - {name: node-tls, secret: {secretName: agent-platform-node-tls, defaultMode: 0440}}
