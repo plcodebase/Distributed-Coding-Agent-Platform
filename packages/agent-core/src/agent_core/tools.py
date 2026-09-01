@@ -27,6 +27,7 @@ class ToolEffect(StrEnum):
     WORKSPACE_MUTATION = "workspace_mutation"
     COMMAND = "command"
     INTERACTION = "interaction"
+    CONTROL_MUTATION = "control_mutation"
 
 
 class ToolExecutionContext(DomainModel):
@@ -195,6 +196,24 @@ class ToolRegistry:
     @property
     def definitions(self) -> tuple[GatewayToolDefinition, ...]:
         return self._definitions
+
+    @property
+    def registrations(self) -> tuple[ToolRegistration, ...]:
+        """Return immutable registrations for explicit composition of capability sets."""
+
+        return tuple(self._tools[definition.name] for definition in self._definitions)
+
+    def effect(self, tool_name: str) -> ToolEffect:
+        """Return a registered tool's declared effect without preparing a call."""
+
+        registration = self._tools.get(tool_name)
+        if registration is None:
+            raise DomainOperationError(
+                code="unknown_tool",
+                message="the requested tool is not registered",
+                details={"tool_name": tool_name},
+            )
+        return registration.effect
 
     def prepare(
         self,

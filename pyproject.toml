@@ -16,6 +16,7 @@ dependencies = [
   "platform-telemetry",
   "queue-wakeup",
   "sandbox-runtime",
+  "sandbox-node-agent",
 ]
 
 [dependency-groups]
@@ -31,6 +32,7 @@ dev = [
   "pyyaml>=6,<7",
   "ruff>=0.12,<1",
   "types-pyyaml>=6,<7",
+  "types-jsonschema>=4.25,<5",
   "websockets>=15,<16",
 ]
 
@@ -50,6 +52,7 @@ platform-persistence = { workspace = true }
 platform-telemetry = { workspace = true }
 queue-wakeup = { workspace = true }
 sandbox-runtime = { workspace = true }
+sandbox-node-agent = { workspace = true }
 
 [tool.uv.workspace]
 members = [
@@ -65,6 +68,7 @@ members = [
   "packages/queue-wakeup",
   "packages/telemetry",
   "packages/sandbox-runtime",
+  "packages/sandbox-node-agent",
 ]
 
 [tool.pytest.ini_options]
@@ -96,6 +100,7 @@ source = [
   "platform_telemetry",
   "queue_wakeup",
   "sandbox_runtime",
+  "sandbox_node_agent",
   "scripts",
 ]
 
@@ -126,6 +131,7 @@ src = [
   "packages/telemetry/src",
   "packages/queue-wakeup/src",
   "packages/sandbox-runtime/src",
+  "packages/sandbox-node-agent/src",
   "scripts",
   "tests",
 ]
@@ -182,6 +188,7 @@ mypy_path = [
   "packages/telemetry/src",
   "packages/queue-wakeup/src",
   "packages/sandbox-runtime/src",
+  "packages/sandbox-node-agent/src",
 ]
 
 [[tool.mypy.overrides]]

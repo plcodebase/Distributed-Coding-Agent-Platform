@@ -22,6 +22,7 @@ members = [
     "platform-persistence",
     "platform-telemetry",
     "queue-wakeup",
+    "sandbox-node-agent",
     "sandbox-runtime",
 ]
 
@@ -95,6 +96,7 @@ dependencies = [
     { name = "platform-persistence" },
     { name = "platform-telemetry" },
     { name = "queue-wakeup" },
+    { name = "sandbox-node-agent" },
     { name = "sandbox-runtime" },
 ]
 
@@ -110,6 +112,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pyyaml" },
     { name = "ruff" },
+    { name = "types-jsonschema" },
     { name = "types-pyyaml" },
     { name = "websockets" },
 ]
@@ -127,6 +130,7 @@ requires-dist = [
     { name = "platform-persistence", editable = "packages/persistence" },
     { name = "platform-telemetry", editable = "packages/telemetry" },
     { name = "queue-wakeup", editable = "packages/queue-wakeup" },
+    { name = "sandbox-node-agent", editable = "packages/sandbox-node-agent" },
     { name = "sandbox-runtime", editable = "packages/sandbox-runtime" },
 ]
 
@@ -142,6 +146,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.2,<8" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", specifier = ">=0.12,<1" },
+    { name = "types-jsonschema", specifier = ">=4.25,<5" },
     { name = "types-pyyaml", specifier = ">=6,<7" },
     { name = "websockets", specifier = ">=15,<16" },
 ]
@@ -2119,6 +2124,37 @@ wheels = [
 ]
 
 [[package]]
+name = "sandbox-node-agent"
+version = "0.1.0"
+source = { editable = "packages/sandbox-node-agent" }
+dependencies = [
+    { name = "agent-core" },
+    { name = "artifact-store" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "jsonschema" },
+    { name = "platform-persistence" },
+    { name = "platform-telemetry" },
+    { name = "pydantic-settings" },
+    { name = "sandbox-runtime" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "agent-core", editable = "packages/agent-core" },
+    { name = "artifact-store", editable = "packages/artifact-store" },
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "jsonschema", specifier = ">=4.25,<5" },
+    { name = "platform-persistence", editable = "packages/persistence" },
+    { name = "platform-telemetry", editable = "packages/telemetry" },
+    { name = "pydantic-settings", specifier = ">=2.9,<3" },
+    { name = "sandbox-runtime", editable = "packages/sandbox-runtime" },
+    { name = "uvicorn", specifier = ">=0.34,<1" },
+]
+
+[[package]]
 name = "sandbox-runtime"
 version = "0.1.0"
 source = { editable = "packages/sandbox-runtime" }
@@ -2305,6 +2341,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/21/3b/6c24bec5be5e743ffd99576daa5cc077722fc7d5bbc00bd133fa0c698dc6/tqdm-4.70.0.tar.gz", hash = "sha256:55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220", size = 795438, upload-time = "2026-07-27T11:33:15.271Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f9/1c/01bfd571a64e7f270e6bab5e33777debe0edc56759233ce84f27dec92d14/tqdm-4.70.0-py3-none-any.whl", hash = "sha256:7f585706bfddbdebf89daac705b2dfcc16890130727d3197ca62c732b4310953", size = 80184, upload-time = "2026-07-27T11:33:13.167Z" },
+]
+
+[[package]]
+name = "types-jsonschema"
+version = "4.26.0.20260518"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "referencing" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/46/73b6a5d61a61015c4248030a8cb07e5bdddb4041430fae9e585a68692578/types_jsonschema-4.26.0.20260518.tar.gz", hash = "sha256:e1dd53dc97a64f5eccdd6fa9839666e09bb500a8ebba2db6fdaf1789faea81a6", size = 16638, upload-time = "2026-05-18T06:06:44.106Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/d5/134f8a147dcecda10db7f60cfc6af0578a25a5c53c87b3907a64385e0184/types_jsonschema-4.26.0.20260518-py3-none-any.whl", hash = "sha256:30b30a518c7fe335df85c919fcbcc631b69c03d4a4b5b632fa916bea03065307", size = 16072, upload-time = "2026-05-18T06:06:43.264Z" },
 ]
 
 [[package]]

@@ -1,0 +1,31 @@
+[project]
+name = "sandbox-node-agent"
+version = "0.1.0"
+description = "Mutually authenticated remote boundary for rootless Podman sandboxes"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "agent-core",
+  "artifact-store",
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "jsonschema>=4.25,<5",
+  "platform-persistence",
+  "platform-telemetry",
+  "pydantic-settings>=2.9,<3",
+  "sandbox-runtime",
+  "uvicorn>=0.34,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sandbox_node_agent"]
+
+[tool.uv.sources]
+agent-core = { workspace = true }
+artifact-store = { workspace = true }
+platform-persistence = { workspace = true }
+platform-telemetry = { workspace = true }
+sandbox-runtime = { workspace = true }

@@ -1,0 +1,32 @@
+ARG PYTHON_BASE_IMAGE=python:3.12.11-slim-bookworm
+FROM ${PYTHON_BASE_IMAGE} AS build
+
+ARG UV_VERSION=0.8.14
+WORKDIR /workspace
+
+RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
+
+COPY pyproject.toml uv.lock ./
+COPY apps ./apps
+COPY packages ./packages
+RUN uv sync --frozen --no-dev
+
+FROM ${PYTHON_BASE_IMAGE}
+
+ENV PATH="/workspace/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/home/agent-node \
+    XDG_RUNTIME_DIR=/run/user/1000
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git podman ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 agent-node \
+    && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin agent-node
+
+WORKDIR /workspace
+COPY --from=build --chown=1000:1000 /workspace /workspace
+USER 1000:1000
+
+ENTRYPOINT ["python"]
