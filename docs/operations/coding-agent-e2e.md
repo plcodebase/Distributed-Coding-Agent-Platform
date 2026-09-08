@@ -1,6 +1,6 @@
-# Coding-agent happy-path E2E
+# Coding-agent local E2E
 
-The opt-in happy-path test proves that a deterministic coding task crosses the real model,
+The opt-in tests prove that deterministic coding tasks cross the real model,
 tool, workspace, and command-isolation boundaries. It is intentionally separate from the fast
 unit and integration suites because it builds images and starts local Podman services.
 
@@ -15,6 +15,11 @@ The checked-in fixture contains an `add()` implementation that subtracts and a l
 3. edit `calculator.py` using the fixture's exact SHA-256 precondition;
 4. execute `python -m unittest -v`;
 5. return a final completion.
+
+A second `[fixture:calculator-retry-v1]` journey deliberately applies an incorrect multiplication,
+runs the repository tests and receives a structured `command_failed` result, corrects the edit using
+the new content hash, and reruns the tests successfully. Both journeys execute twice and require
+byte-identical final patches across independent workspaces.
 
 This is not a mocked `ModelGateway`: the test uses the OpenAI Agents SDK adapter and
 `GatewayClient`, with fragmented function-call arguments delivered by the OpenAI-compatible
@@ -49,9 +54,9 @@ host command execution.
 The test fails unless all of the following are true:
 
 - the original test fails inside the Podman sandbox before the agent runs;
-- tool calls arrive in the expected read/read/edit/command sequence;
+- tool calls arrive in the expected successful or fail-then-correct sequence;
 - all tool arguments pass the production schemas and the edit hash matches;
-- the edit and command each create a checkpoint before execution;
+- every edit and command creates a checkpoint before execution, including the failed verification;
 - the sandboxed command succeeds and emits `OK` through the bounded output stream;
 - event sequence numbers are contiguous and the run has the expected final text;
 - the final test passes again in a new disposable command container;
@@ -89,7 +94,9 @@ tracked change appears in non-mutating current-diff context, the repository test
 restore, each side-effecting tool executes once, events replay in order, and the tenant-scoped final
 patch downloads with its recorded checksum. It then rewinds to the first pre-tool checkpoint, runs a
 different approved edit on a new execution epoch, and proves active and abandoned branch artifacts
-remain distinct and auditable.
+remain distinct and auditable. It also proves run-submission idempotency, conflict rejection,
+cross-tenant denial for sessions/events/approvals/rewind/artifacts, and duplicate approval replay
+without duplicate execution.
 
 The target removes only its derived `agent-platform-distributed` containers, network, and volumes.
 It also rehearses a full Alembic downgrade-to-base and upgrade-to-head against that disposable
@@ -100,7 +107,8 @@ Run the deterministic target on a dedicated rootless-Podman CI runner. Add a sep
 evaluation gate; model drift must not make the release smoke test nondeterministic.
 
 This journey proves the local production boundary and arbitrary branch-safe rewind, not production
-scale. Remaining acceptance work includes concurrent workers, real provider failover, Redis-loss
-polling, API reconnect through a real network server, a rendered site Kubernetes overlay, and
-immutable revision/image/report evidence from the release environment. See
+scale. A separate real-Redis suite stops its exact test service and proves PostgreSQL creation and
+polling remain authoritative before Redis readiness recovers. Remaining acceptance work includes
+real provider failover, a rendered site Kubernetes overlay, and immutable revision/image/report
+evidence from the release environment. See
 `docs/architecture/production-readiness.md` for the complete closure plan.

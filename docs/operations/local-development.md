@@ -50,6 +50,12 @@ non-production token. Do not put a real identity-provider credential in source c
 Use `make migration-check` after changing persistence models. Run
 `make postgres-security` for the opt-in real-PostgreSQL migration, idempotency,
 shared-policy, concurrent-sequence, and replay suite.
+Run `make redis-security ENV_FILE=.env.example` to verify real wake-up delivery and prove a Redis
+outage does not prevent durable PostgreSQL run creation or polling-based claims.
+
+For the complete deterministic local acceptance matrix, start a healthy rootless Podman machine and
+run `make local-acceptance ENV_FILE=.env.example`. Generated evaluation evidence is written beneath
+`.cache/acceptance/<revision>/`; the checked-in simulation baseline is not modified.
 
 ## Local CLI
 

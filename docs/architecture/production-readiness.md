@@ -1,6 +1,6 @@
 # Production readiness review
 
-Reviewed against the original implementation design on 2026-08-21. The user's Podman-only
+Reviewed against the original implementation design on 2026-09-01. The user's Podman-only
 requirement supersedes every Docker reference in that draft. No Docker-compatible daemon, socket,
 CLI, build, or test path is part of the supported architecture.
 
@@ -61,7 +61,7 @@ builder will accept them.
 | Capability | Current evidence |
 |---|---|
 | Deterministic coding-agent orchestration | Integrated and extensively unit/integration tested. The platform loop, not SDK `Runner`, owns turns, tools, limits, retries, redaction, events, and duplicate suppression. |
-| Real coding happy path | Live-verified locally through LiteLLM, the Agents SDK adapter, Git worktree tools, and a rootless-Podman command sandbox. |
+| Real coding journeys | Live-verified locally through LiteLLM, the Agents SDK adapter, Git worktree tools, and a rootless-Podman command sandbox. The deterministic matrix covers both a direct repair and a wrong edit followed by failed verification, hash-aware correction, and successful verification. Each journey runs twice and requires byte-identical patches. |
 | Distributed production-boundary path | Live-verified locally with real PostgreSQL, MinIO, TLS 1.3 mTLS node transport, rootless Podman, project instructions, explicit file references, current-diff context, two approvals, branch-scoped checkpoints, five sequential worker instances, restore, ordered replay, and distinct epoch patches. The model is deterministic and provider-neutral. |
 | Durable recovery after ordinary suspension/loss | Integrated. Checkpoint messages are combined with validated journal suffixes, terminal outcomes are replayed, and worker capacity is released while suspended. |
 | Arbitrary rewind | Live-verified locally. Rewind atomically seeds a new epoch from the selected prefix, restores the pre-tool workspace snapshot, preserves abandoned rows and artifacts for audit, fences stale workers, and produces a distinct active replacement patch. Target-cluster evidence remains outstanding. |
@@ -183,22 +183,36 @@ Fresh local evidence for this review:
 
 - `make release-check`: passed;
 - Ruff formatting and lint: passed;
-- strict mypy: passed for 220 source files;
-- unit tests: 855 passed;
-- branch coverage: 85.47% against an 85% gate;
-- integration tests: 5 passed, including 2 real uvicorn/TCP event-gateway cases;
+- strict mypy: passed for 221 source files;
+- unit tests: 856 passed;
+- branch coverage: 85.48% against an 85% gate;
+- integration tests: 7 passed, including malformed fragmented SDK arguments, stale-edit recovery,
+  and the existing real uvicorn/TCP event-gateway cases;
 - pre-commit: passed;
 - frozen dependency audit: no known vulnerabilities;
 - lock verification: passed;
 - package build: all 14 workspace packages produced an sdist and wheel;
+- all 30 coding fixtures, all 9 load profiles, all 10 chaos scenarios, and the deployment
+  simulation passed harness validation; generated evidence was written only under the ignored
+  `.cache/acceptance/<revision>/` directory and is not live-performance evidence;
+- rootless-Podman sandbox security suite: 8 passed in 16.79 seconds;
+- LiteLLM routing, streaming, and compatible-provider fallback suite: 3 passed in 73.87 seconds;
 - lifecycle persistence adapter: 93% branch coverage from deterministic repository tests;
-- real-PostgreSQL security and persistence suite: 18 passed, including lifecycle and an isolated
-  restore verification;
+- real-PostgreSQL security and persistence suite: 18 passed in 9.19 seconds, including lifecycle
+  and an isolated restore verification;
+- real-Redis wake-up and outage suite: 2 passed in 1.29 seconds, including durable PostgreSQL
+  creation and polling while the exact test Redis service was stopped, followed by readiness
+  recovery;
 - focused real-PostgreSQL context/task/memory recomposition: 1 passed, including immutable
   submission reference recovery;
-- distributed production-boundary E2E: 1 passed locally in 21.70 seconds with real PostgreSQL,
+- coding-agent E2E: 2 passed in 19.96 seconds; both journeys ran twice internally and required
+  deterministic patches, source-checkout preservation, checkpoint ordering, and canary redaction;
+- distributed production-boundary E2E: 1 passed locally in 13.96 seconds with real PostgreSQL,
   MinIO, TLS 1.3 mTLS node transport, rootless Podman, and every production workspace-context
-  source asserted in recorded model requests.
+  source asserted in recorded model requests;
+- isolated full-stack acceptance: migration downgrade/upgrade/check and 11 PostgreSQL, Redis,
+  MinIO, LiteLLM route, Prometheus, and Grafana checks passed; all dedicated project resources were
+  removed afterward.
 
 The local E2E result is functional evidence, not a latency target or production benchmark.
 
@@ -208,11 +222,15 @@ The release candidate should pass, from a clean checkout:
 make release-check
 make kubernetes-contract
 make postgres-security
+make redis-security ENV_FILE=.env.example
 make sandbox-security
 make gateway-security
 make e2e-happy
 make distributed-e2e
 ```
+
+The same deterministic local matrix is composed by
+`make local-acceptance ENV_FILE=.env.example` on a healthy rootless Podman engine.
 
 It must also pass the rendered site-overlay/admission checks and the live campaigns above. Pure
 process entrypoints and dependency-construction roots are excluded from line-coverage measurement;

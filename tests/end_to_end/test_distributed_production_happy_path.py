@@ -18,7 +18,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from agent_api import ApiServices, Principal, StaticTokenAuthenticator, create_app
 from agent_core.artifacts import DurableSnapshotReference
@@ -66,7 +66,7 @@ from platform_persistence import (
     PostgresWorkspaceRepository,
 )
 from platform_persistence.distributed import PostgresRecoveryStore
-from platform_persistence.models import CheckpointRecord, ToolCallRecord
+from platform_persistence.models import CheckpointRecord, RunRecord, ToolCallRecord
 from platform_telemetry import PlatformTelemetry, Redactor, TelemetrySettings
 from sandbox_node_agent import NodeAgentTlsSettings, create_client_ssl_context, serve_node_agent
 from sandbox_node_agent.production import ProductionNodeSettings, create_production_node_app
@@ -476,6 +476,45 @@ async def test_api_s3_mtls_node_approval_recovery_and_patch_happy_path(  # noqa:
             )
             assert run_response.status_code == 200
             run_id = uuid.UUID(run_response.json()["run"]["id"])
+            replayed_submission = await api.post(
+                f"/v1/sessions/{session_id}/runs",
+                headers={**authorization, "idempotency-key": "distributed-production-e2e"},
+                json={
+                    "task": "Fix calculator.add and run the repository tests.",
+                    "priority": 100,
+                    "referenced_files": [{"path": "README.md"}],
+                },
+            )
+            assert replayed_submission.status_code == 200
+            assert replayed_submission.json()["created"] is False
+            assert replayed_submission.json()["run"]["id"] == str(run_id)
+            conflicting_submission = await api.post(
+                f"/v1/sessions/{session_id}/runs",
+                headers={**authorization, "idempotency-key": "distributed-production-e2e"},
+                json={
+                    "task": "Fix calculator.add and run the repository tests.",
+                    "priority": 100,
+                    "referenced_files": [{"path": "calculator.py"}],
+                },
+            )
+            assert conflicting_submission.status_code == 409
+            assert conflicting_submission.json()["error"]["code"] == "run_idempotency_conflict"
+            assert (
+                await api.get(
+                    f"/v1/sessions/{session_id}",
+                    headers={"authorization": f"Bearer {_OTHER_TOKEN}"},
+                )
+            ).status_code == 404
+            async with database.sessions() as submission_query:
+                run_count = await submission_query.scalar(
+                    select(func.count())
+                    .select_from(RunRecord)
+                    .where(
+                        RunRecord.tenant_id == _TENANT_ID,
+                        RunRecord.session_id == session_id,
+                    )
+                )
+            assert run_count == 1
 
             tls_root = tmp_path / "tls"
             tls_root.mkdir(mode=0o700)
@@ -591,12 +630,26 @@ async def test_api_s3_mtls_node_approval_recovery_and_patch_happy_path(  # noqa:
             waiting = await runs.get(_TENANT_ID, run_id)
             assert waiting is not None and waiting.status is RunStatus.WAITING_APPROVAL
             edit_approval = await _approval_id(api, run_id, 0)
+            cross_tenant_approval = await api.post(
+                f"/v1/runs/{run_id}/approvals/{edit_approval}",
+                headers={"authorization": f"Bearer {_OTHER_TOKEN}"},
+                json={"approved": True},
+            )
+            assert cross_tenant_approval.status_code == 404
             approved = await api.post(
                 f"/v1/runs/{run_id}/approvals/{edit_approval}",
                 headers=authorization,
                 json={"approved": True},
             )
             assert approved.status_code == 200
+            repeated_approval = await api.post(
+                f"/v1/runs/{run_id}/approvals/{edit_approval}",
+                headers=authorization,
+                json={"approved": True},
+            )
+            assert repeated_approval.status_code == 200
+            assert repeated_approval.json()["id"] == approved.json()["id"]
+            assert repeated_approval.json()["status"] == "approved"
             resumed = await runs.get(_TENANT_ID, run_id)
             assert resumed is not None and resumed.status is RunStatus.QUEUED
 
@@ -634,6 +687,12 @@ async def test_api_s3_mtls_node_approval_recovery_and_patch_happy_path(  # noqa:
                 headers=authorization,
             )
             assert replay.status_code == 200
+            assert (
+                await api.get(
+                    f"/v1/runs/{run_id}/events?limit=100",
+                    headers={"authorization": f"Bearer {_OTHER_TOKEN}"},
+                )
+            ).status_code == 404
             replayed_events = replay.json()["events"]
             failures = [
                 item["payload"] for item in replayed_events if item["event_type"] == "run.failed"
@@ -777,6 +836,13 @@ async def test_api_s3_mtls_node_approval_recovery_and_patch_happy_path(  # noqa:
                 assert completed_snapshot_uri is not None
                 reference = DurableSnapshotReference.from_uri(completed_snapshot_uri)
                 assert await objects.head(reference.object_key) is not None
+
+            cross_tenant_rewind = await api.post(
+                f"/v1/runs/{run_id}/rewind",
+                headers={"authorization": f"Bearer {_OTHER_TOKEN}"},
+                json={"checkpoint_id": str(checkpoint_rows[0].id)},
+            )
+            assert cross_tenant_rewind.status_code == 404
 
             rewind_response = await api.post(
                 f"/v1/runs/{run_id}/rewind",

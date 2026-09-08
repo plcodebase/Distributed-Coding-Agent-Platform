@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from agent_core.domain.status import ToolCallStatus
 from agent_core.events import (
     CheckpointCreatedEvent,
     RunCompletedEvent,
@@ -173,3 +174,146 @@ async def test_fake_model_executes_read_edit_and_command_in_isolated_workspace(
         assert not (source / "command.txt").exists()
     finally:
         await sandbox.destroy()
+
+
+async def test_agent_recovers_from_stale_edit_without_mutating_the_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+    create_repository(source)
+    source_head = git(source, "rev-parse", "HEAD")
+    source_status = git(source, "status", "--porcelain=v2", "--branch")
+    original_hash = hashlib.sha256(b"value = 1\n").hexdigest()
+
+    workspace = GitWorktreeManager(worktree_parent=worktrees).create(
+        source,
+        run_id="integration-stale-edit",
+    )
+    sandbox = LocalSandbox(
+        workspace,
+        unsafe_allow_host_execution=True,
+        runtime_environment="test",
+    )
+    checkpoints = InMemoryCheckpointCoordinator(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        workspace=workspace,
+        clock=SteppingClock(NOW),
+        cancel_active=sandbox.cancel_active,
+    )
+    tools = WorkspaceToolset(workspace, sandbox=sandbox).registry(
+        include_edit=True,
+        include_command=True,
+    )
+    gateway = ScriptedModelGateway(
+        [
+            ScriptedGatewayTurn.tool_calls(
+                GatewayToolCall(
+                    id="read-stale",
+                    name="read_file",
+                    arguments={"path": "main.py"},
+                )
+            ),
+            ScriptedGatewayTurn.tool_calls(
+                GatewayToolCall(
+                    id="edit-stale",
+                    name="edit_file",
+                    arguments={
+                        "path": "main.py",
+                        "expected_sha256": "0" * 64,
+                        "old_text": "value = 1",
+                        "new_text": "value = 2",
+                    },
+                )
+            ),
+            ScriptedGatewayTurn.tool_calls(
+                GatewayToolCall(
+                    id="edit-retry",
+                    name="edit_file",
+                    arguments={
+                        "path": "main.py",
+                        "expected_sha256": original_hash,
+                        "old_text": "value = 1",
+                        "new_text": "value = 2",
+                    },
+                )
+            ),
+            ScriptedGatewayTurn.tool_calls(
+                GatewayToolCall(
+                    id="verify-retry",
+                    name="run_command",
+                    arguments={
+                        "argv": [
+                            sys.executable,
+                            "-c",
+                            (
+                                "from pathlib import Path;"
+                                "assert Path('main.py').read_text() == 'value = 2\\n';"
+                                "print('verified')"
+                            ),
+                        ],
+                        "timeout_seconds": 2,
+                    },
+                )
+            ),
+            ScriptedGatewayTurn.text("Recovered from the stale edit and verified the change."),
+        ]
+    )
+    loop = AgentLoop(
+        gateway=gateway,
+        tools=tools,
+        clock=SteppingClock(NOW),
+        id_generator=SequentialIdGenerator(),
+        checkpoints=checkpoints,
+    )
+
+    try:
+        events = [
+            event
+            async for event in loop.run(
+                AgentLoopInput(
+                    tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+                    session_id=SESSION_ID,
+                    run_id=RUN_ID,
+                    attempt=1,
+                    worker_id="worker-stale-edit",
+                    route_name="coding-default",
+                    messages=(
+                        GatewayMessage(
+                            role=MessageRole.USER,
+                            content="Update the value, recover from conflicts, and verify it.",
+                        ),
+                    ),
+                    task_plan={"steps": [{"title": "update and verify", "done": False}]},
+                )
+            )
+        ]
+
+        failed_edit = next(
+            event
+            for event in events
+            if isinstance(event, ToolCompletedEvent) and event.payload.tool_call_id == "edit-stale"
+        )
+        assert failed_edit.payload.status is ToolCallStatus.FAILED
+        assert failed_edit.payload.error is not None
+        assert failed_edit.payload.error.code == "edit_hash_conflict"
+        assert "edit_hash_conflict" in gateway.requests[2].messages[-1].content
+        assert isinstance(events[-1], RunCompletedEvent)
+        assert events[-1].payload.final_text == (
+            "Recovered from the stale edit and verified the change."
+        )
+        assert sum(isinstance(event, ToolCompletedEvent) for event in events) == 4
+        assert sum(isinstance(event, CheckpointCreatedEvent) for event in events) == 3
+        assert workspace.file_bytes("main.py") == b"value = 2\n"
+        patch = workspace.final_patch()
+        assert b"value = 2" in patch
+        assert b"value = 1" in patch
+    finally:
+        await sandbox.destroy()
+
+    assert tuple(worktrees.iterdir()) == ()
+    assert git(source, "rev-parse", "HEAD") == source_head
+    assert git(source, "status", "--porcelain=v2", "--branch") == source_status
+    assert (source / "main.py").read_bytes() == b"value = 1\n"

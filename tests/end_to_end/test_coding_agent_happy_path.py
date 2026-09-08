@@ -44,9 +44,13 @@ pytestmark = [
 ]
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "calculator_bug"
-_TASK = (
+_HAPPY_TASK = (
     "[fixture:calculator-bug-v1] Fix the implementation of add so the repository tests pass. "
     "Do not modify the test file. Run python -m unittest -v to verify the fix."
+)
+_RETRY_TASK = (
+    "[fixture:calculator-retry-v1] Fix the implementation of add so the repository tests pass. "
+    "React to verification failures, do not modify the test file, and rerun python -m unittest -v."
 )
 _CANARY_SECRET = "sk-" + "e2e-canary-secret"
 _GIT = shutil.which("git") or "/usr/bin/git"
@@ -107,6 +111,11 @@ async def _run_agent_once(  # noqa: PLR0915 - one complete E2E evidence boundary
     run_id: UUID,
     settings: PlatformSettings,
     sandbox_image: str,
+    task: str,
+    expected_final_text: str,
+    expected_calls: tuple[str, ...],
+    expected_checkpoint_count: int,
+    failed_tool_calls: frozenset[str] = frozenset(),
 ) -> _RunEvidence:
     source_head = _git(source, "rev-parse", "HEAD")
     source_status = _git(source, "status", "--porcelain=v2", "--branch")
@@ -174,7 +183,7 @@ async def _run_agent_once(  # noqa: PLR0915 - one complete E2E evidence boundary
                         ),
                         GatewayMessage(
                             role=MessageRole.USER,
-                            content=f"{_TASK} Redaction canary: {_CANARY_SECRET}",
+                            content=f"{task} Redaction canary: {_CANARY_SECRET}",
                         ),
                     ),
                     task_plan={"steps": [{"title": "fix and verify", "done": False}]},
@@ -183,30 +192,33 @@ async def _run_agent_once(  # noqa: PLR0915 - one complete E2E evidence boundary
         ]
 
         assert isinstance(events[-1], RunCompletedEvent)
-        assert events[-1].payload.final_text == (
-            "Fixed calculator.add and verified the repository test suite in the sandbox."
-        )
+        assert events[-1].payload.final_text == expected_final_text
         calls = [
             event.payload.tool_call_id
             for event in events
             if isinstance(event, ModelToolCallReceivedEvent)
         ]
-        assert calls == [
-            "e2e-read-calculator",
-            "e2e-read-test",
-            "e2e-edit-calculator",
-            "e2e-run-tests",
-        ]
+        assert calls == list(expected_calls)
         completions = [event for event in events if isinstance(event, ToolCompletedEvent)]
-        assert len(completions) == 4
-        assert all(event.payload.status is ToolCallStatus.COMPLETED for event in completions)
-        assert len([event for event in events if isinstance(event, CheckpointCreatedEvent)]) == 2
+        assert len(completions) == len(expected_calls)
+        for completion in completions:
+            if completion.payload.tool_call_id in failed_tool_calls:
+                assert completion.payload.status is ToolCallStatus.FAILED
+                assert completion.payload.error is not None
+                assert completion.payload.error.code == "command_failed"
+            else:
+                assert completion.payload.status is ToolCallStatus.COMPLETED
+        assert len([event for event in events if isinstance(event, CheckpointCreatedEvent)]) == (
+            expected_checkpoint_count
+        )
         command_output = "".join(
             event.payload.chunk
             for event in events
             if isinstance(event, (ToolStdoutEvent, ToolStderrEvent))
         )
         assert "OK" in command_output
+        if failed_tool_calls:
+            assert "FAILED" in command_output
         assert [event.sequence for event in events] == list(range(1, len(events) + 1))
 
         final_terminal, final_output = await _sandbox_command(
@@ -258,6 +270,17 @@ async def test_coding_agent_happy_path_through_litellm_and_podman(tmp_path: Path
         run_id=UUID("30000000-0000-0000-0000-000000000001"),
         settings=settings,
         sandbox_image=sandbox_image,
+        task=_HAPPY_TASK,
+        expected_final_text=(
+            "Fixed calculator.add and verified the repository test suite in the sandbox."
+        ),
+        expected_calls=(
+            "e2e-read-calculator",
+            "e2e-read-test",
+            "e2e-edit-calculator",
+            "e2e-run-tests",
+        ),
+        expected_checkpoint_count=2,
     )
     assert tuple(worktrees.iterdir()) == ()
     second = await _run_agent_once(
@@ -266,6 +289,80 @@ async def test_coding_agent_happy_path_through_litellm_and_podman(tmp_path: Path
         run_id=UUID("30000000-0000-0000-0000-000000000002"),
         settings=settings,
         sandbox_image=sandbox_image,
+        task=_HAPPY_TASK,
+        expected_final_text=(
+            "Fixed calculator.add and verified the repository test suite in the sandbox."
+        ),
+        expected_calls=(
+            "e2e-read-calculator",
+            "e2e-read-test",
+            "e2e-edit-calculator",
+            "e2e-run-tests",
+        ),
+        expected_checkpoint_count=2,
+    )
+    assert tuple(worktrees.iterdir()) == ()
+
+    assert first.patch == second.patch
+    assert first.event_json != second.event_json
+    applied = tmp_path / "applied"
+    _git(tmp_path, "clone", "-q", str(source), str(applied))
+    _git(applied, "apply", "--check", "-", input_bytes=first.patch)
+    _git(applied, "apply", "-", input_bytes=first.patch)
+    assert _git(applied, "diff", "--name-only") == "calculator.py"
+    assert (applied / "calculator.py").read_bytes().endswith(b"return left + right\n")
+    assert (applied / "test_calculator.py").read_bytes() == (
+        source / "test_calculator.py"
+    ).read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_recovers_from_failed_verification_through_litellm_and_podman(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+    _create_source_repository(source)
+    settings = PlatformSettings()
+    sandbox_image = os.getenv(
+        "AGENT_PLATFORM_SANDBOX_IMAGE",
+        "localhost/agent-platform-sandbox:sequence-10",
+    )
+    expected_calls = (
+        "e2e-retry-read-calculator",
+        "e2e-retry-read-test",
+        "e2e-retry-edit-incorrect",
+        "e2e-retry-tests-fail",
+        "e2e-retry-edit-correct",
+        "e2e-retry-tests-pass",
+    )
+    final_text = "Observed the failing test, corrected calculator.add, and verified the fix."
+
+    first = await _run_agent_once(
+        source=source,
+        worktree_parent=worktrees,
+        run_id=UUID("30000000-0000-0000-0000-000000000003"),
+        settings=settings,
+        sandbox_image=sandbox_image,
+        task=_RETRY_TASK,
+        expected_final_text=final_text,
+        expected_calls=expected_calls,
+        expected_checkpoint_count=4,
+        failed_tool_calls=frozenset({"e2e-retry-tests-fail"}),
+    )
+    assert tuple(worktrees.iterdir()) == ()
+    second = await _run_agent_once(
+        source=source,
+        worktree_parent=worktrees,
+        run_id=UUID("30000000-0000-0000-0000-000000000004"),
+        settings=settings,
+        sandbox_image=sandbox_image,
+        task=_RETRY_TASK,
+        expected_final_text=final_text,
+        expected_calls=expected_calls,
+        expected_checkpoint_count=4,
+        failed_tool_calls=frozenset({"e2e-retry-tests-fail"}),
     )
     assert tuple(worktrees.iterdir()) == ()
 

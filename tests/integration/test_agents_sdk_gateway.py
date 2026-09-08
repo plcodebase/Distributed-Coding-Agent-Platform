@@ -5,12 +5,13 @@ import threading
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 import pytest
 
-from agent_core.events import EventType, ToolCompletedEvent
+from agent_core.domain.status import ToolCallStatus
+from agent_core.events import EventType, ModelToolCallReceivedEvent, ToolCompletedEvent
 from agent_core.fakes import SequentialIdGenerator, SteppingClock
 from agent_core.gateway import GatewayMessage, MessageRole
 from agent_core.loop import AgentLoop, AgentLoopInput
@@ -52,11 +53,13 @@ class EchoTool:
 class FakeOpenAIServer(ThreadingHTTPServer):
     recorded_requests: list[dict[str, Any]]
     authorization_headers: list[str]
+    mode: Literal["normal", "malformed"]
 
-    def __init__(self) -> None:
+    def __init__(self, *, mode: Literal["normal", "malformed"] = "normal") -> None:
         super().__init__(("127.0.0.1", 0), FakeOpenAIHandler)
         self.recorded_requests = []
         self.authorization_headers = []
+        self.mode = mode
 
 
 class FakeOpenAIHandler(BaseHTTPRequestHandler):
@@ -80,7 +83,10 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
         has_tool_result = any(
             isinstance(message, dict) and message.get("role") == "tool" for message in messages
         )
-        events = _final_text_chunks() if has_tool_result else _fragmented_tool_call_chunks()
+        if server.mode == "malformed" and len(server.recorded_requests) == 1:
+            events = _malformed_tool_call_chunks()
+        else:
+            events = _final_text_chunks() if has_tool_result else _fragmented_tool_call_chunks()
         payload = b"".join(
             b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n\n" for event in events
         )
@@ -169,6 +175,49 @@ def _fragmented_tool_call_chunks() -> tuple[dict[str, Any], ...]:
                 "completion_tokens": 1,
                 "total_tokens": 3,
                 "prompt_tokens_details": {"cached_tokens": 1},
+            },
+        ),
+    )
+
+
+def _malformed_tool_call_chunks() -> tuple[dict[str, Any], ...]:
+    return (
+        _chunk(
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-sdk-invalid",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo_text",
+                                    "arguments": '{"text":"raw-rejected-sentinel',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        ),
+        _chunk(
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        ),
+        _chunk(
+            choices=[],
+            usage={
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
             },
         ),
     )
@@ -293,3 +342,90 @@ async def test_agents_sdk_streams_fragmented_tool_round_trip_through_agent_loop(
         message.get("role") == "tool" and '"echo":"雪"' in message.get("content", "")
         for message in server.recorded_requests[1]["messages"]
     )
+
+
+@pytest.mark.integration
+async def test_agents_sdk_recovers_from_fragmented_malformed_tool_arguments() -> None:
+    rejected_raw_value = "raw-rejected-sentinel"
+    server = FakeOpenAIServer(mode="malformed")
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    adapter = create_openai_compatible_agents_gateway(
+        PlatformSettings(
+            gateway_url=f"http://127.0.0.1:{server.server_port}",
+            gateway_api_key="sk-sequence-4-test",
+        )
+    )
+    gateway = GatewayClient(adapter, close=adapter.aclose)
+    echo_tool = EchoTool()
+    registry = ToolRegistry(
+        (
+            RegisteredTool(
+                name="echo_text",
+                description="Echo a UTF-8 value through the typed tool boundary",
+                arguments_type=EchoArguments,
+                handler=echo_tool.run,
+                effect=ToolEffect.READ_ONLY,
+            ),
+        )
+    )
+    loop = AgentLoop(
+        gateway=gateway,
+        tools=registry,
+        clock=SteppingClock(datetime(2026, 7, 28, 12, tzinfo=UTC)),
+        id_generator=SequentialIdGenerator(),
+    )
+    loop_input = AgentLoopInput(
+        tenant_id=UUID("00000000-0000-0000-0000-000000000010"),
+        session_id=UUID("00000000-0000-0000-0000-000000000020"),
+        run_id=UUID("20000000-0000-0000-0000-000000000002"),
+        attempt=1,
+        worker_id="sdk-integration-worker",
+        route_name="coding-default",
+        messages=(
+            GatewayMessage(
+                role=MessageRole.USER,
+                content="Recover from malformed arguments, then echo the requested value.",
+            ),
+        ),
+    )
+
+    try:
+        async with gateway:
+            events = [event async for event in loop.run(loop_input)]
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert server_thread.is_alive() is False
+    assert echo_tool.values == ["雪"]
+    rejected = next(
+        event
+        for event in events
+        if isinstance(event, ModelToolCallReceivedEvent)
+        and event.payload.tool_call_id == "call-sdk-invalid"
+    )
+    assert rejected.payload.arguments is None
+    assert rejected.payload.argument_hash is None
+    assert rejected.payload.error is not None
+    assert rejected.payload.error.code == "malformed_tool_arguments"
+    failed = next(
+        event
+        for event in events
+        if isinstance(event, ToolCompletedEvent)
+        and event.payload.tool_call_id == "call-sdk-invalid"
+    )
+    assert failed.payload.status is ToolCallStatus.FAILED
+    assert failed.payload.error is not None
+    assert failed.payload.error.code == "malformed_tool_arguments"
+    assert events[-1].event_type is EventType.RUN_COMPLETED
+    assert len(server.recorded_requests) == 3
+    correction = json.dumps(server.recorded_requests[1], sort_keys=True)
+    later_requests = json.dumps(server.recorded_requests[1:], sort_keys=True)
+    serialized_events = "\n".join(event.model_dump_json() for event in events)
+    assert "malformed_tool_arguments" in correction
+    assert len(correction.encode("utf-8")) < 64 * 1024
+    assert rejected_raw_value not in correction
+    assert rejected_raw_value not in later_requests
+    assert rejected_raw_value not in serialized_events

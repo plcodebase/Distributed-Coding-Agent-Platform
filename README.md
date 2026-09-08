@@ -642,6 +642,7 @@ make podman-images
 make sandbox-security
 make gateway-security ENV_FILE=.env
 make postgres-security
+make redis-security ENV_FILE=.env.example
 make e2e-happy ENV_FILE=.env
 ```
 
@@ -650,3 +651,15 @@ gateway key from the selected environment file. The test itself recreates and la
 stops its three targeted LiteLLM/fake-provider services. The deterministic coding-agent
 path and its remaining product-level gaps are documented in
 [`docs/operations/coding-agent-e2e.md`](docs/operations/coding-agent-e2e.md).
+
+Run the complete deterministic local acceptance campaign with a healthy rootless Podman machine:
+
+```shell
+make local-acceptance ENV_FILE=.env.example
+```
+
+The aggregate target runs release and Kubernetes contracts, all unit and integration gates,
+simulation-only coding/load/chaos evidence into `.cache/acceptance/<revision>/`, sandbox and gateway
+security, real PostgreSQL and Redis outage coverage, the full dependency-stack smoke test, and both
+coding-agent E2E journeys. It uses only local fake model deployments and cleans each test-owned
+Podman resource group on success, failure, or interruption.

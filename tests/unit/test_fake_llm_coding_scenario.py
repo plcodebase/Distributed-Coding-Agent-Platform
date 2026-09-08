@@ -41,6 +41,17 @@ def _request(*tool_call_ids: str) -> dict[str, Any]:
     }
 
 
+def _retry_request(*tool_call_ids: str) -> dict[str, Any]:
+    request = _request(*tool_call_ids)
+    request["messages"][0]["content"] = "[fixture:calculator-retry-v1] Fix and verify."
+    for message in request["messages"]:
+        if message.get("tool_call_id") == "e2e-retry-tests-fail":
+            message["content"] = (
+                '{"error":{"code":"command_failed","message":"verification failed"},"ok":false}'
+            )
+    return request
+
+
 def test_coding_scenario_matches_the_checked_in_fixture() -> None:
     scenario = _load_coding_scenario()
     fixture = (
@@ -107,6 +118,42 @@ def test_coding_scenario_streams_fragmented_canonical_arguments() -> None:
         '{"path":"calculator.py"}'
     )
     assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_coding_retry_scenario_requires_failure_before_correction() -> None:
+    scenario = _load_coding_scenario()
+    fixture = (
+        Path(__file__).parents[1] / "end_to_end" / "fixtures" / "calculator_bug" / "calculator.py"
+    ).read_text(encoding="utf-8")
+    incorrect = fixture.replace("return left - right", "return left * right").encode()
+    assert hashlib.sha256(incorrect).hexdigest() == scenario.INCORRECT_CALCULATOR_SHA256
+    assert scenario.is_request(_retry_request()) is True
+
+    sequence = (
+        "e2e-retry-read-calculator",
+        "e2e-retry-read-test",
+        "e2e-retry-edit-incorrect",
+        "e2e-retry-tests-fail",
+        "e2e-retry-edit-correct",
+        "e2e-retry-tests-pass",
+    )
+    actions = [scenario.next_action(_retry_request(*sequence[:index])) for index in range(6)]
+    assert [(action[0], action[1]) for action in actions] == [
+        ("e2e-retry-read-calculator", "read_file"),
+        ("e2e-retry-read-test", "read_file"),
+        ("e2e-retry-edit-incorrect", "edit_file"),
+        ("e2e-retry-tests-fail", "run_command"),
+        ("e2e-retry-edit-correct", "edit_file"),
+        ("e2e-retry-tests-pass", "run_command"),
+    ]
+    corrective_arguments = cast("tuple[str, str, dict[str, object]]", actions[4])[2]
+    assert corrective_arguments["expected_sha256"] == scenario.INCORRECT_CALCULATOR_SHA256
+    assert isinstance(scenario.next_action(_retry_request(*sequence)), str)
+
+    unexpected_success = _retry_request(*sequence[:4])
+    unexpected_success["messages"][-1]["content"] = '{"ok":true,"result":{}}'
+    with pytest.raises(ValueError, match="retry scenario"):
+        scenario.next_action(unexpected_success)
 
 
 def test_coding_scenario_fails_closed_on_bad_or_out_of_order_feedback() -> None:
