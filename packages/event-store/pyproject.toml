@@ -5,7 +5,7 @@ description = "Durable PostgreSQL event sequencing and replay for the agent plat
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "agent-core",
-  "anyio>=4,<5",
+  "anyio>=4.15.1,<5",
   "platform-persistence",
 ]
 
